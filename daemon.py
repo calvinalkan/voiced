@@ -83,9 +83,10 @@ def copy_to_clipboard(text: str) -> None:
     try:
         # wl-copy forks to background by default to serve paste requests.
         # We use run() which waits for the fork to complete (nearly instant).
-        subprocess.run(
-            ["wl-copy", "--", text],
-            stdin=subprocess.DEVNULL,
+        # Pass text via stdin (not as argument) to handle any content robustly.
+        _ = subprocess.run(
+            ["wl-copy", "--"],
+            input=text.encode(),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=True,
