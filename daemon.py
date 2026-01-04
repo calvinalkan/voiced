@@ -238,6 +238,18 @@ class VoiceDaemon:
                 else:
                     log("daemon", "warn", "already recording, ignoring")
 
+            elif action == "listen-toggle":
+                if not self.recording:
+                    threading.Thread(
+                        target=lambda ti=test_input, to=test_output, sa=save_audio: self.do_record(
+                            auto_stop=True, test_input=ti, test_output=to, save_audio=sa
+                        ),
+                        daemon=True,
+                    ).start()
+                else:
+                    log("daemon", "info", "stopping (listen toggle)")
+                    self.stop_event.set()
+
             elif action == "record":
                 if not self.recording:
                     threading.Thread(

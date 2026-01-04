@@ -69,7 +69,19 @@ build_command() {
 }
 
 cmd_listen() {
-    send_command "$(build_command listen)"
+    local toggle=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -t|--toggle) toggle=true; shift ;;
+            *) echo "Unknown option: $1" >&2; exit 1 ;;
+        esac
+    done
+
+    if [[ "$toggle" == "true" ]]; then
+        send_command "$(build_command listen-toggle)"
+    else
+        send_command "$(build_command listen)"
+    fi
 }
 
 cmd_record() {
@@ -182,7 +194,7 @@ EOF
 
 case "${1:-}" in
     serve)      shift; cmd_serve "$@" ;;
-    listen)     cmd_listen ;;
+    listen)     shift; cmd_listen "$@" ;;
     record)     shift; cmd_record "$@" ;;
     stop)       cmd_stop ;;
     status)     cmd_status ;;
