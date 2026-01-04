@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment
+.venv/
+
+# Tool caches
+.ruff_cache/
+
+# Compiled binary (rebuild with ./build-dotool.sh)
+dotool
+
+# User config (use config.example.json as template)
+config.json

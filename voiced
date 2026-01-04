@@ -1,0 +1,194 @@
+#!/bin/bash
+#
+# voiced - Voice dictation CLI
+#
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+PID_FILE="/tmp/voiced.pid"
+COMMAND_FILE="/tmp/voiced-command"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/voiced"
+HISTORY_FILE="$STATE_DIR/history.json"
+
+# Find ydotool socket
+for socket in "/tmp/.ydotool_socket" "/run/user/$(id -u)/.ydotool_socket" "/run/ydotoold/socket"; do
+    [[ -e "$socket" ]] && YDOTOOL_SOCKET="$socket" && break
+done
+
+notify() {
+    notify-send -a voiced -i audio-input-microphone -u "${2:-normal}" -t 2000 "$1" 2>/dev/null || true
+}
+
+get_daemon_pid() {
+    [[ -f "$PID_FILE" ]] || return 1
+    local pid
+    pid=$(cat "$PID_FILE")
+    kill -0 "$pid" 2>/dev/null && echo "$pid" && return 0
+    rm -f "$PID_FILE"
+    return 1
+}
+
+send_command() {
+    local pid
+    pid=$(get_daemon_pid) || { echo "Daemon not running. Start with: voiced start" >&2; return 1; }
+    echo "$1" >> "$COMMAND_FILE"
+    kill -USR1 "$pid"
+}
+
+paste_text() {
+    local text="$1"
+    local old_clipboard
+
+    old_clipboard=$(wl-paste -n 2>/dev/null || true)
+    wl-copy -- "$text"
+    sleep 0.05
+    YDOTOOL_SOCKET="${YDOTOOL_SOCKET:-}" ydotool key 29:1 42:1 47:1 47:0 42:0 29:0
+    sleep 0.05
+    [[ -n "$old_clipboard" ]] && wl-copy -- "$old_clipboard"
+}
+
+cmd_serve() {
+    if get_daemon_pid >/dev/null; then
+        echo "Daemon already running (PID: $(cat "$PID_FILE"))" >&2
+        exit 1
+    fi
+
+    source "$SCRIPT_DIR/.venv/bin/activate"
+    exec python "$SCRIPT_DIR/daemon.py" "$@"
+}
+
+build_command() {
+    local cmd="$1"
+    local json="{\"cmd\":\"$cmd\""
+    [[ -n "${VOICED_TEST_INPUT:-}" ]] && json+=",\"test_input\":\"$VOICED_TEST_INPUT\""
+    [[ -n "${VOICED_TEST_OUTPUT:-}" ]] && json+=",\"test_output\":\"$VOICED_TEST_OUTPUT\""
+    [[ -n "${VOICED_SAVE_AUDIO:-}" ]] && json+=",\"save_audio\":\"$VOICED_SAVE_AUDIO\""
+    json+="}"
+    echo "$json"
+}
+
+cmd_listen() {
+    send_command "$(build_command listen)"
+}
+
+cmd_record() {
+    local toggle=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -t|--toggle) toggle=true; shift ;;
+            *) echo "Unknown option: $1" >&2; exit 1 ;;
+        esac
+    done
+
+    if [[ "$toggle" == "true" ]]; then
+        send_command "$(build_command record-toggle)"
+    else
+        send_command "$(build_command record)"
+    fi
+}
+
+cmd_stop() {
+    send_command '{"cmd":"stop"}'
+}
+
+cmd_status() {
+    local pid
+    if pid=$(get_daemon_pid); then
+        echo "Daemon running (PID: $pid)"
+    else
+        echo "Daemon not running"
+    fi
+}
+
+cmd_kill() {
+    local pid
+    if pid=$(get_daemon_pid); then
+        kill "$pid"
+        echo "Killed daemon (PID: $pid)"
+    else
+        echo "Daemon not running"
+    fi
+}
+
+cmd_history() {
+    local number="${1:-}"
+    local copy_flag="${2:-}"
+
+    if [[ ! -f "$HISTORY_FILE" ]]; then
+        echo "No history yet"
+        exit 0
+    fi
+
+    if [[ -z "$number" ]]; then
+        echo "Recent transcriptions:"
+        echo
+        jq -r 'to_entries | .[] | "  \(.key + 1 | tostring | if length < 2 then " " + . else . end). [\(.value.time | split(" ")[1])] \(.value.text | if length > 60 then .[0:60] + "..." else . end)"' "$HISTORY_FILE"
+        echo
+        echo "Usage: voiced history N       to type entry N"
+        echo "       voiced history N -c    to copy to clipboard"
+        exit 0
+    fi
+
+    local count
+    count=$(jq 'length' "$HISTORY_FILE")
+    if [[ "$number" -lt 1 ]] || [[ "$number" -gt "$count" ]]; then
+        echo "Invalid entry number. Valid range: 1-$count" >&2
+        exit 1
+    fi
+
+    local text
+    text=$(jq -r ".[$((number - 1))].text" "$HISTORY_FILE")
+    local display="${text:0:60}"
+    [[ ${#text} -gt 60 ]] && display="$display..."
+
+    if [[ "$copy_flag" == "-c" ]] || [[ "$copy_flag" == "--copy" ]]; then
+        wl-copy -- "$text"
+        echo "Copied to clipboard: $display"
+    else
+        paste_text "$text"
+        echo "Typed: $display"
+    fi
+}
+
+usage() {
+    cat <<'EOF'
+voiced - Voice dictation
+
+Commands:
+  serve [opts]        Start daemon (for systemd/foreground)
+  listen              Listen and transcribe (auto-stop on silence)
+  record              Record until 'stop' command
+  record -t, --toggle Toggle recording on/off (for keyboard shortcuts)
+  stop                Stop current recording
+  status              Show daemon status
+  kill                Kill the daemon
+  history             Show recent transcriptions
+  history N           Re-type transcription N
+  history N -c        Copy transcription N to clipboard
+
+Options for 'serve':
+  --config FILE       Config file path
+  --model MODEL       tiny, base, small, medium, large-v3
+  --silence-threshold FLOAT
+  --silence-duration  FLOAT
+  --auto-enter        Press Enter after typing
+  -d, --debug         Debug output
+
+Config: ~/.config/voiced/config.json
+History: ~/.local/state/voiced/history.json
+EOF
+}
+
+case "${1:-}" in
+    serve)      shift; cmd_serve "$@" ;;
+    listen)     cmd_listen ;;
+    record)     shift; cmd_record "$@" ;;
+    stop)       cmd_stop ;;
+    status)     cmd_status ;;
+    kill)       cmd_kill ;;
+    history)    shift; cmd_history "$@" ;;
+    -h|--help)  usage ;;
+    "")         usage ;;
+    *)          echo "Unknown command: $1" >&2; usage >&2; exit 1 ;;
+esac
