@@ -1,8 +1,8 @@
 MAKEFLAGS += -j$(shell nproc) --output-sync=target
 
-.PHONY: check lint format fix typecheck typecheck-ty typecheck-pyright
+.PHONY: check lint format fix typecheck typecheck-ty typecheck-pyright test
 
-check: lint typecheck
+check: lint typecheck test
 
 lint:
 	-uv run ruff check .
@@ -20,3 +20,6 @@ typecheck-ty:
 
 typecheck-pyright:
 	-uv run basedpyright .
+
+test:
+	./test.sh

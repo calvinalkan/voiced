@@ -6,8 +6,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-PID_FILE="/tmp/voiced.pid"
-COMMAND_FILE="/tmp/voiced-command"
+
+# Support multiple instances via VOICED_INSTANCE env var
+INSTANCE_SUFFIX="${VOICED_INSTANCE:+-$VOICED_INSTANCE}"
+PID_FILE="/tmp/voiced${INSTANCE_SUFFIX}.pid"
+COMMAND_FILE="/tmp/voiced${INSTANCE_SUFFIX}-command"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/voiced"
 HISTORY_FILE="$STATE_DIR/history.json"
 

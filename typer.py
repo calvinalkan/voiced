@@ -3,6 +3,8 @@ Text insertion module for voiced.
 Uses dotool for layout-aware keyboard input.
 """
 
+from __future__ import annotations
+
 import os
 import subprocess
 import threading
@@ -10,7 +12,7 @@ import time
 from pathlib import Path
 
 
-def detect_keyboard_layout():
+def detect_keyboard_layout() -> str:
     """Auto-detect keyboard layout from system settings."""
     # Try gsettings first (GNOME)
     try:
@@ -44,7 +46,7 @@ def detect_keyboard_layout():
     return "us"
 
 
-def find_typer_backend():
+def find_typer_backend() -> tuple[str | None, str | None]:
     """Find available typing backend. Returns (name, path) or (None, None)."""
     script_dir = Path(__file__).parent
 
@@ -69,7 +71,22 @@ def find_typer_backend():
 
 
 class Typer:
-    def __init__(self, backend="auto", keyboard_layout=None, auto_enter=False, debug=False):
+    auto_enter: bool
+    debug: bool
+    keyboard_layout: str
+    backend: str
+    backend_path: str
+    _start_time: float | None
+    _dotool_proc: subprocess.Popen[bytes] | None
+    _dotool_lock: threading.Lock
+
+    def __init__(
+        self,
+        backend: str = "auto",
+        keyboard_layout: str | None = None,
+        auto_enter: bool = False,
+        debug: bool = False,
+    ) -> None:
         self.auto_enter = auto_enter
         self.debug = debug
         self.keyboard_layout = keyboard_layout or detect_keyboard_layout()
@@ -82,7 +99,7 @@ class Typer:
         # Find backend
         if backend == "auto":
             name, path = find_typer_backend()
-            if name is None:
+            if name is None or path is None:
                 raise RuntimeError("No typing backend found. Install dotool or ydotool.")
             self.backend = name
             self.backend_path = path
@@ -90,17 +107,19 @@ class Typer:
             name, path = find_typer_backend()
             if name != backend:
                 raise RuntimeError(f"{backend} not found")
+            if name is None or path is None:
+                raise RuntimeError(f"{backend} not found")
             self.backend = name
             self.backend_path = path
 
         # Dotool process started lazily on first use
 
-    def _log(self, level, msg):
+    def _log(self, level: str, msg: str) -> None:
         if level == "debug" and not self.debug:
             return
         print(f"[typer] [{level}] {msg}", flush=True)
 
-    def _start_dotool(self):
+    def _start_dotool(self) -> bool:
         """Start a new dotool process. Returns True on success."""
         try:
             env = os.environ.copy()
@@ -115,8 +134,9 @@ class Typer:
             )
 
             # Send initial config
-            self._dotool_proc.stdin.write(b"typedelay 0\ntypehold 0\n")
-            self._dotool_proc.stdin.flush()
+            if self._dotool_proc.stdin:
+                _ = self._dotool_proc.stdin.write(b"typedelay 0\ntypehold 0\n")
+                self._dotool_proc.stdin.flush()
 
             self._log("debug", "dotool started")
             return True
@@ -125,7 +145,7 @@ class Typer:
             self._dotool_proc = None
             return False
 
-    def _type_dotool(self, text):
+    def _type_dotool(self, text: str) -> tuple[int, int]:
         """Type using persistent dotool process. Returns (total, failed)."""
         with self._dotool_lock:
             # Start process on first use
@@ -139,8 +159,9 @@ class Typer:
                 if self.auto_enter:
                     cmd += "key Return\n"
 
-                self._dotool_proc.stdin.write(cmd.encode())
-                self._dotool_proc.stdin.flush()
+                if self._dotool_proc and self._dotool_proc.stdin:
+                    _ = self._dotool_proc.stdin.write(cmd.encode())
+                    self._dotool_proc.stdin.flush()
 
                 # Note: We can't easily get per-character failure info with persistent process
                 # The warnings go to stderr but we can't read them without blocking
@@ -152,21 +173,22 @@ class Typer:
                 self._dotool_proc = None
 
                 if not self._start_dotool():
-                    raise RuntimeError("dotool restart failed")
+                    raise RuntimeError("dotool restart failed") from e
 
                 # Retry the write
                 try:
                     cmd = f"type {text}\n"
                     if self.auto_enter:
                         cmd += "key Return\n"
-                    self._dotool_proc.stdin.write(cmd.encode())
-                    self._dotool_proc.stdin.flush()
+                    if self._dotool_proc and self._dotool_proc.stdin:
+                        _ = self._dotool_proc.stdin.write(cmd.encode())
+                        self._dotool_proc.stdin.flush()
                     return (len(text), 0)
-                except (BrokenPipeError, OSError):
+                except (BrokenPipeError, OSError) as retry_err:
                     self._dotool_proc = None
-                    raise RuntimeError("dotool failed after restart")
+                    raise RuntimeError("dotool failed after restart") from retry_err
 
-    def _type_ydotool(self, text):
+    def _type_ydotool(self, text: str) -> None:
         """Type using ydotool (instant, may have layout issues)."""
         env = os.environ.copy()
         for s in ["/tmp/.ydotool_socket", f"/run/user/{os.getuid()}/.ydotool_socket"]:
@@ -181,14 +203,14 @@ class Typer:
             raise RuntimeError(f"ydotool failed: {result.stderr.decode()}")
 
         if self.auto_enter:
-            subprocess.run(
+            _ = subprocess.run(
                 [self.backend_path, "key", "28:1", "28:0"],
                 capture_output=True,
                 timeout=1,
                 env=env,
             )
 
-    def type_text(self, text):
+    def type_text(self, text: str) -> tuple[bool, int, int]:
         """Insert text at cursor position. Returns (success, total_chars, failed_chars)."""
         self._start_time = time.time()
 
@@ -207,13 +229,14 @@ class Typer:
             self._log("error", f"type failed: {e}")
             return (False, len(text), len(text))
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         """Clean up persistent dotool process."""
         with self._dotool_lock:
             if self._dotool_proc is not None:
                 try:
-                    self._dotool_proc.stdin.close()
-                    self._dotool_proc.wait(timeout=1)
+                    if self._dotool_proc.stdin:
+                        self._dotool_proc.stdin.close()
+                    _ = self._dotool_proc.wait(timeout=1)
                 except Exception:
                     self._dotool_proc.kill()
                 self._dotool_proc = None

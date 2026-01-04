@@ -3,16 +3,25 @@ Audio recording module for voiced.
 Handles microphone input and silence detection.
 """
 
+from __future__ import annotations
+
 import os
 import sys
+import threading
 import time
 import wave
+from collections.abc import Callable
+from typing import cast
 
 import numpy as np
-import sounddevice as sd
+import sounddevice as sd  # type: ignore[import-untyped]
+from numpy.typing import NDArray
+
+# Type alias for audio arrays - float32 audio samples
+AudioArray = NDArray[np.float32]
 
 
-def get_terminal_width():
+def get_terminal_width() -> int:
     """Get terminal width, default to 80 if unavailable."""
     try:
         return os.get_terminal_size().columns
@@ -21,15 +30,27 @@ def get_terminal_width():
 
 
 class Audio:
+    sample_rate: int
+    silence_threshold: float
+    silence_duration: float
+    speech_start_duration: float
+    channels: int
+    debug: bool
+    is_tty: bool
+    pre_buffer_seconds: float
+    pre_buffer_samples: int
+    _start_time: float | None
+    _waveform_history: list[str]
+
     def __init__(
         self,
-        silence_threshold=0.01,
-        silence_duration=0.6,
-        sample_rate=16000,
-        speech_start_duration=0.2,
-        debug=False,
-        is_tty=True,
-    ):
+        silence_threshold: float = 0.01,
+        silence_duration: float = 0.6,
+        sample_rate: int = 16000,
+        speech_start_duration: float = 0.2,
+        debug: bool = False,
+        is_tty: bool = True,
+    ) -> None:
         self.sample_rate = sample_rate
         self.silence_threshold = silence_threshold
         self.silence_duration = silence_duration
@@ -38,27 +59,28 @@ class Audio:
         self.debug = debug
         self.is_tty = is_tty
         self._start_time = None
+        self._waveform_history = []
 
         # Pre-buffer to catch start of speech (1 second)
         self.pre_buffer_seconds = 1.0
         self.pre_buffer_samples = int(self.pre_buffer_seconds * sample_rate)
 
-    def _elapsed_ms(self):
+    def _elapsed_ms(self) -> int:
         """Get elapsed milliseconds since recording started."""
         if self._start_time is None:
             return 0
         return int((time.time() - self._start_time) * 1000)
 
-    def _log(self, level, message):
+    def _log(self, level: str, message: str) -> None:
         """Log a message with audio namespace."""
         # Clear any in-progress live display line first
         if self.is_tty:
             width = get_terminal_width() - 1
-            sys.stdout.write(f"\r{' ' * width}\r")
-            sys.stdout.flush()
+            _ = sys.stdout.write(f"\r{' ' * width}\r")
+            _ = sys.stdout.flush()
         print(f"[audio] [{level}] {message}", flush=True)
 
-    def _level_to_bar(self, level):
+    def _level_to_bar(self, level: float) -> str:
         """Convert audio level to waveform character, scaled to threshold."""
         bars = "▁▂▃▄▅▆▇█"
         # Scale so threshold = ▅ (index 4), giving headroom for speech above
@@ -68,13 +90,19 @@ class Audio:
         return bars[idx]
 
     def _format_live_display(
-        self, level, is_speech, is_recording, speech_samples, silence_samples, elapsed
-    ):
+        self,
+        level: float,
+        is_speech: bool,
+        is_recording: bool,
+        speech_samples: int,
+        silence_samples: int,
+        elapsed: float,
+    ) -> str:
         """Format the live-updating display line (TTY only)."""
         # Add to waveform history
         self._waveform_history.append(self._level_to_bar(level))
         if len(self._waveform_history) > 40:
-            self._waveform_history.pop(0)
+            _ = self._waveform_history.pop(0)
 
         waveform = "".join(self._waveform_history).ljust(40)
 
@@ -105,7 +133,7 @@ class Audio:
 
         return f"{waveform} {level_info} {state}"
 
-    def to_file(self, audio, path):
+    def to_file(self, audio: AudioArray, path: str) -> None:
         """
         Save audio to a WAV file.
 
@@ -131,7 +159,7 @@ class Audio:
             self._log("error", f"failed to save audio to {path}: {e}")
             raise
 
-    def from_file(self, path):
+    def from_file(self, path: str) -> AudioArray:
         """
         Load audio from a WAV file.
 
@@ -163,6 +191,7 @@ class Audio:
             raise ValueError(f"Invalid WAV file: {e}") from e
 
         # Convert bytes to numpy array based on sample width
+        audio: AudioArray
         if sample_width == 1:
             audio = np.frombuffer(frames, dtype=np.uint8).astype(np.float32) / 128.0 - 1.0
         elif sample_width == 2:
@@ -174,7 +203,7 @@ class Audio:
 
         # Convert stereo to mono by averaging channels
         if channels == 2:
-            audio = audio.reshape(-1, 2).mean(axis=1)
+            audio = audio.reshape(-1, 2).mean(axis=1).astype(np.float32)  # pyright: ignore[reportAny]
 
         # Resample if needed (simple linear interpolation)
         if file_rate != self.sample_rate:
@@ -187,13 +216,13 @@ class Audio:
 
     def record(
         self,
-        stop_event=None,
-        auto_stop_on_silence=True,
-        on_start=None,
-        on_stop=None,
-        test_input=None,
-        save_audio=None,
-    ):
+        stop_event: threading.Event | None = None,
+        auto_stop_on_silence: bool = True,
+        on_start: Callable[[], None] | None = None,
+        on_stop: Callable[[], None] | None = None,
+        test_input: str | None = None,
+        save_audio: str | None = None,
+    ) -> AudioArray | None:
         """
         Record audio from microphone.
 
@@ -218,8 +247,8 @@ class Audio:
         # Short-circuit: if test_input is provided, read from file instead of mic
         if test_input:
             return self.from_file(test_input)
-        audio_buffer = []
-        pre_buffer = []
+        audio_buffer: list[float] = []
+        pre_buffer: list[float] = []
         is_recording = False
         silence_samples = 0
         speech_samples = 0  # Track sustained speech before recording starts
@@ -229,32 +258,38 @@ class Audio:
         self._start_time = time.time()
         self._waveform_history = []
 
-        def callback(indata, frames, time_info, status):
+        def callback(
+            indata: AudioArray,
+            _frames: int,
+            _time_info: object,
+            _status: object,
+        ) -> None:
             nonlocal audio_buffer, pre_buffer, is_recording, silence_samples, speech_samples, done
 
             if done:
                 return
 
-            audio = indata[:, 0].copy()
+            audio: AudioArray = indata[:, 0].copy()
+            audio_list: list[float] = cast(list[float], audio.tolist())
 
             # Maintain pre-buffer
-            pre_buffer.extend(audio.tolist())
+            pre_buffer.extend(audio_list)
             if len(pre_buffer) > self.pre_buffer_samples:
                 pre_buffer = pre_buffer[-self.pre_buffer_samples :]
 
-            level = np.abs(audio).mean()
+            level = float(np.abs(audio).mean())  # pyright: ignore[reportAny]
             is_speech = level > self.silence_threshold
 
             # Live display (only in TTY mode with debug) - updates every callback (~100ms)
-            if self.debug and self.is_tty:
+            if self.debug and self.is_tty and self._start_time is not None:
                 elapsed = time.time() - self._start_time
                 line = self._format_live_display(
                     level, is_speech, is_recording, speech_samples, silence_samples, elapsed
                 )
                 # Carriage return + padded line to overwrite previous
                 width = get_terminal_width() - 1
-                sys.stdout.write(f"\r{line:<{width}}")
-                sys.stdout.flush()
+                _ = sys.stdout.write(f"\r{line:<{width}}")
+                _ = sys.stdout.flush()
 
             if is_speech:
                 if not is_recording:
@@ -268,7 +303,7 @@ class Audio:
                         if on_start:
                             on_start()
                 else:
-                    audio_buffer.extend(audio.tolist())
+                    audio_buffer.extend(audio_list)
                     silence_samples = 0
             else:
                 # Reset speech counter if audio drops below threshold
@@ -276,7 +311,7 @@ class Audio:
                     speech_samples = 0
 
                 if is_recording:
-                    audio_buffer.extend(audio.tolist())
+                    audio_buffer.extend(audio_list)
                     silence_samples += len(audio)
 
                     # Auto-stop on silence (only if enabled)
@@ -302,20 +337,22 @@ class Audio:
                     if on_stop:
                         on_stop()
                     break
-                sd.sleep(50)
+                sd.sleep(50)  # pyright: ignore[reportUnknownMemberType]
 
         # Clear live display line when done
         if self.debug and self.is_tty:
             width = get_terminal_width() - 1
-            sys.stdout.write(f"\r{' ' * width}\r")
-            sys.stdout.flush()
+            _ = sys.stdout.write(f"\r{' ' * width}\r")
+            _ = sys.stdout.flush()
 
-        audio = np.array(audio_buffer, dtype=np.float32) if audio_buffer else None
+        result: AudioArray | None = (
+            np.array(audio_buffer, dtype=np.float32) if audio_buffer else None
+        )
 
         # Save audio to file if save_audio is set
         if save_audio:
             self._log("debug", f"save_audio set: {save_audio}")
-            if audio is not None:
-                self.to_file(audio, save_audio)
+            if result is not None:
+                self.to_file(result, save_audio)
 
-        return audio
+        return result

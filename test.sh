@@ -4,6 +4,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Use a separate instance for testing to avoid conflicts with running daemon
+export VOICED_INSTANCE="test"
+
 # Cleanup function
 cleanup() {
     if [ -n "$DAEMON_PID" ]; then
@@ -14,8 +17,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Stop any existing test daemon first
+voiced kill 2>/dev/null || true
+sleep 1
+
 echo "=== Starting daemon ==="
-voiced serve --debug &
+voiced serve --debug --model base &
 DAEMON_PID=$!
 sleep 3
 

@@ -42,6 +42,8 @@ unknown-argument = "error"
 [tool.basedpyright]
 pythonVersion = "3.12"
 typeCheckingMode = "all"
+# Only ignore stubs for external libs that don't have them
+reportMissingTypeStubs = false
 
 [dependency-groups]
 dev = [

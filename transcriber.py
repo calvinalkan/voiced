@@ -3,19 +3,36 @@ Transcription module for voiced.
 Wraps faster-whisper for speech-to-text.
 """
 
+from __future__ import annotations
+
+from collections.abc import Callable
+
 import numpy as np
-from faster_whisper import WhisperModel
+from faster_whisper import WhisperModel  # type: ignore[import-untyped]
+from numpy.typing import NDArray
 
 
 class Transcriber:
-    def __init__(self, model_size="base", device="cpu", language="en", debug=False):
+    model_size: str
+    device: str
+    language: str
+    model: WhisperModel | None
+    debug: bool
+
+    def __init__(
+        self,
+        model_size: str = "base",
+        device: str = "cpu",
+        language: str = "en",
+        debug: bool = False,
+    ) -> None:
         self.model_size = model_size
         self.device = device
         self.language = language
         self.model = None
         self.debug = debug
 
-    def load(self, on_progress=None):
+    def load(self, on_progress: Callable[[str], None] | None = None) -> None:
         """Load the model into memory."""
         compute_type = "int8" if self.device == "cpu" else "float16"
 
@@ -28,12 +45,12 @@ class Transcriber:
         if on_progress:
             on_progress("Warming up...")
         dummy = np.zeros(16000, dtype=np.float32)
-        list(self.model.transcribe(dummy, language=self.language))
+        _ = list(self.model.transcribe(dummy, language=self.language))  # pyright: ignore[reportUnknownMemberType]
 
         if on_progress:
             on_progress("Ready")
 
-    def transcribe(self, audio_data):
+    def transcribe(self, audio_data: NDArray[np.float32]) -> str | None:
         """
         Transcribe audio data to text.
 
@@ -46,10 +63,10 @@ class Transcriber:
         if self.model is None:
             raise RuntimeError("Model not loaded. Call load() first.")
 
-        if audio_data is None or len(audio_data) < 8000:
+        if len(audio_data) < 8000:
             return None
 
-        segments, info = self.model.transcribe(
+        segments, info = self.model.transcribe(  # pyright: ignore[reportUnknownMemberType]
             audio_data,
             language=self.language,
             beam_size=1,
