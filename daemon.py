@@ -81,18 +81,20 @@ def log(component: str, level: str, message: str) -> None:
 def copy_to_clipboard(text: str) -> None:
     """Copy text to clipboard using wl-copy (Wayland). Fire and forget."""
     try:
-        proc = subprocess.Popen(
-            ["wl-copy", "--"],
-            stdin=subprocess.PIPE,
+        # wl-copy forks to background by default to serve paste requests.
+        # We use run() which waits for the fork to complete (nearly instant).
+        subprocess.run(
+            ["wl-copy", "--", text],
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            check=True,
         )
-        if proc.stdin:
-            _ = proc.stdin.write(text.encode())
-            proc.stdin.close()
-        log("clipboard", "info", f"started: {len(text)} chars")
+        log("clipboard", "info", f"copied: {len(text)} chars")
     except FileNotFoundError:
         log("clipboard", "warn", "wl-copy not found, skipping clipboard")
+    except subprocess.CalledProcessError as e:
+        log("clipboard", "warn", f"clipboard copy failed: exit {e.returncode}")
     except Exception as e:
         log("clipboard", "warn", f"clipboard copy failed: {e}")
 
