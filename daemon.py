@@ -79,25 +79,35 @@ def log(component: str, level: str, message: str) -> None:
 
 
 def copy_to_clipboard(text: str) -> None:
-    """Copy text to clipboard using wl-copy (Wayland). Fire and forget."""
+    """Copy text to clipboard using wl-copy (Wayland). Timeout if it hangs."""
+    proc: subprocess.Popen[bytes] | None = None
     try:
         # wl-copy forks to background by default to serve paste requests.
-        # We use run() which waits for the fork to complete (nearly instant).
-        # Pass text via stdin (not as argument) to handle any content robustly.
-        _ = subprocess.run(
+        # Use Popen + communicate(timeout) so we can kill on hang.
+        # Known issue: some Wayland compositors cause wl-copy to hang.
+        proc = subprocess.Popen(
             ["wl-copy", "--"],
-            input=text.encode(),
+            stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            check=True,
         )
-        log("clipboard", "info", f"copied: {len(text)} chars")
+        proc.communicate(input=text.encode(), timeout=2)
+        if proc.returncode == 0:
+            log("clipboard", "info", f"copied: {len(text)} chars")
+        else:
+            log("clipboard", "warn", f"clipboard copy failed: exit {proc.returncode}")
+    except subprocess.TimeoutExpired:
+        log("clipboard", "warn", "wl-copy timed out after 2s, killing")
+        if proc:
+            proc.kill()
+            proc.wait()
     except FileNotFoundError:
         log("clipboard", "warn", "wl-copy not found, skipping clipboard")
-    except subprocess.CalledProcessError as e:
-        log("clipboard", "warn", f"clipboard copy failed: exit {e.returncode}")
     except Exception as e:
         log("clipboard", "warn", f"clipboard copy failed: {e}")
+        if proc:
+            proc.kill()
+            proc.wait()
 
 
 def notify(message: str, urgency: str = "normal", timeout: int = 2000) -> int | None:
