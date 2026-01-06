@@ -91,7 +91,7 @@ def copy_to_clipboard(text: str) -> None:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        proc.communicate(input=text.encode(), timeout=2)
+        _ = proc.communicate(input=text.encode(), timeout=2)
         if proc.returncode == 0:
             log("clipboard", "info", f"copied: {len(text)} chars")
         else:
@@ -99,15 +99,15 @@ def copy_to_clipboard(text: str) -> None:
     except subprocess.TimeoutExpired:
         log("clipboard", "warn", "wl-copy timed out after 2s, killing")
         if proc:
-            proc.kill()
-            proc.wait()
+            _ = proc.kill()
+            _ = proc.wait()
     except FileNotFoundError:
         log("clipboard", "warn", "wl-copy not found, skipping clipboard")
     except Exception as e:
         log("clipboard", "warn", f"clipboard copy failed: {e}")
         if proc:
-            proc.kill()
-            proc.wait()
+            _ = proc.kill()
+            _ = proc.wait()
 
 
 def notify(message: str, urgency: str = "normal", timeout: int = 2000) -> int | None:
