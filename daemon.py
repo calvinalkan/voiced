@@ -30,7 +30,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from audio import Audio
-from transcriber import Transcriber
+from transcriber import TRANSCRIBER_ENGINES, TranscriberProtocol, make_transcriber
 from typer import Typer
 
 
@@ -48,6 +48,7 @@ class Config(TypedDict):
     clipboard_copy: bool
     insertion_method: str
     paste_keybind: str
+    transcriber_engine: str
 
 # File paths - support multiple instances via VOICED_INSTANCE env var
 _INSTANCE = os.environ.get("VOICED_INSTANCE", "")
@@ -74,6 +75,7 @@ DEFAULT_CONFIG: Config = {
     "clipboard_copy": True,
     "insertion_method": "paste",
     "paste_keybind": "ctrl+shift+v",
+    "transcriber_engine": "whisper",
 }
 
 
@@ -242,6 +244,12 @@ def parse_config(data: object) -> Config:
         config["insertion_method"] = v
     if (v := get_str("paste_keybind")) is not None:
         config["paste_keybind"] = v
+    if (v := get_str("transcriber_engine")) is not None:
+        if v not in TRANSCRIBER_ENGINES:
+            raise ConfigError(
+                f"transcriber_engine must be one of {TRANSCRIBER_ENGINES}, got '{v}'"
+            )
+        config["transcriber_engine"] = v
 
     return config
 
@@ -359,7 +367,7 @@ class VoiceDaemon:
     recording: bool
     stop_event: threading.Event
     audio: Audio
-    transcriber: Transcriber
+    transcriber: TranscriberProtocol
     typer: Typer
 
     def __init__(self, config: Config) -> None:
@@ -377,8 +385,9 @@ class VoiceDaemon:
             debug=self.debug,
             is_tty=self.is_tty,
         )
-        self.transcriber = Transcriber(
-            model_size=config["model"],
+        self.transcriber = make_transcriber(
+            engine=config["transcriber_engine"],
+            model=config["model"],
             device=config["device"],
             debug=self.debug,
         )
@@ -562,7 +571,8 @@ class VoiceDaemon:
         print("=" * 50, flush=True)
         print("voiced daemon", flush=True)
         print("=" * 50, flush=True)
-        print(f"  Model:             faster-whisper ({self.config['model']})", flush=True)
+        print(f"  Engine:            {self.config['transcriber_engine']}", flush=True)
+        print(f"  Model:             {self.config['model']}", flush=True)
         print(f"  Device:            {self.config['device']}", flush=True)
         print(f"  Silence threshold: {self.config['silence_threshold']} (amplitude 0.0-1.0)", flush=True)
         print(f"  Silence duration:  {self.config['silence_duration']}s", flush=True)
@@ -621,6 +631,11 @@ def main() -> None:
         choices=["paste", "type"],
         help="How dictated text reaches the focused app",
     )
+    _ = parser.add_argument(
+        "--transcriber-engine",
+        choices=list(TRANSCRIBER_ENGINES),
+        help="Speech recognition engine",
+    )
     _ = parser.add_argument("--debug", "-d", action="store_true")
     args = parser.parse_args()
 
@@ -634,6 +649,7 @@ def main() -> None:
     arg_keyboard_layout = cast(str | None, args.keyboard_layout)
     arg_typer_backend = cast(str | None, args.typer_backend)
     arg_insertion_method = cast(str | None, args.insertion_method)
+    arg_transcriber_engine = cast(str | None, args.transcriber_engine)
     arg_debug = cast(bool, args.debug)
 
     config = load_config(arg_config)
@@ -654,6 +670,8 @@ def main() -> None:
         config["typer_backend"] = arg_typer_backend
     if arg_insertion_method:
         config["insertion_method"] = arg_insertion_method
+    if arg_transcriber_engine:
+        config["transcriber_engine"] = arg_transcriber_engine
     if arg_debug:
         config["debug"] = True
 
