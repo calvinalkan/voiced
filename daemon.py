@@ -49,6 +49,7 @@ class Config(TypedDict):
     insertion_method: str
     paste_keybind: str
     transcriber_engine: str
+    streaming: bool
 
 # File paths - support multiple instances via VOICED_INSTANCE env var
 _INSTANCE = os.environ.get("VOICED_INSTANCE", "")
@@ -76,6 +77,7 @@ DEFAULT_CONFIG: Config = {
     "insertion_method": "paste",
     "paste_keybind": "ctrl+shift+v",
     "transcriber_engine": "whisper",
+    "streaming": False,
 }
 
 
@@ -250,6 +252,13 @@ def parse_config(data: object) -> Config:
                 f"transcriber_engine must be one of {TRANSCRIBER_ENGINES}, got '{v}'"
             )
         config["transcriber_engine"] = v
+    if (v := get_bool("streaming")) is not None:
+        config["streaming"] = v
+
+    if config["transcriber_engine"] == "whisper" and config["streaming"]:
+        raise ConfigError(
+            "streaming=true requires transcriber_engine=moonshine; whisper has no streaming inference API"
+        )
 
     return config
 
@@ -390,6 +399,7 @@ class VoiceDaemon:
             model=config["model"],
             device=config["device"],
             debug=self.debug,
+            streaming=config["streaming"],
         )
         def typer_notify(msg: str) -> None:
             _ = notify(msg, urgency="low")
@@ -489,9 +499,11 @@ class VoiceDaemon:
             log("audio", "info", "waiting for speech...")
 
         try:
+            self.transcriber.start_session()
             audio = self.audio.record(
                 stop_event=self.stop_event,
                 auto_stop_on_silence=auto_stop,
+                on_chunk=self.transcriber.feed,
                 test_input=test_input,
                 save_audio=save_audio,
             )
@@ -504,6 +516,9 @@ class VoiceDaemon:
         self, audio: NDArray[np.float32] | None, test_output: str | None = None
     ) -> None:
         if audio is None or len(audio) < 8000:
+            # Drain the worker session anyway so it doesn't carry leftover
+            # state into the next recording.
+            _ = self.transcriber.finalize()
             log("audio", "info", "no speech detected")
             _ = notify("No speech detected")
             return
@@ -515,7 +530,7 @@ class VoiceDaemon:
         log("transcriber", "info", "processing...")
 
         start_time = time.time()
-        text = self.transcriber.transcribe(audio)
+        text = self.transcriber.finalize()
         elapsed_ms = int((time.time() - start_time) * 1000)
 
         if not text:
@@ -573,6 +588,7 @@ class VoiceDaemon:
         print("=" * 50, flush=True)
         print(f"  Engine:            {self.config['transcriber_engine']}", flush=True)
         print(f"  Model:             {self.config['model']}", flush=True)
+        print(f"  Streaming:         {self.config['streaming']}", flush=True)
         print(f"  Device:            {self.config['device']}", flush=True)
         print(f"  Silence threshold: {self.config['silence_threshold']} (amplitude 0.0-1.0)", flush=True)
         print(f"  Silence duration:  {self.config['silence_duration']}s", flush=True)
@@ -605,6 +621,7 @@ class VoiceDaemon:
 
         # Clean up
         self.typer.shutdown()
+        self.transcriber.shutdown()
         log("daemon", "info", "shutdown complete")
 
 
@@ -636,6 +653,12 @@ def main() -> None:
         choices=list(TRANSCRIBER_ENGINES),
         help="Speech recognition engine",
     )
+    _ = parser.add_argument(
+        "--streaming",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Live streaming inference (Moonshine only). --no-streaming to disable.",
+    )
     _ = parser.add_argument("--debug", "-d", action="store_true")
     args = parser.parse_args()
 
@@ -650,6 +673,7 @@ def main() -> None:
     arg_typer_backend = cast(str | None, args.typer_backend)
     arg_insertion_method = cast(str | None, args.insertion_method)
     arg_transcriber_engine = cast(str | None, args.transcriber_engine)
+    arg_streaming = cast(bool | None, args.streaming)
     arg_debug = cast(bool, args.debug)
 
     config = load_config(arg_config)
@@ -672,6 +696,8 @@ def main() -> None:
         config["insertion_method"] = arg_insertion_method
     if arg_transcriber_engine:
         config["transcriber_engine"] = arg_transcriber_engine
+    if arg_streaming is not None:
+        config["streaming"] = arg_streaming
     if arg_debug:
         config["debug"] = True
 

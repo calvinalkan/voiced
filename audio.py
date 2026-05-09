@@ -220,6 +220,7 @@ class Audio:
         auto_stop_on_silence: bool = True,
         on_start: Callable[[], None] | None = None,
         on_stop: Callable[[], None] | None = None,
+        on_chunk: Callable[[AudioArray], None] | None = None,
         test_input: str | None = None,
         save_audio: str | None = None,
     ) -> AudioArray | None:
@@ -238,6 +239,12 @@ class Audio:
             auto_stop_on_silence: if True, stop after silence_duration of quiet
             on_start: callback when speech first detected
             on_stop: callback when recording stops
+            on_chunk: called with each chunk while recording. The first call
+                carries the pre-buffer (~1s of audio captured before speech
+                was detected) so the start of the first word arrives intact;
+                subsequent calls carry live chunks. In test_input mode, fires
+                once with the entire loaded audio. Invoked from the audio
+                callback thread (mic mode) or the caller's thread (test mode).
             test_input: path to WAV file to use instead of microphone
             save_audio: path to save recorded audio as WAV file
 
@@ -246,7 +253,12 @@ class Audio:
         """
         # Short-circuit: if test_input is provided, read from file instead of mic
         if test_input:
-            return self.from_file(test_input)
+            audio = self.from_file(test_input)
+            if on_chunk and len(audio) > 0:
+                on_chunk(audio)
+            if save_audio:
+                self.to_file(audio, save_audio)
+            return audio
         audio_buffer: list[float] = []
         pre_buffer: list[float] = []
         is_recording = False
@@ -300,11 +312,18 @@ class Audio:
                         audio_buffer = pre_buffer.copy()
                         if self.debug:
                             self._log("debug", "speech detected, recording started\n")
+                        if on_chunk:
+                            # Pre-buffer (which already includes this chunk via
+                            # the extend above) is the seed needed to capture
+                            # the start of the first word.
+                            on_chunk(np.array(audio_buffer, dtype=np.float32))
                         if on_start:
                             on_start()
                 else:
                     audio_buffer.extend(audio_list)
                     silence_samples = 0
+                    if on_chunk:
+                        on_chunk(audio)
             else:
                 # Reset speech counter if audio drops below threshold
                 if not is_recording:
@@ -313,6 +332,8 @@ class Audio:
                 if is_recording:
                     audio_buffer.extend(audio_list)
                     silence_samples += len(audio)
+                    if on_chunk:
+                        on_chunk(audio)
 
                     # Auto-stop on silence (only if enabled)
                     if auto_stop_on_silence and silence_samples >= silence_samples_needed:

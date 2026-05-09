@@ -22,7 +22,10 @@ voiced kill 2>/dev/null || true
 sleep 1
 
 echo "=== Starting daemon ==="
-voiced serve --debug --model base &
+# Pin engine + model so the test stays reproducible regardless of the user's
+# real ~/.config/voiced/config.json. The expected fixture matches Whisper
+# base output ("Hello world, hello my agent.").
+voiced serve --debug --transcriber-engine whisper --model base &
 DAEMON_PID=$!
 sleep 3
 

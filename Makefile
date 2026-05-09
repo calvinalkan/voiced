@@ -1,6 +1,6 @@
 MAKEFLAGS += -j$(shell nproc) --output-sync=target
 
-.PHONY: check lint format fix typecheck typecheck-ty typecheck-pyright test
+.PHONY: check lint format fix typecheck typecheck-ty typecheck-pyright test test-integration test-transcribers
 
 check: lint typecheck test
 
@@ -21,5 +21,10 @@ typecheck-ty:
 typecheck-pyright:
 	uv run basedpyright .
 
-test:
+test: test-transcribers test-integration
+
+test-transcribers:
+	uv run python test_transcriber.py
+
+test-integration:
 	./test.sh
