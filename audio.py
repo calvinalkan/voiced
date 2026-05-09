@@ -220,7 +220,6 @@ class Audio:
         auto_stop_on_silence: bool = True,
         on_start: Callable[[], None] | None = None,
         on_stop: Callable[[], None] | None = None,
-        on_chunk: Callable[[AudioArray], None] | None = None,
         test_input: str | None = None,
         save_audio: str | None = None,
     ) -> AudioArray | None:
@@ -239,10 +238,6 @@ class Audio:
             auto_stop_on_silence: if True, stop after silence_duration of quiet
             on_start: callback when speech first detected
             on_stop: callback when recording stops
-            on_chunk: called with each audio chunk while recording. The first
-                call carries the pre-buffer (~1s of audio before speech was
-                detected) as a single warm-up chunk; subsequent calls deliver
-                live chunks. Invoked from the audio callback thread.
             test_input: path to WAV file to use instead of microphone
             save_audio: path to save recorded audio as WAV file
 
@@ -305,18 +300,11 @@ class Audio:
                         audio_buffer = pre_buffer.copy()
                         if self.debug:
                             self._log("debug", "speech detected, recording started\n")
-                        if on_chunk:
-                            # Pre-buffer already includes the current chunk
-                            # (extended above), so this is the seed needed to
-                            # capture the start of the first word.
-                            on_chunk(np.array(audio_buffer, dtype=np.float32))
                         if on_start:
                             on_start()
                 else:
                     audio_buffer.extend(audio_list)
                     silence_samples = 0
-                    if on_chunk:
-                        on_chunk(audio)
             else:
                 # Reset speech counter if audio drops below threshold
                 if not is_recording:
@@ -325,8 +313,6 @@ class Audio:
                 if is_recording:
                     audio_buffer.extend(audio_list)
                     silence_samples += len(audio)
-                    if on_chunk:
-                        on_chunk(audio)
 
                     # Auto-stop on silence (only if enabled)
                     if auto_stop_on_silence and silence_samples >= silence_samples_needed:

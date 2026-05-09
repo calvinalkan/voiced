@@ -10,7 +10,6 @@ Two engines, same input contract (numpy float32 mono @ 16kHz → str | None):
 
 from __future__ import annotations
 
-import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol, cast
 
@@ -19,15 +18,7 @@ from numpy.typing import NDArray
 
 if TYPE_CHECKING:
     from faster_whisper import WhisperModel
-    from moonshine_voice.transcriber import (
-        Stream as _MoonshineCoreStream,
-    )
-    from moonshine_voice.transcriber import (
-        Transcriber as _MoonshineCoreTranscriber,
-    )
-    from moonshine_voice.transcriber import (
-        TranscriptEvent as _MoonshineTranscriptEvent,
-    )
+    from moonshine_voice.transcriber import Transcriber as _MoonshineCoreTranscriber
 
 
 WHISPER_MODELS: tuple[str, ...] = ("tiny", "base", "small", "medium", "large-v3")
@@ -132,136 +123,6 @@ _MOONSHINE_ARCH_BY_NAME: dict[str, str] = {
 }
 
 
-class MoonshineStream:
-    """Wraps moonshine's Stream so the daemon can feed chunks during recording
-    and finalize once at end-of-speech. Most of the inference work happens
-    incrementally inside add_chunk; finalize only processes the trailing buffer.
-
-    Lines are accumulated via the LineCompleted listener pattern — each call
-    to update_transcription() inside the moonshine library returns only the
-    current delta, so we register a listener at construction and capture
-    line texts as they're emitted across the stream's lifetime."""
-
-    debug: bool
-    _stream: _MoonshineCoreStream
-    _started: bool
-    _closed: bool
-    _chunks_fed: int
-    _samples_fed: int
-    _open_time: float
-    _seen_line_ids: set[int]
-    _line_texts: list[tuple[int, str]]
-
-    def __init__(self, stream: _MoonshineCoreStream, debug: bool = False) -> None:
-        self._stream = stream
-        self._started = False
-        self._closed = False
-        self._chunks_fed = 0
-        self._samples_fed = 0
-        self._open_time = time.time()
-        self._seen_line_ids = set()
-        self._line_texts = []
-        self.debug = debug
-        # Capture lines as they're finalized by the encoder. The listener fires
-        # on whichever thread called add_audio/stop; appending to a list is
-        # atomic under the GIL so no explicit lock is needed.
-        stream.add_listener(self._on_event)
-
-    def _log(self, level: str, msg: str) -> None:
-        if level == "debug" and not self.debug:
-            return
-        print(f"[transcriber] [{level}] {msg}", flush=True)
-
-    def _on_event(self, event: _MoonshineTranscriptEvent) -> None:
-        # Imported lazily so the module doesn't pay the moonshine import cost
-        # when only Whisper is in use.
-        from moonshine_voice.transcriber import LineCompleted
-
-        if not isinstance(event, LineCompleted):
-            return
-        line = event.line
-        if line.line_id in self._seen_line_ids:
-            return
-        self._seen_line_ids.add(line.line_id)
-        text = line.text.strip()
-        if text:
-            self._line_texts.append((line.line_id, text))
-            if self.debug:
-                self._log("debug", f"line #{line.line_id} completed: {text!r}")
-
-    def add_chunk(self, audio: NDArray[np.float32]) -> None:
-        """Feed a chunk to the encoder. Safe to call from the audio callback thread."""
-        if self._closed:
-            return
-        if not self._started:
-            self._stream.start()
-            self._started = True
-            self._log("debug", "stream started")
-
-        chunk_list = cast(list[float], audio.tolist())
-        self._stream.add_audio(chunk_list, sample_rate=16000)
-        self._chunks_fed += 1
-        self._samples_fed += len(chunk_list)
-
-        if self.debug:
-            wall_elapsed = time.time() - self._open_time
-            buffered_sec = self._samples_fed / 16000
-            self._log(
-                "debug",
-                f"chunk #{self._chunks_fed}: {len(chunk_list)} samples (buffered: {buffered_sec:.2f}s @ wall {wall_elapsed:.2f}s)",
-            )
-
-    def finalize(self) -> str | None:
-        """Stop the stream and return the final transcript. Idempotent — closes
-        underlying resources, safe to call once even if never started."""
-        if self._closed:
-            return None
-        if not self._started:
-            self._log("debug", "finalize called with no chunks fed")
-            self.close()
-            return None
-
-        try:
-            t0 = time.time()
-            # stop() runs a final update_transcription internally, which emits
-            # any remaining LineCompleted events to our listener before returning.
-            final_transcript = self._stream.stop()
-            finalize_ms = int((time.time() - t0) * 1000)
-
-            # Defensive merge: include any lines present in the final transcript
-            # that the listener didn't see (e.g. lines emitted only as updated/
-            # not-yet-complete and finalized in stop's update call).
-            if final_transcript is not None:
-                for line in final_transcript.lines:
-                    if line.line_id not in self._seen_line_ids:
-                        self._seen_line_ids.add(line.line_id)
-                        text = line.text.strip()
-                        if text:
-                            self._line_texts.append((line.line_id, text))
-
-            self._line_texts.sort(key=lambda pair: pair[0])
-            text = " ".join(t for _, t in self._line_texts)
-
-            if self.debug:
-                self._log(
-                    "debug",
-                    f"finalized: {self._chunks_fed} chunks, {self._samples_fed / 16000:.2f}s audio, finalize {finalize_ms}ms, {len(self._line_texts)} lines",
-                )
-            return text if text else None
-        finally:
-            self.close()
-
-    def close(self) -> None:
-        """Release native resources. Idempotent."""
-        if self._closed:
-            return
-        try:
-            self._stream.close()
-        except Exception as e:
-            self._log("warn", f"error closing stream: {e}")
-        self._closed = True
-
-
 class MoonshineTranscriber:
     model_size: str
     language: str
@@ -329,14 +190,6 @@ class MoonshineTranscriber:
 
         text = " ".join(line.text.strip() for line in transcript.lines if line.text.strip())
         return text if text else None
-
-    def start_stream(self) -> MoonshineStream:
-        """Open a new streaming inference session. Caller must call finalize()
-        (or close()) when done to release resources."""
-        if self.transcriber is None:
-            raise RuntimeError("Model not loaded. Call load() first.")
-        core_stream = self.transcriber.create_stream()
-        return MoonshineStream(core_stream, debug=self.debug)
 
 
 def make_transcriber(
