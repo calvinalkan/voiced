@@ -5,6 +5,7 @@ description = "Voice transcription daemon"
 requires-python = ">=3.12"
 dependencies = [
     "faster-whisper",
+    "moonshine-voice>=0.0.59",
     "numpy",
     "sounddevice",
 ]
