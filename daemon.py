@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from types import FrameType
@@ -30,7 +31,13 @@ import numpy as np
 from numpy.typing import NDArray
 
 from audio import Audio
-from transcriber import TRANSCRIBER_ENGINES, TranscriberProtocol, make_transcriber
+from transcriber import (
+    TRANSCRIBER_ENGINES,
+    MoonshineStream,
+    MoonshineTranscriber,
+    TranscriberProtocol,
+    make_transcriber,
+)
 from typer import Typer
 
 
@@ -488,20 +495,39 @@ class VoiceDaemon:
         else:
             log("audio", "info", "waiting for speech...")
 
+        # Streaming inference: only available on Moonshine, and only when audio
+        # comes from the live mic (test_input shortcuts past the recording loop
+        # so on_chunk would never fire).
+        stream: MoonshineStream | None = None
+        on_chunk: Callable[[NDArray[np.float32]], None] | None = None
+        if isinstance(self.transcriber, MoonshineTranscriber) and not test_input:
+            stream = self.transcriber.start_stream()
+            on_chunk = stream.add_chunk
+            if self.debug:
+                log("transcriber", "debug", "streaming inference enabled")
+
         try:
             audio = self.audio.record(
                 stop_event=self.stop_event,
                 auto_stop_on_silence=auto_stop,
                 test_input=test_input,
                 save_audio=save_audio,
+                on_chunk=on_chunk,
             )
-            self.process_audio(audio, test_output=test_output)
+            self.process_audio(audio, test_output=test_output, stream=stream)
         finally:
+            # Idempotent close — handles both the early-bail-on-empty-audio
+            # case and any exception during process_audio.
+            if stream is not None:
+                stream.close()
             self.recording = False
             self.stop_event.clear()
 
     def process_audio(
-        self, audio: NDArray[np.float32] | None, test_output: str | None = None
+        self,
+        audio: NDArray[np.float32] | None,
+        test_output: str | None = None,
+        stream: MoonshineStream | None = None,
     ) -> None:
         if audio is None or len(audio) < 8000:
             log("audio", "info", "no speech detected")
@@ -515,7 +541,12 @@ class VoiceDaemon:
         log("transcriber", "info", "processing...")
 
         start_time = time.time()
-        text = self.transcriber.transcribe(audio)
+        if stream is not None:
+            # Streaming path: most encoder work already done during recording;
+            # finalize processes the trailing buffer and returns the transcript.
+            text = stream.finalize()
+        else:
+            text = self.transcriber.transcribe(audio)
         elapsed_ms = int((time.time() - start_time) * 1000)
 
         if not text:
