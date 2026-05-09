@@ -22,10 +22,12 @@ voiced kill 2>/dev/null || true
 sleep 1
 
 echo "=== Starting daemon ==="
-# Pin engine + model so the test stays reproducible regardless of the user's
-# real ~/.config/voiced/config.json. The expected fixture matches Whisper
-# base output ("Hello world, hello my agent.").
-voiced serve --debug --transcriber-engine whisper --model base &
+# Pin engine + model + streaming-off so the test stays reproducible regardless
+# of the user's real ~/.config/voiced/config.json. The expected fixture matches
+# Whisper base output ("Hello world, hello my agent."). --no-streaming is
+# required because whisper rejects streaming=true and the user's config may
+# have it enabled.
+voiced serve --debug --transcriber-engine whisper --model base --no-streaming &
 DAEMON_PID=$!
 sleep 3
 

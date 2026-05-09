@@ -75,12 +75,18 @@ class _Msg(NamedTuple):
     kind="chunk"     : audio chunk (audio field set)
     kind="finalize"  : drain session, append text to out_box, set done_event
     kind="shutdown"  : exit worker loop
+
+    enqueue_time is the time.time() at queue.put — used by the worker to
+    log how long a finalize message waited in the queue behind audio
+    chunk backlog. That wait is the dominant component of user-perceived
+    end-of-speech latency when the encoder runs slower than real-time.
     """
 
     kind: str
     audio: NDArray[np.float32] | None = None
     done_event: threading.Event | None = None
     out_box: list[str | None] | None = None
+    enqueue_time: float = 0.0
 
 
 def _signal_done(msg: _Msg, text: str | None) -> None:
@@ -168,10 +174,17 @@ class WhisperTranscriber:
             if msg.audio is not None:
                 self._buffer.append(msg.audio)
         elif msg.kind == "finalize":
+            queue_wait_ms = (
+                int((time.time() - msg.enqueue_time) * 1000)
+                if msg.enqueue_time
+                else 0
+            )
             try:
                 text = self._finalize_buffer()
             finally:
                 self._buffer = []
+            if self.debug and queue_wait_ms > 0:
+                self._log("debug", f"finalize queue wait: {queue_wait_ms}ms")
             _signal_done(msg, text)
         elif msg.kind == "shutdown":
             self._buffer = []
@@ -219,7 +232,14 @@ class WhisperTranscriber:
     def finalize(self) -> str | None:
         done = threading.Event()
         out_box: list[str | None] = []
-        self._queue.put(_Msg(kind="finalize", done_event=done, out_box=out_box))
+        self._queue.put(
+            _Msg(
+                kind="finalize",
+                done_event=done,
+                out_box=out_box,
+                enqueue_time=time.time(),
+            )
+        )
         _ = done.wait()
         return out_box[0] if out_box else None
 
@@ -346,8 +366,17 @@ class MoonshineTranscriber:
             if msg.audio is not None:
                 self._handle_chunk(msg.audio)
         elif msg.kind == "finalize":
+            # Time spent waiting in the queue behind audio-chunk backlog. When
+            # the encoder runs slower than real-time, this dominates the
+            # user-perceived end-of-speech latency — the inner stop()/transcribe
+            # call runs fast once the worker actually reaches it.
+            queue_wait_ms = (
+                int((time.time() - msg.enqueue_time) * 1000)
+                if msg.enqueue_time
+                else 0
+            )
             try:
-                text = self._handle_finalize()
+                text = self._handle_finalize(queue_wait_ms)
             finally:
                 self._cleanup_session()
             _signal_done(msg, text)
@@ -390,12 +419,12 @@ class MoonshineTranscriber:
                 f"chunk #{self._session_chunks}: {len(audio)} samples (buffered {buffered:.2f}s @ wall {wall:.2f}s)",
             )
 
-    def _handle_finalize(self) -> str | None:
+    def _handle_finalize(self, queue_wait_ms: int) -> str | None:
         if self.streaming:
-            return self._finalize_streaming()
-        return self._finalize_buffered()
+            return self._finalize_streaming(queue_wait_ms)
+        return self._finalize_buffered(queue_wait_ms)
 
-    def _finalize_streaming(self) -> str | None:
+    def _finalize_streaming(self, queue_wait_ms: int) -> str | None:
         if self._stream is None:
             self._log("debug", "streaming finalize without active session")
             return None
@@ -403,17 +432,18 @@ class MoonshineTranscriber:
         # Stream.stop() runs a final update_transcription internally and emits
         # any remaining LineCompleted events to our listener before returning.
         _ = self._stream.stop()
-        elapsed_ms = int((time.time() - t0) * 1000)
+        stop_ms = int((time.time() - t0) * 1000)
         self._session_lines.sort(key=lambda p: p[0])
         text = " ".join(t for _, t in self._session_lines)
         if self.debug:
+            total_ms = queue_wait_ms + stop_ms
             self._log(
                 "debug",
-                f"finalized streaming: {self._session_chunks} chunks, {self._session_samples / 16000:.2f}s audio, finalize {elapsed_ms}ms, {len(self._session_lines)} lines",
+                f"finalized streaming: {self._session_chunks} chunks, {self._session_samples / 16000:.2f}s audio, queue_wait {queue_wait_ms}ms + stop {stop_ms}ms = {total_ms}ms, {len(self._session_lines)} lines",
             )
         return text if text else None
 
-    def _finalize_buffered(self) -> str | None:
+    def _finalize_buffered(self, queue_wait_ms: int) -> str | None:
         if not self._buffer:
             return None
         audio = np.concatenate(self._buffer)
@@ -425,14 +455,15 @@ class MoonshineTranscriber:
         transcript = self.transcriber.transcribe_without_streaming(
             audio_list, sample_rate=16000
         )
-        elapsed_ms = int((time.time() - t0) * 1000)
+        transcribe_ms = int((time.time() - t0) * 1000)
         text = " ".join(
             line.text.strip() for line in transcript.lines if line.text.strip()
         )
         if self.debug:
+            total_ms = queue_wait_ms + transcribe_ms
             self._log(
                 "debug",
-                f"finalized buffered: {self._session_chunks} chunks, {len(audio) / 16000:.2f}s audio, transcribe {elapsed_ms}ms, {len(transcript.lines)} lines",
+                f"finalized buffered: {self._session_chunks} chunks, {len(audio) / 16000:.2f}s audio, queue_wait {queue_wait_ms}ms + transcribe {transcribe_ms}ms = {total_ms}ms, {len(transcript.lines)} lines",
             )
         return text if text else None
 
@@ -471,7 +502,14 @@ class MoonshineTranscriber:
     def finalize(self) -> str | None:
         done = threading.Event()
         out_box: list[str | None] = []
-        self._queue.put(_Msg(kind="finalize", done_event=done, out_box=out_box))
+        self._queue.put(
+            _Msg(
+                kind="finalize",
+                done_event=done,
+                out_box=out_box,
+                enqueue_time=time.time(),
+            )
+        )
         _ = done.wait()
         return out_box[0] if out_box else None
 
