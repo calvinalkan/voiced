@@ -3,5 +3,7 @@
     "device": "cpu",
     "silence_threshold": 0.01,
     "silence_duration": 0.6,
-    "auto_enter": false
+    "auto_enter": false,
+    "insertion_method": "paste",
+    "paste_keybind": "ctrl+shift+v"
 }

@@ -1,6 +1,8 @@
 """
 Text insertion module for voiced.
-Uses dotool for layout-aware keyboard input.
+
+Inserts dictated text via paste-first (wl-clipboard + Ctrl+Shift+V), falling
+back to layout-aware keyboard typing through dotool when paste is unavailable.
 """
 
 from __future__ import annotations
@@ -9,6 +11,7 @@ import os
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 
@@ -76,9 +79,13 @@ class Typer:
     keyboard_layout: str
     backend: str
     backend_path: str
+    insertion_method: str
+    paste_keybind: str
     _start_time: float | None
     _dotool_proc: subprocess.Popen[bytes] | None
     _dotool_lock: threading.Lock
+    _copy_to_clipboard: Callable[[str], bool]
+    _notify: Callable[[str], None]
 
     def __init__(
         self,
@@ -86,13 +93,18 @@ class Typer:
         keyboard_layout: str | None = None,
         auto_enter: bool = False,
         debug: bool = False,
+        insertion_method: str = "paste",
+        paste_keybind: str = "ctrl+shift+v",
+        copy_to_clipboard: Callable[[str], bool] | None = None,
+        notify: Callable[[str], None] | None = None,
     ) -> None:
         self.auto_enter = auto_enter
         self.debug = debug
         self.keyboard_layout = keyboard_layout or detect_keyboard_layout()
+        self.paste_keybind = paste_keybind
+        self._copy_to_clipboard = copy_to_clipboard or (lambda _t: False)
+        self._notify = notify or (lambda _m: None)
         self._start_time = None
-
-        # Persistent dotool process
         self._dotool_proc = None
         self._dotool_lock = threading.Lock()
 
@@ -112,7 +124,15 @@ class Typer:
             self.backend = name
             self.backend_path = path
 
-        # Dotool process started lazily on first use
+        # Paste support is dotool-only: ydotool's key API takes raw evdev
+        # keycodes which would need a separate keymap translation layer.
+        if insertion_method == "paste" and self.backend != "dotool":
+            self._log(
+                "warn",
+                f"paste not implemented for {self.backend}, using type insertion",
+            )
+            insertion_method = "type"
+        self.insertion_method = insertion_method
 
     def _log(self, level: str, msg: str) -> None:
         if level == "debug" and not self.debug:
@@ -125,18 +145,16 @@ class Typer:
             env = os.environ.copy()
             env["DOTOOL_XKB_LAYOUT"] = self.keyboard_layout
 
+            # stdout/stderr to DEVNULL: dotool emits warnings (e.g. unmapped
+            # keysyms) to stderr; with PIPE the buffer fills over a long-lived
+            # session and dotool blocks on its next stderr write, freezing input.
             self._dotool_proc = subprocess.Popen(
                 [self.backend_path],
                 stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 env=env,
             )
-
-            # Send initial config
-            if self._dotool_proc.stdin:
-                _ = self._dotool_proc.stdin.write(b"typedelay 0\ntypehold 0\n")
-                self._dotool_proc.stdin.flush()
 
             self._log("debug", "dotool started")
             return True
@@ -145,89 +163,100 @@ class Typer:
             self._dotool_proc = None
             return False
 
-    def _type_dotool(self, text: str) -> tuple[int, int]:
-        """Type using persistent dotool process. Returns (total, failed)."""
+    def _send_dotool(self, cmd: str) -> bool:
+        """Write a command to dotool stdin. Reconnects once on broken pipe."""
         with self._dotool_lock:
-            # Start process on first use
             if self._dotool_proc is None:
                 if not self._start_dotool():
-                    raise RuntimeError("dotool not available")
+                    return False
 
-            try:
-                # Send type command
-                cmd = f"type {text}\n"
-                if self.auto_enter:
-                    cmd += "key Return\n"
-
-                if self._dotool_proc and self._dotool_proc.stdin:
-                    _ = self._dotool_proc.stdin.write(cmd.encode())
-                    self._dotool_proc.stdin.flush()
-
-                # Note: We can't easily get per-character failure info with persistent process
-                # The warnings go to stderr but we can't read them without blocking
-                return (len(text), 0)
-
-            except (BrokenPipeError, OSError) as e:
-                # Process died, try once to restart
-                self._log("warn", f"dotool pipe error: {e}, restarting...")
-                self._dotool_proc = None
-
-                if not self._start_dotool():
-                    raise RuntimeError("dotool restart failed") from e
-
-                # Retry the write
+            for attempt in range(2):
                 try:
-                    cmd = f"type {text}\n"
-                    if self.auto_enter:
-                        cmd += "key Return\n"
                     if self._dotool_proc and self._dotool_proc.stdin:
                         _ = self._dotool_proc.stdin.write(cmd.encode())
                         self._dotool_proc.stdin.flush()
-                    return (len(text), 0)
-                except (BrokenPipeError, OSError) as retry_err:
+                    return True
+                except (BrokenPipeError, OSError) as e:
+                    if attempt == 0:
+                        self._log("warn", f"dotool pipe error: {e}, restarting")
+                        self._dotool_proc = None
+                        if not self._start_dotool():
+                            return False
+                        continue
+                    self._log("error", f"dotool failed after restart: {e}")
                     self._dotool_proc = None
-                    raise RuntimeError("dotool failed after restart") from retry_err
+                    return False
+            return False
 
-    def _type_ydotool(self, text: str) -> None:
-        """Type using ydotool (instant, may have layout issues)."""
+    def _try_paste(self, text: str) -> bool:
+        """Copy to clipboard and send paste keybind. All-or-nothing."""
+        if not self._copy_to_clipboard(text):
+            return False
+        # wl-copy forks to background after acquiring the selection, but the
+        # compositor's selection handover takes a few ms; a brief settle keeps
+        # the paste keystroke from racing the clipboard owner change.
+        time.sleep(0.05)
+        cmd = f"key {self.paste_keybind}\n"
+        if self.auto_enter:
+            cmd += "key enter\n"
+        return self._send_dotool(cmd)
+
+    def _type_dotool(self, text: str) -> bool:
+        """Type via dotool at a paced rate. Used as fallback when paste fails."""
+        # 4ms typedelay + 4ms typehold ≈ 125 keys/sec. Faster rates drop
+        # characters mid-stream (kernel uinput overflow) or trigger Wayland
+        # EPIPE crashes in apps like Zed under sustained synthetic input.
+        cmd = f"typedelay 4\ntypehold 4\ntype {text}\n"
+        if self.auto_enter:
+            cmd += "key enter\n"
+        return self._send_dotool(cmd)
+
+    def _type_ydotool(self, text: str) -> bool:
+        """Type via ydotool (no layout awareness, same paced rate)."""
         env = os.environ.copy()
         for s in ["/tmp/.ydotool_socket", f"/run/user/{os.getuid()}/.ydotool_socket"]:
             if os.path.exists(s):
                 env["YDOTOOL_SOCKET"] = s
                 break
 
-        cmd = [self.backend_path, "type", "-d", "0", "-H", "0", "--", text]
-        result = subprocess.run(cmd, capture_output=True, timeout=10, env=env)
-
-        if result.returncode != 0:
-            raise RuntimeError(f"ydotool failed: {result.stderr.decode()}")
-
-        if self.auto_enter:
-            _ = subprocess.run(
-                [self.backend_path, "key", "28:1", "28:0"],
+        try:
+            result = subprocess.run(
+                [self.backend_path, "type", "-d", "4", "-H", "4", "--", text],
                 capture_output=True,
-                timeout=1,
+                timeout=15,
                 env=env,
             )
+            if result.returncode != 0:
+                self._log("error", f"ydotool failed: {result.stderr.decode()}")
+                return False
+            if self.auto_enter:
+                _ = subprocess.run(
+                    [self.backend_path, "key", "28:1", "28:0"],
+                    capture_output=True,
+                    timeout=1,
+                    env=env,
+                )
+            return True
+        except subprocess.TimeoutExpired:
+            self._log("error", "ydotool timed out after 15s")
+            return False
 
-    def type_text(self, text: str) -> tuple[bool, int, int]:
-        """Insert text at cursor position. Returns (success, total_chars, failed_chars)."""
+    def insert_text(self, text: str) -> tuple[bool, str]:
+        """Insert text at cursor. Returns (success, method) where method is
+        'paste' or 'type'. In paste mode, falls back to typing on failure."""
         self._start_time = time.time()
-
         if not text:
-            return (False, 0, 0)
+            return (False, "none")
 
-        try:
-            if self.backend == "dotool":
-                total, failed = self._type_dotool(text)
-                return (True, total, failed)
-            else:
-                self._type_ydotool(text)
-                return (True, len(text), 0)
+        if self.insertion_method == "paste":
+            if self._try_paste(text):
+                return (True, "paste")
+            self._log("warn", "paste failed, falling back to type")
+            self._notify("voiced: paste failed, typing instead")
 
-        except Exception as e:
-            self._log("error", f"type failed: {e}")
-            return (False, len(text), len(text))
+        if self.backend == "dotool":
+            return (self._type_dotool(text), "type")
+        return (self._type_ydotool(text), "type")
 
     def shutdown(self) -> None:
         """Clean up persistent dotool process."""

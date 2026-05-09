@@ -46,6 +46,8 @@ class Config(TypedDict):
     keyboard_layout: str | None
     typer_backend: str
     clipboard_copy: bool
+    insertion_method: str
+    paste_keybind: str
 
 # File paths - support multiple instances via VOICED_INSTANCE env var
 _INSTANCE = os.environ.get("VOICED_INSTANCE", "")
@@ -70,6 +72,8 @@ DEFAULT_CONFIG: Config = {
     "keyboard_layout": None,
     "typer_backend": "auto",
     "clipboard_copy": True,
+    "insertion_method": "paste",
+    "paste_keybind": "ctrl+shift+v",
 }
 
 
@@ -78,8 +82,8 @@ def log(component: str, level: str, message: str) -> None:
     print(f"[{component}] [{level}] {message}", flush=True)
 
 
-def copy_to_clipboard(text: str) -> None:
-    """Copy text to clipboard using wl-copy (Wayland). Timeout if it hangs."""
+def copy_to_clipboard(text: str) -> bool:
+    """Copy text to clipboard via wl-copy. Returns True on success."""
     proc: subprocess.Popen[bytes] | None = None
     try:
         # wl-copy forks to background by default to serve paste requests.
@@ -94,20 +98,24 @@ def copy_to_clipboard(text: str) -> None:
         _ = proc.communicate(input=text.encode(), timeout=2)
         if proc.returncode == 0:
             log("clipboard", "info", f"copied: {len(text)} chars")
-        else:
-            log("clipboard", "warn", f"clipboard copy failed: exit {proc.returncode}")
+            return True
+        log("clipboard", "warn", f"clipboard copy failed: exit {proc.returncode}")
+        return False
     except subprocess.TimeoutExpired:
         log("clipboard", "warn", "wl-copy timed out after 2s, killing")
         if proc:
             _ = proc.kill()
             _ = proc.wait()
+        return False
     except FileNotFoundError:
         log("clipboard", "warn", "wl-copy not found, skipping clipboard")
+        return False
     except Exception as e:
         log("clipboard", "warn", f"clipboard copy failed: {e}")
         if proc:
             _ = proc.kill()
             _ = proc.wait()
+        return False
 
 
 def notify(message: str, urgency: str = "normal", timeout: int = 2000) -> int | None:
@@ -228,6 +236,12 @@ def parse_config(data: object) -> Config:
         config["typer_backend"] = v
     if (v := get_bool("clipboard_copy")) is not None:
         config["clipboard_copy"] = v
+    if (v := get_str("insertion_method")) is not None:
+        if v not in ("paste", "type"):
+            raise ConfigError(f"insertion_method must be 'paste' or 'type', got '{v}'")
+        config["insertion_method"] = v
+    if (v := get_str("paste_keybind")) is not None:
+        config["paste_keybind"] = v
 
     return config
 
@@ -368,11 +382,18 @@ class VoiceDaemon:
             device=config["device"],
             debug=self.debug,
         )
+        def typer_notify(msg: str) -> None:
+            _ = notify(msg, urgency="low")
+
         self.typer = Typer(
             backend=config["typer_backend"],
             keyboard_layout=config["keyboard_layout"],
             auto_enter=config["auto_enter"],
             debug=self.debug,
+            insertion_method=config["insertion_method"],
+            paste_keybind=config["paste_keybind"],
+            copy_to_clipboard=copy_to_clipboard,
+            notify=typer_notify,
         )
 
     def _start_recording_thread(
@@ -519,28 +540,23 @@ class VoiceDaemon:
             return
 
         start_time = time.time()
-        success, total, failed = self.typer.type_text(text)
+        success, method = self.typer.insert_text(text)
         elapsed_ms = int((time.time() - start_time) * 1000)
 
-        # Copy to clipboard (async, won't block)
-        if self.config.get("clipboard_copy", True):
-            copy_to_clipboard(text)
+        # Paste mode already populated the clipboard. For type mode (or paste
+        # fallback to type), explicitly copy if the user wants the dictation
+        # left on the clipboard.
+        if method != "paste" and self.config.get("clipboard_copy", True):
+            _ = copy_to_clipboard(text)
 
         # Close "Transcribing..." notification now that we're done
         notify_close(notify_id)
 
-        if success and failed == 0:
-            log("typer", "info", f"done ({elapsed_ms}ms): {total} chars")
-        elif success and failed > 0:
-            log(
-                "typer",
-                "warn",
-                f"done ({elapsed_ms}ms): {total - failed}/{total} chars, {failed} failed",
-            )
-            _ = notify(f"Typing incomplete: {failed} chars failed - check history")
+        if success:
+            log("typer", "info", f"done ({elapsed_ms}ms, {method}): {len(text)} chars")
         else:
             log("typer", "error", "failed (saved to history)")
-            _ = notify("Failed to type - use 'voiced history' to recover")
+            _ = notify("Failed to insert text - use 'voiced history' to recover")
 
     def run(self) -> None:
         print("=" * 50, flush=True)
@@ -553,6 +569,8 @@ class VoiceDaemon:
         print(f"  Speech start:      {self.config['speech_start_duration']}s", flush=True)
         print(f"  Auto-enter:        {self.config['auto_enter']}", flush=True)
         print(f"  Clipboard copy:    {self.config['clipboard_copy']}", flush=True)
+        print(f"  Insertion method:  {self.typer.insertion_method}", flush=True)
+        print(f"  Paste keybind:     {self.typer.paste_keybind}", flush=True)
         print(f"  Typer backend:     {self.typer.backend}", flush=True)
         print(f"  Keyboard layout:   {self.typer.keyboard_layout}", flush=True)
         print(f"  Debug:             {self.debug}", flush=True)
@@ -598,6 +616,11 @@ def main() -> None:
     _ = parser.add_argument(
         "--typer-backend", choices=["auto", "dotool", "ydotool"], help="Typing backend"
     )
+    _ = parser.add_argument(
+        "--insertion-method",
+        choices=["paste", "type"],
+        help="How dictated text reaches the focused app",
+    )
     _ = parser.add_argument("--debug", "-d", action="store_true")
     args = parser.parse_args()
 
@@ -610,6 +633,7 @@ def main() -> None:
     arg_auto_enter = cast(bool, args.auto_enter)
     arg_keyboard_layout = cast(str | None, args.keyboard_layout)
     arg_typer_backend = cast(str | None, args.typer_backend)
+    arg_insertion_method = cast(str | None, args.insertion_method)
     arg_debug = cast(bool, args.debug)
 
     config = load_config(arg_config)
@@ -628,6 +652,8 @@ def main() -> None:
         config["keyboard_layout"] = arg_keyboard_layout
     if arg_typer_backend:
         config["typer_backend"] = arg_typer_backend
+    if arg_insertion_method:
+        config["insertion_method"] = arg_insertion_method
     if arg_debug:
         config["debug"] = True
 
