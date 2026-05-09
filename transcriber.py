@@ -47,7 +47,20 @@ if TYPE_CHECKING:
     )
 
 
-WHISPER_MODELS: tuple[str, ...] = ("tiny", "base", "small", "medium", "large-v3")
+WHISPER_MODELS: tuple[str, ...] = (
+    "tiny",
+    "base",
+    "small",
+    "medium",
+    "large-v3",
+    # English-only variants — typically more accurate on English at the same
+    # size, since they don't have to share capacity with 98 other languages.
+    # No `.en` for large-v3.
+    "tiny.en",
+    "base.en",
+    "small.en",
+    "medium.en",
+)
 MOONSHINE_MODELS: tuple[str, ...] = (
     "tiny",
     "base",
