@@ -29,7 +29,7 @@ from typing import TypedDict, cast
 import numpy as np
 from numpy.typing import NDArray
 
-from audio import Audio
+from audio import Audio, InputDeviceError
 from transcriber import TRANSCRIBER_ENGINES, TranscriberProtocol, make_transcriber
 from typer import Typer
 
@@ -37,6 +37,7 @@ from typer import Typer
 class Config(TypedDict):
     model: str
     device: str
+    input_device: str | None
     silence_threshold: float
     silence_duration: float
     speech_start_duration: float
@@ -65,6 +66,7 @@ HISTORY_FILE = STATE_DIR / "history.json"
 DEFAULT_CONFIG: Config = {
     "model": "base",
     "device": "cpu",
+    "input_device": None,
     "silence_threshold": 0.02,
     "silence_duration": 0.8,
     "speech_start_duration": 0.2,
@@ -122,22 +124,34 @@ def copy_to_clipboard(text: str) -> bool:
         return False
 
 
-def notify(message: str, urgency: str = "normal", timeout: int = 2000) -> int | None:
+def notify(
+    message: str,
+    urgency: str = "normal",
+    timeout: int = 2000,
+    body: str | None = None,
+) -> int | None:
     """Send desktop notification (non-blocking). Returns notification ID."""
     # Skip notifications in test mode
     if _INSTANCE:
         return None
     try:
+        command = [
+            "notify-send",
+            "-a",
+            "voiced",
+            "-i",
+            "audio-input-microphone",
+            "-u",
+            urgency,
+            "-t",
+            str(timeout),
+            "-p",  # Print notification ID
+            message,
+        ]
+        if body is not None:
+            command.append(body)
         result = subprocess.run(
-            [
-                "notify-send",
-                "-a", "voiced",
-                "-i", "audio-input-microphone",
-                "-u", urgency,
-                "-t", str(timeout),
-                "-p",  # Print notification ID
-                message,
-            ],
+            command,
             capture_output=True,
             text=True,
             timeout=1,
@@ -222,6 +236,11 @@ def parse_config(data: object) -> Config:
         config["model"] = v
     if (v := get_str("device")) is not None:
         config["device"] = v
+    if "input_device" in d:
+        input_device = get_str_or_none("input_device")
+        if input_device == "":
+            raise ConfigError("input_device must not be empty")
+        config["input_device"] = input_device
     if (v := get_float("silence_threshold")) is not None:
         config["silence_threshold"] = v
     if (v := get_float("silence_duration")) is not None:
@@ -391,6 +410,7 @@ class VoiceDaemon:
             silence_threshold=config["silence_threshold"],
             silence_duration=config["silence_duration"],
             speech_start_duration=config["speech_start_duration"],
+            input_device=config["input_device"],
             debug=self.debug,
             is_tty=self.is_tty,
         )
@@ -508,6 +528,15 @@ class VoiceDaemon:
                 save_audio=save_audio,
             )
             self.process_audio(audio, test_output=test_output)
+        except InputDeviceError as e:
+            _ = self.transcriber.finalize()
+            log("audio", "error", str(e))
+            _ = notify(
+                "voiced: microphone error",
+                urgency="critical",
+                timeout=5000,
+                body=str(e),
+            )
         finally:
             self.recording = False
             self.stop_event.clear()
@@ -590,6 +619,10 @@ class VoiceDaemon:
         print(f"  Model:             {self.config['model']}", flush=True)
         print(f"  Streaming:         {self.config['streaming']}", flush=True)
         print(f"  Device:            {self.config['device']}", flush=True)
+        print(
+            f"  Input device:      {self.config['input_device'] or 'system default'}",
+            flush=True,
+        )
         print(f"  Silence threshold: {self.config['silence_threshold']} (amplitude 0.0-1.0)", flush=True)
         print(f"  Silence duration:  {self.config['silence_duration']}s", flush=True)
         print(f"  Speech start:      {self.config['speech_start_duration']}s", flush=True)

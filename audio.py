@@ -5,7 +5,9 @@ Handles microphone input and silence detection.
 
 from __future__ import annotations
 
+import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -21,6 +23,10 @@ from numpy.typing import NDArray
 AudioArray = NDArray[np.float32]
 
 
+class InputDeviceError(RuntimeError):
+    """The configured or default microphone cannot be opened for recording."""
+
+
 def get_terminal_width() -> int:
     """Get terminal width, default to 80 if unavailable."""
     try:
@@ -34,6 +40,7 @@ class Audio:
     silence_threshold: float
     silence_duration: float
     speech_start_duration: float
+    input_device: str | None
     channels: int
     debug: bool
     is_tty: bool
@@ -48,6 +55,7 @@ class Audio:
         silence_duration: float = 0.6,
         sample_rate: int = 16000,
         speech_start_duration: float = 0.2,
+        input_device: str | None = None,
         debug: bool = False,
         is_tty: bool = True,
     ) -> None:
@@ -55,6 +63,7 @@ class Audio:
         self.silence_threshold = silence_threshold
         self.silence_duration = silence_duration
         self.speech_start_duration = speech_start_duration  # Sustained speech needed to start
+        self.input_device = input_device
         self.channels = 1
         self.debug = debug
         self.is_tty = is_tty
@@ -214,6 +223,84 @@ class Audio:
 
         return audio
 
+    def _select_input_device(self) -> None:
+        if self.input_device is None:
+            if self.debug:
+                self._log("debug", "using system default input device")
+            return
+
+        selection_start = time.monotonic()
+        try:
+            result = subprocess.run(
+                ["pactl", "--format=json", "list", "sources"],
+                capture_output=True,
+                text=True,
+                timeout=1,
+                check=True,
+            )
+            sources = cast(list[dict[str, object]], json.loads(result.stdout))
+        except FileNotFoundError as e:
+            raise InputDeviceError(
+                "cannot select a configured microphone because pactl is unavailable"
+            ) from e
+        except (subprocess.SubprocessError, json.JSONDecodeError, TypeError) as e:
+            raise InputDeviceError(f"could not list PipeWire input devices: {e}") from e
+
+        input_sources: list[tuple[str, str]] = []
+        for source in sources:
+            name = source.get("name")
+            description = source.get("description")
+            if isinstance(name, str) and not name.endswith(".monitor"):
+                input_sources.append(
+                    (name, description if isinstance(description, str) else name)
+                )
+
+        if self.debug:
+            available = "; ".join(
+                f"{description} ({name})" for name, description in input_sources
+            ) or "none"
+            self._log("debug", f"available input devices: {available}")
+
+        configured_name = self.input_device.casefold()
+        matches = [
+            (name, description)
+            for name, description in input_sources
+            if configured_name in name.casefold()
+            or configured_name in description.casefold()
+        ]
+        if not matches:
+            raise InputDeviceError(
+                f"configured microphone {self.input_device!r} is unavailable"
+            )
+        if len(matches) > 1:
+            matched_names = "; ".join(
+                f"{description} ({name})" for name, description in matches
+            )
+            raise InputDeviceError(
+                f"configured microphone {self.input_device!r} is ambiguous; matched {matched_names}"
+            )
+
+        source_name, description = matches[0]
+        try:
+            _ = subprocess.run(
+                ["pactl", "set-default-source", source_name],
+                capture_output=True,
+                text=True,
+                timeout=1,
+                check=True,
+            )
+        except subprocess.SubprocessError as e:
+            raise InputDeviceError(
+                f"could not select configured microphone {self.input_device!r}: {e}"
+            ) from e
+
+        if self.debug:
+            elapsed_ms = int((time.monotonic() - selection_start) * 1000)
+            self._log(
+                "debug",
+                f"using configured input device: {description} ({source_name}), selected in {elapsed_ms}ms",
+            )
+
     def record(
         self,
         stop_event: threading.Event | None = None,
@@ -259,6 +346,7 @@ class Audio:
             if save_audio:
                 self.to_file(audio, save_audio)
             return audio
+        self._select_input_device()
         audio_buffer: list[float] = []
         pre_buffer: list[float] = []
         is_recording = False
@@ -345,20 +433,28 @@ class Audio:
                         if on_stop:
                             on_stop()
 
-        with sd.InputStream(
-            samplerate=self.sample_rate,
-            channels=self.channels,
-            dtype=np.float32,
-            blocksize=int(self.sample_rate * 0.1),
-            callback=callback,
-        ):
-            while not done:
-                # Check for external stop signal
-                if stop_event and stop_event.is_set():
-                    if on_stop:
-                        on_stop()
-                    break
-                sd.sleep(50)  # pyright: ignore[reportUnknownMemberType]
+        try:
+            with sd.InputStream(
+                samplerate=self.sample_rate,
+                channels=self.channels,
+                dtype=np.float32,
+                blocksize=int(self.sample_rate * 0.1),
+                callback=callback,
+            ):
+                while not done:
+                    # Check for external stop signal
+                    if stop_event and stop_event.is_set():
+                        if on_stop:
+                            on_stop()
+                        break
+                    sd.sleep(50)  # pyright: ignore[reportUnknownMemberType]
+        except sd.PortAudioError as e:
+            device_description = (
+                repr(self.input_device)
+                if self.input_device is not None
+                else "the system default microphone"
+            )
+            raise InputDeviceError(f"could not open {device_description}: {e}") from e
 
         # Clear live display line when done
         if self.debug and self.is_tty:

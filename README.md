@@ -151,6 +151,7 @@ transcription, and no CPU drama while you're talking.
 | `model` | str | `"base"` | model name; depends on engine — see below |
 | `streaming` | bool | `false` | live streaming inference (Moonshine only). On by default = no; only enable if your CPU can keep up. |
 | `device` | str | `"cpu"` | `"cpu"` or `"cuda"` if you have a GPU |
+| `input_device` | str/null | `null` | case-insensitive microphone name fragment; `null` uses the system default |
 | `silence_threshold` | float | `0.02` | amplitude threshold for "is this speech" (0.0–1.0) |
 | `silence_duration` | float | `0.8` | seconds of quiet before auto-stop in `listen` mode |
 | `speech_start_duration` | float | `0.2` | sustained speech needed to start recording |
@@ -162,6 +163,13 @@ transcription, and no CPU drama while you're talking.
 | `keyboard_layout` | str/null | autodetected | XKB layout (e.g. `"de"`, `"us"`) — only matters in `type` insertion mode |
 | `history_size` | int | `20` | keep this many recent transcriptions |
 | `debug` | bool | `false` | verbose chunk-by-chunk logs |
+
+When `input_device` is set, voiced resolves the PipeWire source before every
+recording and makes that source the system default before opening the audio
+stream, so USB device indexes may change safely. It refuses to record if the
+name is missing or matches multiple inputs; it never silently falls back to
+another microphone. Debug logging lists the available inputs, the selected
+match, and selection latency.
 
 ### Available models
 
@@ -330,6 +338,11 @@ Whisper `small.en`.
 ## Troubleshooting
 
 **`voiced status` says "Daemon not running"** → start it: `systemctl --user start voiced`. If it crashes, `journalctl --user -u voiced -n 50` for logs.
+
+**The configured microphone is unavailable or ambiguous** → voiced refuses to
+record, logs the error, and sends a critical desktop notification. Run the
+daemon with `--debug` to list the input devices seen by PipeWire, then make
+`input_device` more precise or reconnect the microphone.
 
 **Paste doesn't land in app X** → try `"insertion_method": "type"` in your config. Some sandboxed apps (Citrix, password managers) block clipboard paste.
 
