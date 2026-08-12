@@ -321,9 +321,11 @@ make check                 # lint + typecheck + fast tests (~20s)
 make test-realtime         # adds the slow ~30s real-time-paced streaming test
 ```
 
-`test-fixtures/hello_world.wav` and `test-fixtures/paragraph.wav` are the
-reference inputs. Add your own — anything in `test-fixtures/` works the
-same way.
+`test-fixtures/hello_world.wav` and `test-fixtures/paragraph.wav` cover the
+basic pipeline and long-form behavior. The `dictation-*.wav` fixtures are real
+Shure MV7 recordings covering ordinary speech, technical vocabulary, and
+numbers; the transcriber suite checks their distinctive phrases with
+Whisper `small.en`.
 
 ## Troubleshooting
 

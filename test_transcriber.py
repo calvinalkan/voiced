@@ -148,6 +148,50 @@ def load_wav(path: Path) -> tuple[NDArray[np.float32], int]:
     return audio, sr
 
 
+def test_whisper_dictation_fixtures() -> None:
+    print("\n--- whisper small.en dictation quality ---")
+    cases = [
+        (
+            "dictation-ordinary.wav",
+            ("weather was unusually pleasant", "answered two messages"),
+        ),
+        (
+            "dictation-technical.wav",
+            ("lock-free queue", "without blocking the microphone"),
+        ),
+        (
+            "dictation-numbers.wav",
+            ("release version 3.14.7", "12.5 seconds", "status code 503"),
+        ),
+    ]
+
+    t = WhisperTranscriber(model_size="small.en")
+    t.load()
+    try:
+        for filename, expected_phrases in cases:
+            audio, sr = load_wav(REPO_ROOT / "test-fixtures" / filename)
+            t.start_session()
+            feed_in_chunks(t, audio, sr)
+
+            t0 = time.time()
+            text = t.finalize()
+            elapsed_ms = int((time.time() - t0) * 1000)
+            if not text:
+                raise AssertionError(f"[{filename}] returned empty text")
+
+            text_lower = text.lower()
+            missing_phrases = [
+                phrase for phrase in expected_phrases if phrase not in text_lower
+            ]
+            if missing_phrases:
+                raise AssertionError(
+                    f"[{filename}] missing {missing_phrases!r}, got {text!r}"
+                )
+            print(f"  PASS {filename} ({elapsed_ms}ms): {text!r}")
+    finally:
+        t.shutdown()
+
+
 def test_paragraph_fixture() -> None:
     """Long-form paragraph (~30s, named-checkpoint paragraph used during dev).
 
@@ -302,6 +346,7 @@ def main() -> int:
     print(f"fixture: {len(audio) / sr:.1f}s of audio, {sr} Hz")
     try:
         test_whisper(audio, sr)
+        test_whisper_dictation_fixtures()
         test_moonshine_buffered(audio, sr)
         test_moonshine_streaming(audio, sr)
         test_concurrent_feed(audio, sr)
