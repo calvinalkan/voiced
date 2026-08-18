@@ -393,6 +393,7 @@ class VoiceDaemon:
     is_tty: bool
     running: bool
     recording: bool
+    notified_input_device_error: str | None
     stop_event: threading.Event
     audio: Audio
     transcriber: TranscriberProtocol
@@ -404,6 +405,7 @@ class VoiceDaemon:
         self.is_tty = sys.stdout.isatty()
         self.running = True
         self.recording = False
+        self.notified_input_device_error = None
         self.stop_event = threading.Event()
 
         self.audio = Audio(
@@ -527,16 +529,24 @@ class VoiceDaemon:
                 test_input=test_input,
                 save_audio=save_audio,
             )
+            self.notified_input_device_error = None
             self.process_audio(audio, test_output=test_output)
         except InputDeviceError as e:
             _ = self.transcriber.finalize()
-            log("audio", "error", str(e))
-            _ = notify(
-                "voiced: microphone error",
-                urgency="critical",
-                timeout=5000,
-                body=str(e),
-            )
+            error_message = str(e)
+            log("audio", "error", error_message)
+
+            # Key repeat can issue several recording commands while a missing
+            # microphone makes each attempt fail immediately. Keep logging
+            # every attempt, but notify only once until the microphone opens.
+            if error_message != self.notified_input_device_error:
+                self.notified_input_device_error = error_message
+                _ = notify(
+                    "voiced: microphone error",
+                    urgency="critical",
+                    timeout=2000,
+                    body=error_message,
+                )
         finally:
             self.recording = False
             self.stop_event.clear()
