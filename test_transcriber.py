@@ -109,7 +109,7 @@ def test_whisper(audio: NDArray[np.float32], sr: int) -> None:
         run_session(t, audio, sr, "whisper run 2", "hello")
         empty_session(t, "whisper empty session")
     finally:
-        t.shutdown()
+        _ = t.shutdown()
     print("  PASS shutdown clean")
 
 
@@ -122,7 +122,7 @@ def test_moonshine_buffered(audio: NDArray[np.float32], sr: int) -> None:
         run_session(t, audio, sr, "moonshine buffered run 2", "hello")
         empty_session(t, "moonshine buffered empty session")
     finally:
-        t.shutdown()
+        _ = t.shutdown()
     print("  PASS shutdown clean")
 
 
@@ -135,7 +135,7 @@ def test_moonshine_streaming(audio: NDArray[np.float32], sr: int) -> None:
         run_session(t, audio, sr, "moonshine streaming run 2", "hello")
         empty_session(t, "moonshine streaming empty session")
     finally:
-        t.shutdown()
+        _ = t.shutdown()
     print("  PASS shutdown clean")
 
 
@@ -189,7 +189,7 @@ def test_whisper_dictation_fixtures() -> None:
                 )
             print(f"  PASS {filename} ({elapsed_ms}ms): {text!r}")
     finally:
-        t.shutdown()
+        _ = t.shutdown()
 
 
 def test_paragraph_fixture() -> None:
@@ -236,7 +236,7 @@ def test_paragraph_fixture() -> None:
             print(f"    markers found: {found} ({len(found)}/{len(markers)})")
             print(f"    text: {text!r}")
         finally:
-            t.shutdown()
+            _ = t.shutdown()
 
 
 def test_paragraph_realtime() -> None:
@@ -286,7 +286,7 @@ def test_paragraph_realtime() -> None:
         text = t.finalize()
         finalize_ms = int((time.time() - finalize_t0) * 1000)
     finally:
-        t.shutdown()
+        _ = t.shutdown()
 
     expected_feed_ms = int(duration_s * 1000)
     feed_ratio = feed_ms / expected_feed_ms
@@ -326,7 +326,7 @@ def test_concurrent_feed(audio: NDArray[np.float32], sr: int) -> None:
         text = t.finalize()
         expect_contains(text, "hello", "concurrent feed")
     finally:
-        t.shutdown()
+        _ = t.shutdown()
 
 
 def main() -> int:

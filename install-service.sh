@@ -39,7 +39,15 @@ After=graphical-session.target
 Type=simple
 ExecStart=$SCRIPT_DIR/voiced serve
 Restart=on-failure
-RestartSec=5
+RestartSec=1
+RestartPreventExitStatus=69 78
+TimeoutStopSec=10
+KillMode=control-group
+RuntimeDirectory=voiced
+RuntimeDirectoryMode=0700
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=voiced
 
 # Environment for Wayland/audio
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
@@ -60,7 +68,24 @@ systemctl --user enable voiced
 echo "Enabled service."
 
 systemctl --user restart voiced
-echo "Started service."
+
+ready=false
+for _ in {1..240}; do
+    if "$SCRIPT_DIR/voiced" status 2>/dev/null | grep -q "Daemon running"; then
+        ready=true
+        break
+    fi
+    if systemctl --user is-failed --quiet voiced; then
+        break
+    fi
+    sleep 0.25
+done
+if [[ "$ready" != true ]]; then
+    echo "Error: voiced did not become ready. Recent logs:" >&2
+    journalctl --user -u voiced -n 20 --no-pager >&2
+    exit 1
+fi
+echo "Started service and opened its control socket."
 
 echo
 echo "Done! Service installed and running."

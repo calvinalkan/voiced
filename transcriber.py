@@ -3,9 +3,10 @@ Transcription module for voiced.
 
 Two engines, same threaded interface. Both engines own one persistent
 worker thread for the daemon's lifetime, started in load() and joined in
-shutdown(). The audio capture thread only enqueues chunks (microsecond
-op); all model work runs on the worker thread, so frames are never
-dropped by callback latency.
+shutdown(). Audio capture performs block copying and silence detection before
+`feed()` enqueues each chunk; all model work remains on the worker thread.
+The capture watchdog reports callback stalls because OS scheduling or other
+callback work can still delay or drop input.
 
 - WhisperTranscriber  (faster-whisper / CTranslate2)
   Buffer-and-transcribe; Whisper has no streaming inference API.
@@ -20,7 +21,7 @@ dropped by callback latency.
 Per-recording protocol:
     transcriber.start_session()
     transcriber.feed(chunk) × N         # safe to call from any thread
-    text = transcriber.finalize()       # blocks until worker drains
+    text = transcriber.finalize()       # returns text or raises worker failure
 """
 
 from __future__ import annotations
@@ -33,6 +34,8 @@ from typing import TYPE_CHECKING, NamedTuple, Protocol, cast
 
 import numpy as np
 from numpy.typing import NDArray
+
+from voiced_logging import LogLevel, log, log_exception
 
 if TYPE_CHECKING:
     from faster_whisper import WhisperModel
@@ -71,14 +74,22 @@ MOONSHINE_MODELS: tuple[str, ...] = (
 TRANSCRIBER_ENGINES: tuple[str, ...] = ("whisper", "moonshine")
 
 
+class TranscriptionTimeoutError(TimeoutError):
+    """The persistent model worker did not finalize within its caller's deadline."""
+
+
+class TranscriptionWorkerError(RuntimeError):
+    """The persistent model worker failed while processing one session."""
+
+
 class TranscriberProtocol(Protocol):
     debug: bool
 
     def load(self, on_progress: Callable[[str], None] | None = None) -> None: ...
     def start_session(self) -> None: ...
     def feed(self, audio: NDArray[np.float32]) -> None: ...
-    def finalize(self) -> str | None: ...
-    def shutdown(self) -> None: ...
+    def finalize(self, timeout_seconds: float | None = None) -> str | None: ...
+    def shutdown(self, timeout_seconds: float = 2.0) -> bool: ...
 
 
 class _Msg(NamedTuple):
@@ -98,13 +109,15 @@ class _Msg(NamedTuple):
     kind: str
     audio: NDArray[np.float32] | None = None
     done_event: threading.Event | None = None
-    out_box: list[str | None] | None = None
+    out_box: list[str | None | TranscriptionWorkerError] | None = None
     enqueue_time: float = 0.0
 
 
-def _signal_done(msg: _Msg, text: str | None) -> None:
+def _signal_done(
+    msg: _Msg, result: str | None | TranscriptionWorkerError
+) -> None:
     if msg.out_box is not None:
-        msg.out_box.append(text)
+        msg.out_box.append(result)
     if msg.done_event is not None:
         msg.done_event.set()
 
@@ -116,16 +129,19 @@ class WhisperTranscriber:
     model_size: str
     device: str
     language: str
+    vad_filter: bool
     model: WhisperModel | None
     _queue: queue.Queue[_Msg]
     _worker: threading.Thread | None
     _buffer: list[NDArray[np.float32]]
+    _session_failure: TranscriptionWorkerError | None
 
     def __init__(
         self,
         model_size: str = "base",
         device: str = "cpu",
         language: str = "en",
+        vad_filter: bool = False,
         debug: bool = False,
     ) -> None:
         if model_size not in WHISPER_MODELS:
@@ -135,16 +151,18 @@ class WhisperTranscriber:
         self.model_size = model_size
         self.device = device
         self.language = language
+        self.vad_filter = vad_filter
         self.model = None
         self.debug = debug
         self._queue = queue.Queue()
         self._worker = None
         self._buffer = []
+        self._session_failure = None
 
-    def _log(self, level: str, msg: str) -> None:
+    def _log(self, level: LogLevel, msg: str) -> None:
         if level == "debug" and not self.debug:
             return
-        print(f"[transcriber] [{level}] {msg}", flush=True)
+        log("transcriber", level, msg)
 
     def load(self, on_progress: Callable[[str], None] | None = None) -> None:
         from faster_whisper import WhisperModel  # type: ignore[import-untyped]
@@ -170,13 +188,27 @@ class WhisperTranscriber:
     def _worker_loop(self) -> None:
         while True:
             msg = self._queue.get()
+            if msg.kind == "start":
+                self._session_failure = None
+            elif self._session_failure is not None:
+                if msg.kind == "chunk":
+                    continue
+                if msg.kind == "finalize":
+                    self._buffer = []
+                    _signal_done(msg, self._session_failure)
+                    self._session_failure = None
+                    continue
+
             try:
                 self._dispatch(msg)
-            except Exception as e:
-                self._log("error", f"worker error on '{msg.kind}': {e}")
-                if msg.kind == "finalize":
-                    _signal_done(msg, None)
+            except Exception as error:
+                log_exception("transcriber", f"Whisper worker failed on {msg.kind!r}")
+                failure = TranscriptionWorkerError(str(error))
                 self._buffer = []
+                if msg.kind == "finalize":
+                    _signal_done(msg, failure)
+                elif msg.kind != "shutdown":
+                    self._session_failure = failure
             if msg.kind == "shutdown":
                 return
 
@@ -222,7 +254,7 @@ class WhisperTranscriber:
             best_of=1,
             temperature=0.0,
             without_timestamps=True,
-            vad_filter=True,
+            vad_filter=self.vad_filter,
             vad_parameters={"min_silence_duration_ms": 200, "speech_pad_ms": 200},
         )
         segments_list = list(segments)
@@ -231,7 +263,7 @@ class WhisperTranscriber:
         if self.debug:
             self._log(
                 "debug",
-                f"finalized: {len(audio) / 16000:.2f}s audio, transcribe {elapsed_ms}ms, language={info.language} (prob={info.language_probability:.2f}), segments={len(segments_list)}",
+                f"finalized: {len(audio) / 16000:.2f}s audio, transcribe {elapsed_ms}ms, vad_filter={self.vad_filter}, language={info.language} (prob={info.language_probability:.2f}), segments={len(segments_list)}",
             )
         text = " ".join(seg.text.strip() for seg in segments_list if seg.text.strip())
         return text if text else None
@@ -242,9 +274,9 @@ class WhisperTranscriber:
     def feed(self, audio: NDArray[np.float32]) -> None:
         self._queue.put(_Msg(kind="chunk", audio=audio))
 
-    def finalize(self) -> str | None:
+    def finalize(self, timeout_seconds: float | None = None) -> str | None:
         done = threading.Event()
-        out_box: list[str | None] = []
+        out_box: list[str | None | TranscriptionWorkerError] = []
         self._queue.put(
             _Msg(
                 kind="finalize",
@@ -253,13 +285,22 @@ class WhisperTranscriber:
                 enqueue_time=time.time(),
             )
         )
-        _ = done.wait()
-        return out_box[0] if out_box else None
+        if not done.wait(timeout_seconds):
+            assert timeout_seconds is not None
+            raise TranscriptionTimeoutError(
+                f"Whisper finalization exceeded {timeout_seconds:.1f}s"
+            )
+        result = out_box[0] if out_box else None
+        if isinstance(result, TranscriptionWorkerError):
+            raise result
+        return result
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout_seconds: float = 2.0) -> bool:
         self._queue.put(_Msg(kind="shutdown"))
-        if self._worker is not None:
-            self._worker.join(timeout=2)
+        if self._worker is None:
+            return True
+        self._worker.join(timeout=timeout_seconds)
+        return not self._worker.is_alive()
 
 
 _MOONSHINE_ARCH_BY_NAME: dict[str, str] = {
@@ -294,6 +335,7 @@ class MoonshineTranscriber:
     _session_chunks: int
     _session_samples: int
     _session_open_time: float
+    _session_failure: TranscriptionWorkerError | None
 
     def __init__(
         self,
@@ -320,11 +362,12 @@ class MoonshineTranscriber:
         self._session_chunks = 0
         self._session_samples = 0
         self._session_open_time = 0.0
+        self._session_failure = None
 
-    def _log(self, level: str, msg: str) -> None:
+    def _log(self, level: LogLevel, msg: str) -> None:
         if level == "debug" and not self.debug:
             return
-        print(f"[transcriber] [{level}] {msg}", flush=True)
+        log("transcriber", level, msg)
 
     def load(self, on_progress: Callable[[str], None] | None = None) -> None:
         from moonshine_voice import ModelArch, get_model_for_language
@@ -358,14 +401,27 @@ class MoonshineTranscriber:
     def _worker_loop(self) -> None:
         while True:
             msg = self._queue.get()
+            if msg.kind == "start":
+                self._session_failure = None
+            elif self._session_failure is not None:
+                if msg.kind == "chunk":
+                    continue
+                if msg.kind == "finalize":
+                    self._cleanup_session()
+                    _signal_done(msg, self._session_failure)
+                    self._session_failure = None
+                    continue
+
             try:
                 self._dispatch(msg)
-            except Exception as e:
-                self._log("error", f"worker error on '{msg.kind}': {e}")
-                if msg.kind == "finalize":
-                    _signal_done(msg, None)
-                # Reset on any error so the next session starts clean.
+            except Exception as error:
+                log_exception("transcriber", f"Moonshine worker failed on {msg.kind!r}")
+                failure = TranscriptionWorkerError(str(error))
                 self._cleanup_session()
+                if msg.kind == "finalize":
+                    _signal_done(msg, failure)
+                elif msg.kind != "shutdown":
+                    self._session_failure = failure
             if msg.kind == "shutdown":
                 return
 
@@ -512,9 +568,9 @@ class MoonshineTranscriber:
     def feed(self, audio: NDArray[np.float32]) -> None:
         self._queue.put(_Msg(kind="chunk", audio=audio))
 
-    def finalize(self) -> str | None:
+    def finalize(self, timeout_seconds: float | None = None) -> str | None:
         done = threading.Event()
-        out_box: list[str | None] = []
+        out_box: list[str | None | TranscriptionWorkerError] = []
         self._queue.put(
             _Msg(
                 kind="finalize",
@@ -523,13 +579,22 @@ class MoonshineTranscriber:
                 enqueue_time=time.time(),
             )
         )
-        _ = done.wait()
-        return out_box[0] if out_box else None
+        if not done.wait(timeout_seconds):
+            assert timeout_seconds is not None
+            raise TranscriptionTimeoutError(
+                f"Moonshine finalization exceeded {timeout_seconds:.1f}s"
+            )
+        result = out_box[0] if out_box else None
+        if isinstance(result, TranscriptionWorkerError):
+            raise result
+        return result
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout_seconds: float = 2.0) -> bool:
         self._queue.put(_Msg(kind="shutdown"))
-        if self._worker is not None:
-            self._worker.join(timeout=2)
+        if self._worker is None:
+            return True
+        self._worker.join(timeout=timeout_seconds)
+        return not self._worker.is_alive()
 
 
 def make_transcriber(
@@ -539,6 +604,7 @@ def make_transcriber(
     language: str = "en",
     debug: bool = False,
     streaming: bool = False,
+    whisper_vad_filter: bool = False,
 ) -> TranscriberProtocol:
     """Construct the configured transcriber. Validates engine/model/streaming."""
     if engine == "whisper":
@@ -547,7 +613,11 @@ def make_transcriber(
                 "whisper has no streaming inference API; use transcriber_engine=moonshine for streaming"
             )
         return WhisperTranscriber(
-            model_size=model, device=device, language=language, debug=debug
+            model_size=model,
+            device=device,
+            language=language,
+            vad_filter=whisper_vad_filter,
+            debug=debug,
         )
     if engine == "moonshine":
         return MoonshineTranscriber(

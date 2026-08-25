@@ -90,7 +90,8 @@ voiced history 3 -c     # copy entry 3 to clipboard instead
 ```
 
 The daemon must be running (`voiced serve` in foreground, or via the systemd
-service) — the CLI just sends commands to it via signals.
+service). The CLI exchanges one request with its Unix control socket under
+`$XDG_RUNTIME_DIR/voiced/`.
 
 ## Bind a hotkey
 
@@ -150,7 +151,8 @@ transcription, and no CPU drama while you're talking.
 | `transcriber_engine` | str | `"whisper"` | `"whisper"` (recommended on CPU) or `"moonshine"` |
 | `model` | str | `"base"` | model name; depends on engine — see below |
 | `streaming` | bool | `false` | live streaming inference (Moonshine only). On by default = no; only enable if your CPU can keep up. |
-| `device` | str | `"cpu"` | `"cpu"` or `"cuda"` if you have a GPU |
+| `whisper_vad_filter` | bool | `false` | run faster-whisper's extra VAD after voiced records audio; usually leave off because voiced already handles speech/silence detection |
+| `device` | str | `"cpu"` | Whisper execution device: `"cpu"` or `"cuda"`; Moonshine requires `"cpu"` because its current API exposes no device selection |
 | `input_device` | str/null | `null` | case-insensitive microphone name fragment; `null` uses the system default |
 | `silence_threshold` | float | `0.02` | amplitude threshold for "is this speech" (0.0–1.0) |
 | `silence_duration` | float | `0.8` | seconds of quiet before auto-stop in `listen` mode |
@@ -162,7 +164,7 @@ transcription, and no CPU drama while you're talking.
 | `typer_backend` | str | `"auto"` | `"auto"`, `"dotool"`, or `"ydotool"` |
 | `keyboard_layout` | str/null | autodetected | XKB layout (e.g. `"de"`, `"us"`) — only matters in `type` insertion mode |
 | `history_size` | int | `20` | keep this many recent transcriptions |
-| `debug` | bool | `false` | verbose chunk-by-chunk logs |
+| `debug` | bool | `false` | verbose lifecycle, device, and model-worker logs |
 
 When `input_device` is set, voiced resolves the PipeWire source before every
 recording and makes that source the system default before opening the audio
@@ -199,14 +201,13 @@ If `small.en` feels a bit slow, drop to `"base.en"` for ~3× speed at slightly
 lower accuracy. If you want maximum accuracy and don't mind ~5-10s of
 finalize wait, try `"medium.en"`.
 
-**Fast CPU or GPU machine, want streaming end-of-speech latency:**
+**Fast CPU, want streaming end-of-speech latency:**
 
 ```json
 {
   "transcriber_engine": "moonshine",
   "model": "small-streaming",
-  "streaming": true,
-  "device": "cuda"
+  "streaming": true
 }
 ```
 
@@ -239,13 +240,13 @@ voiced serve --transcriber-engine moonshine --model tiny-streaming --streaming
 │                  hotkey ──┐      │                                      │
 │                           ▼      ▼                                      │
 │             ┌──────────────────────────────────┐                        │
-│             │  voiced (bash CLI)               │                        │
+│             │  voiced CLI                      │                        │
 │             │  serve / listen / record / stop  │                        │
 │             │  status / kill / history         │                        │
 │             └─────────────┬────────────────────┘                        │
 │                           │                                             │
-│        JSON line on /tmp/voiced-command                                 │
-│        + SIGUSR1                                                        │
+│        one JSON request on a Unix socket                                │
+│        under $XDG_RUNTIME_DIR/voiced                                    │
 │                           │                                             │
 │                           ▼                                             │
 │  ┌────────────────────────────────────────────────────────────────────┐ │
@@ -281,21 +282,24 @@ voiced serve --transcriber-engine moonshine --model tiny-streaming --streaming
 ### How a recording flows
 
 1. **You press the hotkey.** GNOME / KDE / your WM runs `voiced record -t`.
-2. **CLI sends a command.** It writes a JSON line to `/tmp/voiced-command`
-   and sends `SIGUSR1` to the daemon.
-3. **Daemon starts a session.** `transcriber.start_session()` (cheap — just
-   queues a message to the worker thread).
-4. **Audio captures chunks.** Sounddevice fires a callback every ~100ms
-   with audio samples. The audio thread *only enqueues* chunks (microsecond
-   cost) — never runs encoder work, so it can never fall behind.
+2. **CLI sends a command.** It opens the per-user Unix socket, sends one JSON
+   request, and receives the daemon's acceptance or current phase.
+3. **Daemon starts a session.** The main loop enters `capturing` and calls
+   `transcriber.start_session()` (cheap — it only queues a worker message).
+4. **Audio captures chunks.** Sounddevice fires a callback every ~100ms.
+   The callback copies each reusable PortAudio block once into float32 storage,
+   updates silence detection, and queues the same block for the model worker;
+   it never runs encoder work or creates Python float objects.
 5. **Worker processes chunks.**
    - In *buffered* mode: just appends to a list. CPU idle.
    - In *streaming* mode: feeds chunks live to the model encoder. Encoder
      work happens here, on the worker thread, off the audio thread.
-6. **You press the hotkey again** (or stop talking, depending on mode).
-7. **Daemon calls finalize.** Worker drains any remaining queue work and
-   either runs a single transcribe call (buffered) or stops the live
-   stream and reads accumulated lines (streaming).
+6. **You press the hotkey again** (or stop talking, depending on mode). The
+   capture owner aborts and closes the input stream; a daemon deadline restarts
+   the service if PortAudio does not return.
+7. **Daemon enters `transcribing`.** The worker drains any remaining queue work
+   and either runs one buffered transcribe call or stops the live stream and
+   reads accumulated lines. Hotkey toggles are ignored during this phase.
 8. **Text gets pasted.** Goes through the clipboard via `wl-copy`, then
    the typer sends `Ctrl+Shift+V` via dotool. Fallback to per-character
    typing if paste fails.
@@ -305,10 +309,59 @@ voiced serve --transcriber-engine moonshine --model tiny-streaming --streaming
 
 The naive approach — run the model directly on the audio capture callback —
 silently drops audio frames whenever the model is slower than real-time.
-The persistent worker decouples them: audio thread is never blocked, the
-model can take however long it takes. If it can't keep up with real-time,
-the queue grows during recording and drains at the end (visible in the
-debug log as `queue_wait Xms + stop Yms`).
+The persistent worker keeps encoder work off the audio callback. If streaming
+inference cannot keep up with real time, its queue grows during recording and
+drains at the end (visible in the debug log as `queue_wait Xms + stop Yms`).
+
+### Failure recovery
+
+The capture thread owns the PortAudio stream and always aborts it before
+closing it. The main loop separately watches progress: stream setup may take
+at most three seconds, and two seconds without an audio callback requests
+capture stop. If the stream aborts and closes, the daemon finalizes the
+buffered speech, saves it to history, inserts the partial transcript, and stays
+running. A reconnected USB microphone is opened as a new stream on the next
+recording; the failed stream is never resumed.
+
+A stop that does not finish within two more seconds means the capture thread is
+still trapped in native PortAudio teardown. Every completed callback has
+already queued its audio on the model worker, so the daemon still finalizes and
+inserts that partial transcript before exiting with `75/TEMPFAIL`. If no usable
+audio arrived, it exits immediately. Systemd then kills the blocked thread and
+starts a clean daemon after one second.
+
+A normal service stop follows a different path: the daemon waits for capture or
+transcription to finish, then shuts down the model worker and typer in order.
+Its internal shutdown deadline is five seconds, while systemd enforces a final
+ten-second bound. Configuration errors exit with `78/CONFIG` and do not restart.
+
+### Logs
+
+The daemon sends all components through one ordered logger. Under systemd each
+line carries a native journal priority: debug 7, info 6, warning 4, error 3, and
+critical 2. Writing to stderr alone does not assign an error priority. Debug
+events are emitted only when `debug` is enabled in the config or with
+`voiced serve --debug`; normal transcription logs retain their short transcript
+preview at info level.
+
+```bash
+journalctl --user -u voiced -f -o short-precise       # follow all logs
+journalctl --user -u voiced -p warning..emerg         # warning and worse
+journalctl --user -u voiced -p debug..debug           # debug only
+```
+
+A recoverable stream failure can be followed from `callback_stall` to
+`capture_recovered`. If native teardown remains stuck, the journal continues
+through `capture_stop_timeout`, `75/TEMPFAIL`, and the next `ready` event.
+
+### Memory behavior
+
+The Whisper model remains resident intentionally so every recording is ready
+immediately. It accounts for most idle memory. Captured audio uses float32
+chunks shared by capture and the model queue rather than Python float objects;
+a 30-second recording requires about 1.8 MiB of sample storage instead of
+roughly 15 MiB. Finalization may temporarily allocate contiguous model input,
+but the per-callback chunks are released after the session.
 
 ### Why a clipboard paste, not just typing?
 
@@ -330,14 +383,20 @@ make test-realtime         # adds the slow ~30s real-time-paced streaming test
 ```
 
 `test-fixtures/hello_world.wav` and `test-fixtures/paragraph.wav` cover the
-basic pipeline and long-form behavior. The `dictation-*.wav` fixtures are real
-Shure MV7 recordings covering ordinary speech, technical vocabulary, and
-numbers; the transcriber suite checks their distinctive phrases with
-Whisper `small.en`.
+basic pipeline and long-form behavior. The integration test starts real daemon
+processes and exercises the CLI socket, transcription, ignored busy toggles,
+ordered shutdown, partial-transcript preservation with and without a process
+restart, and stale-socket recovery. The
+`dictation-*.wav` fixtures are real Shure MV7 recordings covering ordinary
+speech, technical vocabulary, and numbers; the transcriber suite checks their
+distinctive phrases with Whisper `small.en`.
 
 ## Troubleshooting
 
-**`voiced status` says "Daemon not running"** → start it: `systemctl --user start voiced`. If it crashes, `journalctl --user -u voiced -n 50` for logs.
+**`voiced status` says "Daemon not running"** → start it with
+`systemctl --user start voiced`. Inspect recent lifecycle events with
+`journalctl --user -u voiced -n 50`; warnings and errors alone are available
+with `journalctl --user -u voiced -p warning..emerg`.
 
 **The configured microphone is unavailable or ambiguous** → voiced refuses to
 record, logs the error, and sends a critical desktop notification. Run the
@@ -347,6 +406,21 @@ daemon with `--debug` to list the input devices seen by PipeWire, then make
 **Paste doesn't land in app X** → try `"insertion_method": "type"` in your config. Some sandboxed apps (Citrix, password managers) block clipboard paste.
 
 **Transcription is gibberish on long recordings** → you might be in `streaming: true` mode with a model that's too heavy for your CPU. Set `"streaming": false` or pick a smaller model.
+
+**Transcription suddenly becomes tiny or unrelated** → check the `[audio] done (...)`
+line in `journalctl --user -u voiced -n 50`. Low `speech_chunks`, very low
+`peak`, high `clipped`, or high `near_zero` means the captured mic audio is bad.
+To keep a failing sample for inspection, run one dictation with
+`VOICED_SAVE_AUDIO=/tmp/voiced-bad.wav voiced record -t`.
+
+**Transcription degrades under CPU load** → look for `[audio] [warn] audio callback`
+lines in the journal. `input overflow`, delayed callbacks, or audio shorter than
+wall time means the OS/audio stack starved microphone capture before Whisper saw
+it. A callback that disappears for two seconds triggers automatic recovery:
+voiced finalizes the partial recording and stays alive if the failed stream
+closes. It exits `TEMPFAIL` only when native teardown remains stuck, after first
+processing the queued audio. Buffered Whisper should only spend model CPU after
+recording stops.
 
 **Typing skips characters** → you've hit the synthetic-input rate limit. Either switch to paste mode (the default) or use a slower typedelay (the daemon already does this in fallback type mode).
 

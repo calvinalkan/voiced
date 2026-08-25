@@ -12,12 +12,15 @@ import sys
 import threading
 import time
 import wave
+from collections import deque
 from collections.abc import Callable
-from typing import cast
+from typing import cast, final
 
 import numpy as np
 import sounddevice as sd  # type: ignore[import-untyped]
 from numpy.typing import NDArray
+
+from voiced_logging import LogLevel, log
 
 # Type alias for audio arrays - float32 audio samples
 AudioArray = NDArray[np.float32]
@@ -25,6 +28,29 @@ AudioArray = NDArray[np.float32]
 
 class InputDeviceError(RuntimeError):
     """The configured or default microphone cannot be opened for recording."""
+
+
+@final
+class CaptureMonitor:
+    """Expose capture progress to the daemon without transferring stream ownership."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._stream_started_monotonic: float | None = None
+        self._last_callback_monotonic: float | None = None
+
+    def mark_stream_started(self, monotonic_time: float) -> None:
+        with self._lock:
+            self._stream_started_monotonic = monotonic_time
+            self._last_callback_monotonic = monotonic_time
+
+    def mark_callback(self, monotonic_time: float) -> None:
+        with self._lock:
+            self._last_callback_monotonic = monotonic_time
+
+    def snapshot(self) -> tuple[float | None, float | None]:
+        with self._lock:
+            return self._stream_started_monotonic, self._last_callback_monotonic
 
 
 def get_terminal_width() -> int:
@@ -41,10 +67,8 @@ class Audio:
     silence_duration: float
     speech_start_duration: float
     input_device: str | None
-    channels: int
     debug: bool
     is_tty: bool
-    pre_buffer_seconds: float
     pre_buffer_samples: int
     _start_time: float | None
     _waveform_history: list[str]
@@ -64,30 +88,22 @@ class Audio:
         self.silence_duration = silence_duration
         self.speech_start_duration = speech_start_duration  # Sustained speech needed to start
         self.input_device = input_device
-        self.channels = 1
         self.debug = debug
         self.is_tty = is_tty
         self._start_time = None
         self._waveform_history = []
 
         # Pre-buffer to catch start of speech (1 second)
-        self.pre_buffer_seconds = 1.0
-        self.pre_buffer_samples = int(self.pre_buffer_seconds * sample_rate)
+        self.pre_buffer_samples = sample_rate
 
-    def _elapsed_ms(self) -> int:
-        """Get elapsed milliseconds since recording started."""
-        if self._start_time is None:
-            return 0
-        return int((time.time() - self._start_time) * 1000)
-
-    def _log(self, level: str, message: str) -> None:
+    def _log(self, level: LogLevel, message: str) -> None:
         """Log a message with audio namespace."""
         # Clear any in-progress live display line first
         if self.is_tty:
             width = get_terminal_width() - 1
             _ = sys.stdout.write(f"\r{' ' * width}\r")
             _ = sys.stdout.flush()
-        print(f"[audio] [{level}] {message}", flush=True)
+        log("audio", level, message)
 
     def _level_to_bar(self, level: float) -> str:
         """Convert audio level to waveform character, scaled to threshold."""
@@ -154,8 +170,9 @@ class Audio:
             OSError: if file cannot be written
         """
         try:
-            # Convert float32 [-1.0, 1.0] to int16
-            audio_int16 = (audio * 32767).astype(np.int16)
+            # Convert float32 [-1.0, 1.0] to int16. Clamp first so overloaded
+            # input gain does not wrap around when saving diagnostics.
+            audio_int16 = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
 
             with wave.open(path, "wb") as f:
                 f.setnchannels(1)
@@ -305,40 +322,38 @@ class Audio:
         self,
         stop_event: threading.Event | None = None,
         auto_stop_on_silence: bool = True,
-        on_start: Callable[[], None] | None = None,
-        on_stop: Callable[[], None] | None = None,
         on_chunk: Callable[[AudioArray], None] | None = None,
         test_input: str | None = None,
         save_audio: str | None = None,
+        monitor: CaptureMonitor | None = None,
+        test_capture_fault: str | None = None,
     ) -> AudioArray | None:
+        """Capture one recording and abort the input stream when capture ends.
+
+        `monitor` reports callback and teardown progress but does not transfer
+        stream ownership. The caller must terminate the process when this
+        operation does not return after a requested stop because Python cannot
+        safely kill a thread blocked inside PortAudio.
         """
-        Record audio from microphone.
+        if test_capture_fault not in (None, "stall", "hang"):
+            raise ValueError("test_capture_fault must be 'stall' or 'hang'")
+        if test_capture_fault is not None:
+            # Integration tests enqueue fixture audio before simulating either
+            # a stream that closes on request or a native owner that stays stuck.
+            fixture_audio = self.from_file(test_input) if test_input else None
+            if fixture_audio is not None and on_chunk:
+                on_chunk(fixture_audio)
+            if monitor:
+                now = time.monotonic()
+                monitor.mark_stream_started(now)
+                monitor.mark_callback(now)
+            if test_capture_fault == "stall":
+                wait_event = stop_event or threading.Event()
+                _ = wait_event.wait()
+                return fixture_audio
+            while True:
+                time.sleep(1)
 
-        If test_input is provided, reads from that file instead of recording
-        from microphone (short-circuits for testing).
-
-        Stops when:
-        - stop_event.is_set() (if provided)
-        - OR silence detected for silence_duration (if auto_stop_on_silence=True)
-
-        Args:
-            stop_event: threading.Event to signal stop (optional)
-            auto_stop_on_silence: if True, stop after silence_duration of quiet
-            on_start: callback when speech first detected
-            on_stop: callback when recording stops
-            on_chunk: called with each chunk while recording. The first call
-                carries the pre-buffer (~1s of audio captured before speech
-                was detected) so the start of the first word arrives intact;
-                subsequent calls carry live chunks. In test_input mode, fires
-                once with the entire loaded audio. Invoked from the audio
-                callback thread (mic mode) or the caller's thread (test mode).
-            test_input: path to WAV file to use instead of microphone
-            save_audio: path to save recorded audio as WAV file
-
-        Returns:
-            numpy array of audio samples (float32)
-        """
-        # Short-circuit: if test_input is provided, read from file instead of mic
         if test_input:
             audio = self.from_file(test_input)
             if on_chunk and len(audio) > 0:
@@ -346,127 +361,164 @@ class Audio:
             if save_audio:
                 self.to_file(audio, save_audio)
             return audio
+
         self._select_input_device()
-        audio_buffer: list[float] = []
-        pre_buffer: list[float] = []
+        block_samples = int(self.sample_rate * 0.1)
+        pre_buffer_chunks_count = max(1, self.pre_buffer_samples // block_samples)
+        pre_buffer: deque[AudioArray] = deque(maxlen=pre_buffer_chunks_count)
+        audio_chunks: list[AudioArray] = []
         is_recording = False
         silence_samples = 0
-        speech_samples = 0  # Track sustained speech before recording starts
+        speech_samples = 0
         silence_samples_needed = int(self.silence_duration * self.sample_rate)
         speech_samples_needed = int(self.speech_start_duration * self.sample_rate)
         done = False
         self._start_time = time.time()
         self._waveform_history = []
+        expected_callback_interval = 0.1
+        callback_status_counts: dict[str, int] = {}
+        delayed_callbacks = 0
+        max_callback_gap = 0.0
+        last_callback_time: float | None = None
+        recording_wall_start: list[float] = []
 
         def callback(
             indata: AudioArray,
             _frames: int,
             _time_info: object,
-            _status: object,
+            status: object,
         ) -> None:
-            nonlocal audio_buffer, pre_buffer, is_recording, silence_samples, speech_samples, done
+            nonlocal is_recording, silence_samples, speech_samples, done
+            nonlocal delayed_callbacks, last_callback_time, max_callback_gap
 
-            if done:
+            if done or wait_event.is_set():
                 return
 
+            now = time.monotonic()
+            if monitor:
+                monitor.mark_callback(now)
+            if last_callback_time is not None:
+                gap = now - last_callback_time
+                if gap > expected_callback_interval * 2.5:
+                    delayed_callbacks += 1
+                    max_callback_gap = max(max_callback_gap, gap)
+            last_callback_time = now
+
+            status_text = str(status)
+            if status_text:
+                callback_status_counts[status_text] = callback_status_counts.get(status_text, 0) + 1
+
+            # PortAudio reuses `indata` after this callback. One float32 copy
+            # preserves the chunk without allocating Python float objects.
             audio: AudioArray = indata[:, 0].copy()
-            audio_list: list[float] = cast(list[float], audio.tolist())
-
-            # Maintain pre-buffer
-            pre_buffer.extend(audio_list)
-            if len(pre_buffer) > self.pre_buffer_samples:
-                pre_buffer = pre_buffer[-self.pre_buffer_samples :]
-
             level = float(np.abs(audio).mean())  # pyright: ignore[reportAny]
             is_speech = level > self.silence_threshold
 
-            # Live display (only in TTY mode with debug) - updates every callback (~100ms)
             if self.debug and self.is_tty and self._start_time is not None:
                 elapsed = time.time() - self._start_time
                 line = self._format_live_display(
                     level, is_speech, is_recording, speech_samples, silence_samples, elapsed
                 )
-                # Carriage return + padded line to overwrite previous
                 width = get_terminal_width() - 1
                 _ = sys.stdout.write(f"\r{line:<{width}}")
                 _ = sys.stdout.flush()
 
-            if is_speech:
-                if not is_recording:
-                    speech_samples += len(audio)
-                    # Only start recording after sustained speech
-                    if speech_samples >= speech_samples_needed:
-                        is_recording = True
-                        audio_buffer = pre_buffer.copy()
-                        if self.debug:
-                            self._log("debug", "speech detected, recording started\n")
-                        if on_chunk:
-                            # Pre-buffer (which already includes this chunk via
-                            # the extend above) is the seed needed to capture
-                            # the start of the first word.
-                            on_chunk(np.array(audio_buffer, dtype=np.float32))
-                        if on_start:
-                            on_start()
-                else:
-                    audio_buffer.extend(audio_list)
-                    silence_samples = 0
-                    if on_chunk:
-                        on_chunk(audio)
-            else:
-                # Reset speech counter if audio drops below threshold
-                if not is_recording:
+            if not is_recording:
+                pre_buffer.append(audio)
+                if not is_speech:
                     speech_samples = 0
+                    return
 
-                if is_recording:
-                    audio_buffer.extend(audio_list)
-                    silence_samples += len(audio)
-                    if on_chunk:
-                        on_chunk(audio)
+                speech_samples += len(audio)
+                if speech_samples < speech_samples_needed:
+                    return
 
-                    # Auto-stop on silence (only if enabled)
-                    if auto_stop_on_silence and silence_samples >= silence_samples_needed:
-                        if self.debug:
-                            self._log(
-                                "debug", f"silence detected ({self.silence_duration}s), stopping"
-                            )
-                        done = True
-                        if on_stop:
-                            on_stop()
+                is_recording = True
+                recording_wall_start.append(now)
+                seed = np.concatenate(tuple(pre_buffer))
+                pre_buffer.clear()
+                audio_chunks.append(seed)
+                if self.debug:
+                    self._log("debug", "speech detected, recording started")
+                if on_chunk:
+                    on_chunk(seed)
+                return
 
+            audio_chunks.append(audio)
+            if on_chunk:
+                on_chunk(audio)
+            if is_speech:
+                silence_samples = 0
+                return
+
+            silence_samples += len(audio)
+            if auto_stop_on_silence and silence_samples >= silence_samples_needed:
+                if self.debug:
+                    self._log("debug", f"silence detected ({self.silence_duration}s), stopping")
+                done = True
+
+        wait_event = stop_event or threading.Event()
+        stream: sd.InputStream | None = None
         try:
-            with sd.InputStream(
+            stream = sd.InputStream(
                 samplerate=self.sample_rate,
-                channels=self.channels,
+                channels=1,
                 dtype=np.float32,
-                blocksize=int(self.sample_rate * 0.1),
+                blocksize=block_samples,
+                latency="high",
                 callback=callback,
-            ):
-                while not done:
-                    # Check for external stop signal
-                    if stop_event and stop_event.is_set():
-                        if on_stop:
-                            on_stop()
-                        break
-                    sd.sleep(50)  # pyright: ignore[reportUnknownMemberType]
-        except sd.PortAudioError as e:
+            )
+            stream.start()
+            if monitor:
+                monitor.mark_stream_started(time.monotonic())
+
+            while not done:
+                if wait_event.wait(0.05):
+                    break
+        except sd.PortAudioError as error:
             device_description = (
                 repr(self.input_device)
                 if self.input_device is not None
                 else "the system default microphone"
             )
-            raise InputDeviceError(f"could not open {device_description}: {e}") from e
+            raise InputDeviceError(f"could not open {device_description}: {error}") from error
+        finally:
+            if stream is not None:
+                self._log("debug", "aborting input stream")
+                try:
+                    stream.abort(ignore_errors=False)
+                except sd.PortAudioError as error:
+                    self._log("warn", f"input stream abort failed: {error}")
+                self._log("debug", "closing input stream")
+                try:
+                    stream.close(ignore_errors=False)
+                except sd.PortAudioError as error:
+                    self._log("warn", f"input stream close failed: {error}")
+                self._log("debug", "input stream closed")
 
-        # Clear live display line when done
         if self.debug and self.is_tty:
             width = get_terminal_width() - 1
             _ = sys.stdout.write(f"\r{' ' * width}\r")
             _ = sys.stdout.flush()
 
-        result: AudioArray | None = (
-            np.array(audio_buffer, dtype=np.float32) if audio_buffer else None
-        )
+        result = np.concatenate(audio_chunks) if audio_chunks else None
+        if result is not None:
+            audio_duration = len(result) / self.sample_rate
+            if recording_wall_start:
+                recording_wall_duration = time.monotonic() - recording_wall_start[0]
+                if audio_duration + 0.25 < recording_wall_duration:
+                    self._log(
+                        "warn",
+                        f"captured audio is shorter than recording wall time ({audio_duration:.1f}s audio vs {recording_wall_duration:.1f}s wall); CPU/audio scheduling may have dropped input",
+                    )
+            if delayed_callbacks:
+                self._log(
+                    "warn",
+                    f"audio callback delayed {delayed_callbacks} times (max gap {max_callback_gap:.2f}s); CPU load may have starved recording",
+                )
+            for status_text, count in callback_status_counts.items():
+                self._log("warn", f"audio callback status: {status_text} ({count}x)")
 
-        # Save audio to file if save_audio is set
         if save_audio:
             self._log("debug", f"save_audio set: {save_audio}")
             if result is not None:

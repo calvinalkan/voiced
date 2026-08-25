@@ -8,11 +8,14 @@ back to layout-aware keyboard typing through dotool when paste is unavailable.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
+
+from voiced_logging import LogLevel, log
 
 
 def detect_keyboard_layout() -> str:
@@ -49,28 +52,19 @@ def detect_keyboard_layout() -> str:
     return "us"
 
 
-def find_typer_backend() -> tuple[str | None, str | None]:
-    """Find available typing backend. Returns (name, path) or (None, None)."""
-    script_dir = Path(__file__).parent
+def find_typer_backend(preferred: str = "auto") -> tuple[str | None, str | None]:
+    """Find the preferred backend, or prefer dotool when selection is automatic."""
+    backend_names = ("dotool", "ydotool") if preferred == "auto" else (preferred,)
+    for backend_name in backend_names:
+        if backend_name == "dotool":
+            local_dotool = Path(__file__).parent / "dotool"
+            if local_dotool.exists() and os.access(local_dotool, os.X_OK):
+                return "dotool", str(local_dotool)
 
-    # Check for dotool in script directory first
-    local_dotool = script_dir / "dotool"
-    if local_dotool.exists() and os.access(local_dotool, os.X_OK):
-        return ("dotool", str(local_dotool))
+        if executable := shutil.which(backend_name):
+            return backend_name, executable
 
-    # Check PATH for dotool
-    for path in os.environ.get("PATH", "").split(":"):
-        dotool = Path(path) / "dotool"
-        if dotool.exists() and os.access(dotool, os.X_OK):
-            return ("dotool", str(dotool))
-
-    # Check for ydotool
-    for path in os.environ.get("PATH", "").split(":"):
-        ydotool = Path(path) / "ydotool"
-        if ydotool.exists() and os.access(ydotool, os.X_OK):
-            return ("ydotool", str(ydotool))
-
-    return (None, None)
+    return None, None
 
 
 class Typer:
@@ -81,7 +75,6 @@ class Typer:
     backend_path: str
     insertion_method: str
     paste_keybind: str
-    _start_time: float | None
     _dotool_proc: subprocess.Popen[bytes] | None
     _dotool_lock: threading.Lock
     _copy_to_clipboard: Callable[[str], bool]
@@ -104,25 +97,16 @@ class Typer:
         self.paste_keybind = paste_keybind
         self._copy_to_clipboard = copy_to_clipboard or (lambda _t: False)
         self._notify = notify or (lambda _m: None)
-        self._start_time = None
         self._dotool_proc = None
         self._dotool_lock = threading.Lock()
 
-        # Find backend
-        if backend == "auto":
-            name, path = find_typer_backend()
-            if name is None or path is None:
+        name, path = find_typer_backend(backend)
+        if name is None or path is None:
+            if backend == "auto":
                 raise RuntimeError("No typing backend found. Install dotool or ydotool.")
-            self.backend = name
-            self.backend_path = path
-        else:
-            name, path = find_typer_backend()
-            if name != backend:
-                raise RuntimeError(f"{backend} not found")
-            if name is None or path is None:
-                raise RuntimeError(f"{backend} not found")
-            self.backend = name
-            self.backend_path = path
+            raise RuntimeError(f"{backend} not found")
+        self.backend = name
+        self.backend_path = path
 
         # Paste support is dotool-only: ydotool's key API takes raw evdev
         # keycodes which would need a separate keymap translation layer.
@@ -134,10 +118,10 @@ class Typer:
             insertion_method = "type"
         self.insertion_method = insertion_method
 
-    def _log(self, level: str, msg: str) -> None:
+    def _log(self, level: LogLevel, msg: str) -> None:
         if level == "debug" and not self.debug:
             return
-        print(f"[typer] [{level}] {msg}", flush=True)
+        log("typer", level, msg)
 
     def _start_dotool(self) -> bool:
         """Start a new dotool process. Returns True on success."""
@@ -244,7 +228,6 @@ class Typer:
     def insert_text(self, text: str) -> tuple[bool, str]:
         """Insert text at cursor. Returns (success, method) where method is
         'paste' or 'type'. In paste mode, falls back to typing on failure."""
-        self._start_time = time.time()
         if not text:
             return (False, "none")
 
