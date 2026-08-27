@@ -1,0 +1,41 @@
+.{
+    .name = .voiced,
+    .version = "0.0.0",
+    // Changing this has security and trust implications.
+    .fingerprint = 0x293158b052534c8c,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // CTranslate2 is the Whisper inference engine. build.zig reproduces
+        // its CMake source list, build definitions, ISA-specific kernel copies,
+        // and native dependency linkage directly with Zig's build API.
+        // Commit: 1251f7cbbf6ee92058e8c276dc78a915e4be55dc.
+        // CMake: https://github.com/OpenNMT/CTranslate2/blob/1251f7c/CMakeLists.txt
+        .ctranslate2 = .{
+            .url = "https://github.com/OpenNMT/CTranslate2/archive/1251f7cbbf6e.tar.gz",
+            .hash = "N-V-__8AAAg-awB-uucK1juoLZ0fkopsUuGpHqE3Pm4VuQwn",
+        },
+
+        // CTranslate2 uses cpu_features to detect the host ISA and select the
+        // matching SSE4.1, AVX, AVX2/FMA, or AVX-512 kernel at runtime.
+        // Commit: 8a494eb1e158ec2050e5f699a504fbc9b896a43b.
+        .cpu_features = .{
+            .url = "https://github.com/google/cpu_features/archive/8a494eb1e158.tar.gz",
+            .hash = "N-V-__8AAPaCBgCnkyjO0pidS7tKWffCECyjR2fouKXgA_A_",
+        },
+
+        // CTranslate2's logging implementation requires spdlog's headers. The
+        // dependency is compiled header-only and adds no separate runtime.
+        // Commit: 76fb40d95455f249bd70824ecfcae7a8f0930fa3.
+        .spdlog = .{
+            .url = "https://github.com/gabime/spdlog/archive/76fb40d95455.tar.gz",
+            .hash = "N-V-__8AAMdOGgCpLeXWSc7OSXCtw9kQCf79W1XEuOfgeX_h",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "compile_flags.txt",
+        "scripts",
+        "src",
+    },
+}

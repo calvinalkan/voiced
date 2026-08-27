@@ -1,0 +1,11 @@
+-std=c++17
+-Isrc
+-isystem
+zig-pkg/N-V-__8AAAg-awB-uucK1juoLZ0fkopsUuGpHqE3Pm4VuQwn/include
+-Weverything
+-Werror
+-pedantic-errors
+-Wno-c++98-compat
+-Wno-c++98-compat-pedantic
+-Wno-pre-c++14-compat
+-Wno-pre-c++17-compat
