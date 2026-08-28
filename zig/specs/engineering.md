@@ -98,9 +98,10 @@ The initial source layout should remain shallow:
 zig/src/
 ├── main.zig
 ├── supervisor.zig
-├── audio.zig
+├── pipewire.zig
+├── audio_process.zig
+├── audio_exchange.zig
 ├── transcriber.zig
-├── exchange.zig
 ├── output.zig
 └── config.zig
 ```

@@ -17,6 +17,12 @@ private to the active session and may be discarded by cancellation.
 
 ## Audio capture
 
+The supervisor uses `audio_process.zig`, never `pipewire.zig` directly.
+`audio_process.zig` owns worker launch, the control/report protocol, shared memfd
+lifetime, publication consumption, deadlines, and forced termination. The child
+then enters `pipewire.zig`, which owns one PipeWire stream and its callback
+lifecycle. Both sides access slot state only through `audio_exchange.zig`.
+
 The audio process connects directly to PipeWire and requests mono float32 audio
 at 16 kHz where graph negotiation permits it. PipeWire may own or recycle its
 small graph buffer pool. The process copies complete callback blocks into an
@@ -29,9 +35,50 @@ Whisper process consume only the previously published prefix.
 The callback performs bounded work. It does not allocate, send control
 messages, transcribe, persist, notify, or wait for another thread.
 
-Direct PipeWire state and registry events are the primary source of device
-removal and stream failure. A monotonic callback-progress deadline remains a
-fallback for failures that produce no useful event.
+Realtime capture selects PipeWire's `client-rt.conf` as well as requesting its
+realtime process callback. The configuration loads PipeWire's realtime module,
+which uses direct scheduler permission or RTKit to promote the data thread.
+Voiced reports the observed scheduler mode and priority. Missing promotion is a
+warning rather than a setup failure: callback-progress deadlines still contain
+a starved worker, and available Header or graph-cycle information still detects
+discontinuous audio.
+
+Before PipeWire can start the callback, the audio process touches every page in
+the shared exchange and attempts to lock the mapping. A failed `mlock` is also a
+warning rather than a setup failure. The report retains its Linux errno and the
+worker's `RLIMIT_MEMLOCK` soft limit because the unlocked pages remain usable
+but may be reclaimed under memory pressure.
+
+Production binaries use Zig's ReleaseSafe mode. Internal lifecycle, protocol,
+and slot-ownership contracts remain assertions because a violation is a Voiced
+defect; bounds, overflow, pointer, optional, and enum safety also remain active.
+PipeWire-owned formats, metadata, timelines, and samples are external operating
+input and continue through explicit validation and structured errors. Measured
+ReleaseSafe callback work remained in the single-digit microseconds at the
+median under both idle and all-CPU contention, far below the approximately 20 ms
+graph interval.
+
+A target name is a routing request, not proof of the source that produced a
+buffer. The audio process observes PipeWire's registry and finds the incoming
+Link whose input node is Voiced's stream node. That Link's output node becomes
+the immutable source for the recording. The realtime callback cannot copy until
+this first relationship is known. Removing the Link, source Node, or underlying
+Device stops the recording; linking a different source also stops it rather
+than allowing one session to mix microphones.
+
+The report joins the source Node to its Device and retains the node name and
+description, graph IDs and object serials, and `device.serial` when supplied.
+Graph IDs and object serials are diagnostics for one PipeWire incarnation. A
+configured physical microphone is resolved again by stable `device.serial`
+before each recording because unplug/replug creates new graph IDs. Discovery
+opens no capture stream: absence or ambiguity fails with the available-source
+catalog instead of touching the default microphone. After connect, the graph
+observer independently verifies that the linked Device carries the configured
+serial before opening the realtime sample gate.
+
+Direct PipeWire state and registry events are therefore the primary source of
+device removal and stream failure. A monotonic callback-progress deadline
+remains a fallback for failures that produce no useful event.
 
 ## Eager chunk pipeline
 
@@ -91,13 +138,33 @@ Zig-owned model-worker buffers and queues remain fixed after initialization.
 
 ## Stop and cancel
 
-Normal stop seals the current partial slot, stops audio, drains every sealed
-chunk in order, persists the resulting transcript, and performs output.
+The supervisor sends one fixed command over the audio worker's existing
+`SOCK_SEQPACKET` control link. PipeWire watches that descriptor on its owner
+loop; the realtime callback never polls for control. Stop, cancel, callback
+completion, and capture failure compete through the same first-wins terminal
+latch.
 
-Cancel marks the session as discard-only, requests audio stop, sets Whisper's
-shared cancellation word, and waits until neither worker can access the
-session buffers. It then resets the slots and transcript without persistence or
+Normal stop closes the source gate and quits the PipeWire loop. Destroying the
+stream then synchronizes with any callback already in progress. Only after that
+boundary does the worker publish the final slot, so every complete callback
+block accepted before stop belongs to the retained prefix. The supervisor drains
+every published chunk in order, persists the resulting transcript, and performs
 output.
+
+Cancel follows the same bounded stream teardown but abandons the final private
+slot rather than publishing it. Earlier slots may already have been published or
+consumed; the `cancelled` result tells the supervisor that the entire session is
+discard-only, so none becomes persistence or user output. The audio report keeps
+separate captured and published sample counts to make the abandoned final prefix
+observable.
+
+The supervisor applies a teardown deadline after either command. An audio worker
+that does not report and exit in time is killed and reaped, and that path is
+classified as forced termination rather than normal stop or cancellation.
+
+At the session level, cancel also sets Whisper's shared cancellation word and
+waits until neither worker can access the session buffers. It then resets the
+slots and transcript without persistence or output.
 
 The CTranslate2 bridge does not pretend a running native inference call was
 canceled. The worker checks the shared cancellation word before publishing any

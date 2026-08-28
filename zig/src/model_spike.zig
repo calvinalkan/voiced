@@ -1,5 +1,6 @@
-//! Loads one 16 kHz mono PCM WAV fixture, computes Whisper log-Mel features in
-//! Zig, and transcribes them through the narrow CTranslate2 C ABI.
+//! Measures the selected Whisper model path with one 16 kHz mono PCM WAV input.
+//! Zig computes log-Mel features and transcribes them through the narrow
+//! CTranslate2 C ABI.
 
 const std = @import("std");
 const log_mel = @import("log_mel.zig");
@@ -139,7 +140,7 @@ pub fn main(init: std.process.Init) !void {
         .measurement_elapsed_ns_max = measurements[measurements.len - 1],
     };
 
-    report_fixture(&arguments, samples.len, features.frames_count, transcript, &benchmark);
+    report_model_spike(&arguments, samples.len, features.frames_count, transcript, &benchmark);
 }
 
 fn transcribe_log_mel_features(
@@ -336,7 +337,7 @@ fn parse_arguments(
 
 fn usage() error{InvalidArguments} {
     stderr(
-        "usage: ctranslate2-fixture --model <model-directory> --audio <wav-path> " ++
+        "usage: model-spike --model <model-directory> --audio <wav-path> " ++
             "[--threads <1-32>] [--runs <odd 1-9>]\n",
         .{},
     );
@@ -496,7 +497,7 @@ fn validate_pcm_wav_format(format: []const u8) !void {
     }
 }
 
-fn report_fixture(
+fn report_model_spike(
     arguments: *const Arguments,
     samples_count: usize,
     frames_count: u32,

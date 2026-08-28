@@ -1,0 +1,8 @@
+# compile_flags.txt carries the repository's C++17 mode for the C++ bridge.
+# The PipeWire boundary is C17 and needs a per-language replacement because one
+# repository-wide compile_flags.txt cannot express both standards.
+If:
+  PathMatch: .*\.c
+CompileFlags:
+  Remove: [-std=*]
+  Add: [-std=gnu17]

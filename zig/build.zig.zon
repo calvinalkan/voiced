@@ -32,6 +32,7 @@
         },
     },
     .paths = .{
+        ".clangd",
         "build.zig",
         "build.zig.zon",
         "compile_flags.txt",

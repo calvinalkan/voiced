@@ -117,7 +117,7 @@ extern "C" ModelHandle *model_create(
             return nullptr;
         }
 
-        // ── Configure English Greedy Decoding ──
+        // ── Configure English Beam-Search Decoding ──
 
         // The English-only model needs no language or task token. The second
         // token requests plain text and prevents timestamp generation.
@@ -126,9 +126,12 @@ extern "C" ModelHandle *model_create(
             whisper_no_timestamps_token_id,
         }};
 
-        // A beam size and top-K of one select the highest-probability token.
-        // One hypothesis avoids scoring or retaining unused alternatives.
-        model->options.beam_size = 1;
+        // Keep five candidate sequences while decoding, matching
+        // faster-whisper's default. Greedy decoding can commit to a locally
+        // likely repeated word and never select end-of-text; retaining several
+        // paths lets the completed utterance win instead. Return only that best
+        // sequence rather than exposing the other beam candidates to Zig.
+        model->options.beam_size = 5;
         model->options.sampling_topk = 1;
         model->options.sampling_temperature = 1.0f;
         model->options.num_hypotheses = 1;

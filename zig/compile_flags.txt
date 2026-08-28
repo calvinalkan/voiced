@@ -2,6 +2,11 @@
 -Isrc
 -isystem
 zig-pkg/N-V-__8AAAg-awB-uucK1juoLZ0fkopsUuGpHqE3Pm4VuQwn/include
+-isystem
+/usr/include/pipewire-0.3
+-isystem
+/usr/include/spa-0.2
+-D_REENTRANT=1
 -Weverything
 -Werror
 -pedantic-errors

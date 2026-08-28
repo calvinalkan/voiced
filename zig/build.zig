@@ -48,7 +48,7 @@ const RepositoryCppCompilePolicy = struct {
 // ├────────────────────────┬─────────────────────────┬─────────────────────────┤
 // │ build.zig.zon          │ src/                    │ zig-pkg/mkl/            │
 // ├────────────────────────┼─────────────────────────┼─────────────────────────┤
-// │ CTranslate2 + spdlog   │ Zig fixture             │ oneMKL archives         │
+// │ CTranslate2 + spdlog   │ Zig model spike         │ oneMKL archives         │
 // │ cpu_features C         │ C++ boundary            │ Intel OpenMP archive    │
 // └────────────────────────┴─────────────────────────┴─────────────────────────┘
 //                                       │
@@ -62,7 +62,7 @@ const RepositoryCppCompilePolicy = struct {
 //                                       │  static link with oneMKL + Intel OpenMP
 //                                       ▼
 //                        ┌──────────────────────────────┐
-//                        │     ctranslate2-fixture      │
+//                        │         model-spike          │
 //                        └──────────────────────────────┘
 //
 // `zig build` only compiles and installs the binary. `setup-native` downloads
@@ -78,6 +78,10 @@ fn add_default_build_command(b: *std.Build) void {
     // Every target artifact uses one optimization mode and an Ubuntu 22.04
     // x86-64 baseline so the final executable never requires an AVX extension.
 
+    // Plain `zig build` remains a Debug development build. Production builds
+    // explicitly select ReleaseSafe so trusted process, exchange, and callback
+    // contracts remain active; ReleaseFast is reserved for comparative
+    // benchmarks where removing those assertions is intentional.
     const optimize = b.standardOptimizeOption(.{});
 
     const mkl_prefix = b.option(
@@ -305,7 +309,7 @@ fn add_default_build_command(b: *std.Build) void {
 
     // ── Compile The C Boundary ──
     //
-    // The Zig fixture imports only `ctranslate2_bridge.h`. This object owns the
+    // The model spike imports only `ctranslate2_bridge.h`. This object owns the
     // C++ model objects, translates exceptions into the C error representation,
     // and keeps CTranslate2 templates and standard-library types out of Zig.
     // Keeping it separate applies voiced's strict warning policy to the boundary
@@ -402,46 +406,108 @@ fn add_default_build_command(b: *std.Build) void {
         .flags = &ctranslate2_cpp_flags,
     });
 
-    // ── Link And Install The Binary ──
+    // ── Link And Install The Model Spike ──
     //
     // The Zig root computes log-Mel features and calls the C boundary. Linking
     // the baseline archive plus every dispatched kernel makes runtime selection
     // self-contained; the executable itself retains the baseline target because
     // no specialized object is entered until after the CPU capability check.
 
-    const fixture = b.addExecutable(.{
-        .name = "ctranslate2-fixture",
+    const model_spike = b.addExecutable(.{
+        .name = "model-spike",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/ctranslate2_fixture.zig"),
+            .root_source_file = b.path("src/model_spike.zig"),
             .target = baseline_target,
             .optimize = optimize,
         }),
     });
-    fixture.root_module.addIncludePath(b.path("src"));
-    fixture.root_module.linkLibrary(ctranslate2_library);
-    fixture.root_module.addObjectFile(c_boundary.getEmittedBin());
-    fixture.root_module.addObjectFile(avx_kernel.getEmittedBin());
-    fixture.root_module.addObjectFile(avx2_kernel.getEmittedBin());
-    fixture.root_module.addObjectFile(avx512_kernel.getEmittedBin());
+    model_spike.root_module.addIncludePath(b.path("src"));
+    model_spike.root_module.linkLibrary(ctranslate2_library);
+    model_spike.root_module.addObjectFile(c_boundary.getEmittedBin());
+    model_spike.root_module.addObjectFile(avx_kernel.getEmittedBin());
+    model_spike.root_module.addObjectFile(avx2_kernel.getEmittedBin());
+    model_spike.root_module.addObjectFile(avx512_kernel.getEmittedBin());
 
     // Intel's static link order lets each later archive resolve references from
     // the interface, threading, and core archives that precede it.
     const mkl_libraries: std.Build.LazyPath = .{
         .cwd_relative = b.pathJoin(&.{ mkl_prefix, "lib" }),
     };
-    fixture.root_module.addObjectFile(mkl_libraries.path(b, "libmkl_intel_ilp64.a"));
-    fixture.root_module.addObjectFile(mkl_libraries.path(b, "libmkl_intel_thread.a"));
-    fixture.root_module.addObjectFile(mkl_libraries.path(b, "libmkl_core.a"));
-    fixture.root_module.addObjectFile(mkl_libraries.path(b, "libiomp5.a"));
-    fixture.root_module.linkSystemLibrary("dl", .{});
-    fixture.root_module.linkSystemLibrary("m", .{});
-    fixture.root_module.linkSystemLibrary("pthread", .{});
-    fixture.root_module.link_libc = true;
-    fixture.root_module.link_libcpp = true;
+    model_spike.root_module.addObjectFile(mkl_libraries.path(b, "libmkl_intel_ilp64.a"));
+    model_spike.root_module.addObjectFile(mkl_libraries.path(b, "libmkl_intel_thread.a"));
+    model_spike.root_module.addObjectFile(mkl_libraries.path(b, "libmkl_core.a"));
+    model_spike.root_module.addObjectFile(mkl_libraries.path(b, "libiomp5.a"));
+    model_spike.root_module.linkSystemLibrary("dl", .{});
+    model_spike.root_module.linkSystemLibrary("m", .{});
+    model_spike.root_module.linkSystemLibrary("pthread", .{});
+    model_spike.root_module.link_libc = true;
+    model_spike.root_module.link_libcpp = true;
 
-    // Installation copies the executable to `zig-out/bin`; this graph contains
-    // no run artifact, so building the project never starts transcription.
-    b.installArtifact(fixture);
+    // ── Compile And Install The Audio Process ──
+    //
+    // The spike imports the five supervisor-side operations from
+    // `audio_process.zig`. `start` launches the sibling `audio-process`
+    // executable, whose root enters the private worker side of the same module.
+    // Both artifacts contain `pipewire.zig` and its narrow C boundary, so each
+    // receives the identical host PipeWire configuration below.
+    const audio_process = b.addExecutable(.{
+        .name = "audio-process",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/audio_process.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    configurePipeWireArtifact(b, audio_process);
+
+    const audio_spike = b.addExecutable(.{
+        .name = "audio-spike",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/audio_spike.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    configurePipeWireArtifact(b, audio_spike);
+
+    // Installation copies all three executables to `zig-out/bin`. No artifact
+    // is attached to a run step, so a normal build never records or transcribes.
+    b.installArtifact(model_spike);
+    b.installArtifact(audio_process);
+    b.installArtifact(audio_spike);
+}
+
+fn configurePipeWireArtifact(
+    b: *std.Build,
+    artifact: *std.Build.Step.Compile,
+) void {
+    // This host-linked boundary deliberately does not use pkg-config discovery.
+    // Explicit roots serve ZLS, translate-c, and compilation consistently, while
+    // the repository-owned C file retains the strict warning policy.
+    artifact.root_module.addIncludePath(b.path("src"));
+    artifact.root_module.addSystemIncludePath(.{
+        .cwd_relative = "/usr/include/pipewire-0.3",
+    });
+    artifact.root_module.addSystemIncludePath(.{
+        .cwd_relative = "/usr/include/spa-0.2",
+    });
+    artifact.root_module.addCMacro("_REENTRANT", "1");
+    artifact.root_module.addCSourceFile(.{
+        .file = b.path("src/audio_pipewire.c"),
+        .flags = &.{
+            "-std=gnu17",
+            "-Weverything",
+            "-Werror",
+            "-pedantic-errors",
+        },
+    });
+    artifact.root_module.addLibraryPath(.{
+        .cwd_relative = "/usr/lib/x86_64-linux-gnu",
+    });
+    artifact.root_module.linkSystemLibrary("pipewire-0.3", .{
+        .use_pkg_config = .no,
+    });
+    artifact.root_module.link_libc = true;
 }
 
 fn resolve_linux_x86_target(
@@ -472,14 +538,15 @@ fn add_update_compile_flags_command(b: *std.Build) void {
     //           └─> generate compile_flags.txt
     const update_compile_flags_command = b.step(
         "update-compile-flags",
-        "Update compile_flags.txt from the C++ flags in build.zig",
+        "Update compile_flags.txt from native compiler settings in build.zig",
     );
 
     const ctranslate2 = b.dependency("ctranslate2", .{});
 
     // Zig supplies include paths directly to compilation, but clangd reads them
-    // from `compile_flags.txt`. Keep the dependency path relative so the file is
-    // valid from any checkout location.
+    // from `compile_flags.txt`. Keep the fetched dependency path relative so the
+    // file remains valid from any checkout; PipeWire's system roots are the
+    // fixed paths supplied by Ubuntu's libpipewire-0.3-dev package.
     const ctranslate2_include_for_clangd = std.fs.path.relative(
         b.allocator,
         ".",
@@ -495,7 +562,13 @@ fn add_update_compile_flags_command(b: *std.Build) void {
     ) catch @panic("OOM");
 
     const compile_flags_text = b.fmt(
-        "{s}\n-Isrc\n-isystem\n{s}\n{s}\n",
+        "{s}\n" ++
+            "-Isrc\n" ++
+            "-isystem\n{s}\n" ++
+            "-isystem\n/usr/include/pipewire-0.3\n" ++
+            "-isystem\n/usr/include/spa-0.2\n" ++
+            "-D_REENTRANT=1\n" ++
+            "{s}\n",
         .{
             RepositoryCppCompilePolicy.standard_flag,
             ctranslate2_include_for_clangd,
