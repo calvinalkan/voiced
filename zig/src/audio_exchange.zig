@@ -1,12 +1,14 @@
-//! Defines the fixed audio memory shared by the supervisor, audio process, and
-//! Whisper process. Audio owns a slot while writing it, release-publishes the
-//! complete slot, and never touches it again until the supervisor has consumed
-//! and released it. No shared value contains a process-local pointer.
+//! Owns the fixed PCM exchange shared by the supervisor, audio process, and
+//! transcription process. Audio privately fills one slot, release-publishes its
+//! sample count, and never touches the slot again until the supervisor restores
+//! that count to zero. The transcription process only reads supervisor-selected
+//! published slots; it never changes audio-slot ownership.
 //!
-//! The exchange is a trusted internal contract: the supervisor creates and
-//! initializes it, then passes it only to Voiced processes running the same
-//! executable. Impossible state is therefore asserted as a programming defect.
-//! External PipeWire formats and buffers are validated before they enter here.
+//! A slot needs no shared `writing` or `transcribing` state. The audio process
+//! privately owns one `SlotWriter`, while the supervisor privately owns any
+//! in-flight transcription. The shared count therefore has one meaning:
+//! zero exposes no complete payload, and a positive value exposes that complete
+//! immutable sample prefix.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -18,45 +20,63 @@ pub const slot_duration_seconds_max: u32 = 30;
 pub const slot_samples_capacity: u32 = sample_rate_hz * slot_duration_seconds_max;
 
 // One callback may copy at most 100 ms of mono float32 audio. This is not a
-// PipeWire format requirement: it is Voiced's explicit bound on work performed
-// by the realtime thread. A larger block is rejected instead of turning an
-// external buffer size into an unbounded realtime copy.
+// PipeWire format requirement: it bounds realtime validation and copying.
 pub const callback_samples_count_max: u32 = sample_rate_hz / 10;
 
-pub const format_version: u32 = 4;
+pub const format_version: u32 = 5;
 
 pub const AudioExchange = extern struct {
     version: u32,
     reserved: u32,
-    generation: u64,
-    audio_callbacks_count: u64,
-    audio_samples_count: u32,
+    session_id: u64,
+
+    // These counters report callback liveness; slot publication alone may be
+    // twenty or more seconds apart and cannot enforce the progress deadline.
+    audio_callbacks_count_atomic: u64,
+    audio_samples_count_atomic: u32,
     reserved_2: u32,
+
     slots: [slots_count]AudioSlot,
 };
 
 pub const AudioSlot = extern struct {
-    state: u32,
-    samples_count: u32,
-    generation: u64,
+    // Audio writes `publication_ordinal` and `samples`, then release-stores a
+    // positive count. The supervisor acquire-loads that count before reading
+    // either field and release-stores zero only after the text is retained.
+    published_samples_count_atomic: u32,
     publication_ordinal: u32,
-    reserved: u32,
     samples: [slot_samples_capacity]f32,
 };
 
+pub const SlotIndex = enum(u8) {
+    slot_0,
+    slot_1,
+    slot_2,
+
+    pub fn arrayIndex(index: SlotIndex) usize {
+        return @intFromEnum(index);
+    }
+
+    pub fn fromArrayIndex(index: usize) SlotIndex {
+        assert(index < slots_count);
+        return @enumFromInt(index);
+    }
+};
+
+pub const SlotWriter = struct {
+    slot: *AudioSlot,
+    publication_ordinal: u32,
+};
+
 pub const PublishedSlot = struct {
-    generation: u64,
     publication_ordinal: u32,
     samples_count: u32,
 };
 
-const SlotState = enum(u32) {
-    available,
-    audio_writing,
-    published,
+pub const PublishedSlotRef = struct {
+    index: SlotIndex,
+    publication: PublishedSlot,
 };
-
-pub const slot_state_available = @intFromEnum(SlotState.available);
 
 comptime {
     assert(sample_rate_hz > 0);
@@ -65,219 +85,202 @@ comptime {
     assert(callback_samples_count_max > 0);
     assert(callback_samples_count_max <= slot_samples_capacity);
 
-    assert(@offsetOf(AudioExchange, "audio_callbacks_count") % @alignOf(u64) == 0);
-    assert(@offsetOf(AudioExchange, "audio_samples_count") % @alignOf(u32) == 0);
+    assert(@offsetOf(AudioExchange, "audio_callbacks_count_atomic") % @alignOf(u64) == 0);
+    assert(@offsetOf(AudioExchange, "audio_samples_count_atomic") % @alignOf(u32) == 0);
     assert(@offsetOf(AudioExchange, "slots") % @alignOf(AudioSlot) == 0);
-    assert(@offsetOf(AudioSlot, "state") % @alignOf(u32) == 0);
+    assert(@offsetOf(AudioSlot, "published_samples_count_atomic") % @alignOf(u32) == 0);
     assert(@offsetOf(AudioSlot, "samples") % @alignOf(f32) == 0);
-    assert(@sizeOf(AudioSlot) == @offsetOf(AudioSlot, "samples") + slot_samples_capacity * @sizeOf(f32));
+    assert(@sizeOf(AudioSlot) == 8 + slot_samples_capacity * @sizeOf(f32));
 }
 
-/// Clears the exchange and assigns a new recording generation. The supervisor
-/// must call this only while no audio or model process can access the mapping.
-pub fn initialize(exchange: *AudioExchange, generation: u64) void {
-    assert(generation > 0);
+/// `initialize` assigns a fresh session to an exchange that no worker can still
+/// access. A canceled session must not call it until every old worker is reaped.
+pub fn initialize(exchange: *AudioExchange, session_id: u64) void {
+    assert(session_id > 0);
 
     @memset(std.mem.asBytes(exchange), 0);
-
     exchange.version = format_version;
-    exchange.generation = generation;
+    exchange.session_id = session_id;
 
     assert(exchange.version == format_version);
     assert(exchange.reserved == 0);
-    assert(exchange.generation == generation);
-    assert(exchange.audio_callbacks_count == 0);
-    assert(exchange.audio_samples_count == 0);
+    assert(exchange.session_id == session_id);
+    assert(exchange.audio_callbacks_count_atomic == 0);
+    assert(exchange.audio_samples_count_atomic == 0);
     assert(exchange.reserved_2 == 0);
 
     for (&exchange.slots) |*slot| {
-        assert(@atomicLoad(u32, &slot.state, .acquire) == @intFromEnum(SlotState.available));
-        assert(slot.samples_count == 0);
-        assert(slot.generation == 0);
+        assert(@atomicLoad(
+            u32,
+            &slot.published_samples_count_atomic,
+            .acquire,
+        ) == 0);
         assert(slot.publication_ordinal == 0);
-        assert(slot.reserved == 0);
     }
 }
 
-/// Publishes callback progress independently of slot boundaries. The supervisor
-/// uses this heartbeat to distinguish a healthy long slot from a stream that
-/// connected but never produced data. The count is diagnostic only: slot state,
-/// not this value, authorizes access to samples.
+/// `publishAudioCallbacksCount` release-publishes callback progress separately
+/// from slot boundaries. The count is diagnostic and authorizes no sample read.
 pub fn publishAudioCallbacksCount(exchange: *AudioExchange, callbacks_count: u64) void {
     assert(exchange.version == format_version);
-    assert(exchange.reserved == 0);
-    assert(exchange.generation > 0);
-    assert(exchange.reserved_2 == 0);
+    assert(exchange.session_id > 0);
     assert(callbacks_count > 0);
-    assert(callbacks_count == @atomicLoad(u64, &exchange.audio_callbacks_count, .monotonic) + 1);
+    assert(callbacks_count == @atomicLoad(
+        u64,
+        &exchange.audio_callbacks_count_atomic,
+        .monotonic,
+    ) + 1);
 
-    @atomicStore(u64, &exchange.audio_callbacks_count, callbacks_count, .release);
+    @atomicStore(
+        u64,
+        &exchange.audio_callbacks_count_atomic,
+        callbacks_count,
+        .release,
+    );
 }
 
-/// Acquires the latest callback heartbeat. A zero value means the audio process
-/// has not entered its process callback during this exchange generation.
 pub fn acquireAudioCallbacksCount(exchange: *const AudioExchange) u64 {
     assert(exchange.version == format_version);
-    assert(exchange.reserved == 0);
-    assert(exchange.generation > 0);
-    assert(exchange.reserved_2 == 0);
+    assert(exchange.session_id > 0);
 
-    return @atomicLoad(u64, &exchange.audio_callbacks_count, .acquire);
+    return @atomicLoad(
+        u64,
+        &exchange.audio_callbacks_count_atomic,
+        .acquire,
+    );
 }
 
-/// Publishes actual sample progress after a complete callback block has entered
-/// a producer-owned slot. Unlike the callback heartbeat, this count does not
-/// advance when PipeWire schedules the process function without a buffer.
+/// `publishAudioSamplesCount` records complete callback blocks after audio has
+/// copied them into its private active slot. Consumers still require a positive
+/// slot publication count before reading PCM.
 pub fn publishAudioSamplesCount(exchange: *AudioExchange, samples_count: u32) void {
     assert(exchange.version == format_version);
-    assert(exchange.reserved == 0);
-    assert(exchange.generation > 0);
-    assert(exchange.reserved_2 == 0);
+    assert(exchange.session_id > 0);
 
-    const samples_count_previous =
-        @atomicLoad(u32, &exchange.audio_samples_count, .monotonic);
+    const samples_count_previous = @atomicLoad(
+        u32,
+        &exchange.audio_samples_count_atomic,
+        .monotonic,
+    );
     assert(samples_count > samples_count_previous);
     assert(samples_count - samples_count_previous <= callback_samples_count_max);
 
-    @atomicStore(u32, &exchange.audio_samples_count, samples_count, .release);
-}
-
-/// Acquires the total samples copied during this generation. This is a liveness
-/// signal only; consumers still need a `published` slot before reading samples.
-pub fn acquireAudioSamplesCount(exchange: *const AudioExchange) u32 {
-    assert(exchange.version == format_version);
-    assert(exchange.reserved == 0);
-    assert(exchange.generation > 0);
-    assert(exchange.reserved_2 == 0);
-
-    return @atomicLoad(u32, &exchange.audio_samples_count, .acquire);
-}
-
-/// Transfers one available slot to the audio producer. Returning `false` means
-/// the consumer still owns every physical slot, so audio must apply its pipeline
-/// pressure policy rather than overwrite unread samples.
-pub fn tryBeginWrite(
-    slot: *AudioSlot,
-    generation: u64,
-    publication_ordinal: u32,
-) bool {
-    assert(generation > 0);
-
-    const state = @atomicLoad(u32, &slot.state, .monotonic);
-
-    switch (state) {
-        @intFromEnum(SlotState.available),
-        @intFromEnum(SlotState.audio_writing),
-        @intFromEnum(SlotState.published),
-        => {},
-        else => unreachable,
-    }
-
-    assert(slot.reserved == 0);
-
-    if (@cmpxchgStrong(
-        u32,
-        &slot.state,
-        @intFromEnum(SlotState.available),
-        @intFromEnum(SlotState.audio_writing),
-        .acquire,
-        .monotonic,
-    ) != null) {
-        return false;
-    }
-
-    slot.samples_count = 0;
-    slot.generation = generation;
-    slot.publication_ordinal = publication_ordinal;
-
-    assert(@atomicLoad(u32, &slot.state, .monotonic) == @intFromEnum(SlotState.audio_writing));
-    assert(slot.samples_count == 0);
-    assert(slot.generation == generation);
-    assert(slot.publication_ordinal == publication_ordinal);
-
-    return true;
-}
-
-/// Publishes the complete prefix written by audio. The release-store makes the
-/// metadata and every preceding sample write visible to the consumer that
-/// acquire-loads the `published` state.
-pub fn publishWrittenSlot(slot: *AudioSlot, samples_count: u32) void {
-    assert(samples_count > 0);
-    assert(samples_count <= slot_samples_capacity);
-    assert(@atomicLoad(u32, &slot.state, .monotonic) == @intFromEnum(SlotState.audio_writing));
-    assert(slot.samples_count == 0);
-    assert(slot.generation > 0);
-    assert(slot.reserved == 0);
-
-    slot.samples_count = samples_count;
     @atomicStore(
         u32,
-        &slot.state,
-        @intFromEnum(SlotState.published),
+        &exchange.audio_samples_count_atomic,
+        samples_count,
         .release,
     );
 }
 
-/// Returns metadata for a complete published prefix, or `null` while audio owns
-/// the slot or the slot is available. The slot is written only by trusted
-/// Voiced processes, so impossible state or metadata is an assertion failure.
-/// The caller may read the returned prefix until `releaseConsumedSlot`.
-pub fn acquirePublishedSlot(slot: *const AudioSlot) ?PublishedSlot {
-    const state = @atomicLoad(u32, &slot.state, .acquire);
-    switch (state) {
-        @intFromEnum(SlotState.available),
-        @intFromEnum(SlotState.audio_writing),
-        @intFromEnum(SlotState.published),
-        => {},
-        else => unreachable,
+pub fn acquireAudioSamplesCount(exchange: *const AudioExchange) u32 {
+    assert(exchange.version == format_version);
+    assert(exchange.session_id > 0);
+
+    return @atomicLoad(
+        u32,
+        &exchange.audio_samples_count_atomic,
+        .acquire,
+    );
+}
+
+/// `tryAcquireWriter` returns the only value accepted by publication and
+/// abandonment. This couples the selected physical slot and ordinal so ordinary
+/// producer code cannot publish a different slot than the one it acquired.
+pub fn tryAcquireWriter(
+    exchange: *AudioExchange,
+    index: SlotIndex,
+    publication_ordinal: u32,
+) ?SlotWriter {
+    const slot = &exchange.slots[index.arrayIndex()];
+    if (@atomicLoad(
+        u32,
+        &slot.published_samples_count_atomic,
+        .acquire,
+    ) != 0) {
+        return null;
     }
-    assert(slot.reserved == 0);
 
-    if (state != @intFromEnum(SlotState.published)) return null;
+    slot.publication_ordinal = publication_ordinal;
 
-    assert(slot.samples_count > 0);
-    assert(slot.samples_count <= slot_samples_capacity);
-    assert(slot.generation > 0);
-
+    assert(@atomicLoad(
+        u32,
+        &slot.published_samples_count_atomic,
+        .monotonic,
+    ) == 0);
+    assert(slot.publication_ordinal == publication_ordinal);
     return .{
-        .generation = slot.generation,
-        .publication_ordinal = slot.publication_ordinal,
-        .samples_count = slot.samples_count,
+        .slot = slot,
+        .publication_ordinal = publication_ordinal,
     };
 }
 
-/// Returns a consumed slot to audio. The producer's publication and the
-/// consumer's release form the two sides of the ownership contract: only a
-/// published slot may become available again.
-pub fn releaseConsumedSlot(slot: *AudioSlot) void {
-    assert(@atomicLoad(u32, &slot.state, .monotonic) ==
-        @intFromEnum(SlotState.published));
-    assert(slot.samples_count > 0);
-    assert(slot.samples_count <= slot_samples_capacity);
-    assert(slot.generation > 0);
-    assert(slot.reserved == 0);
+/// `publishWrittenSlot` makes the complete metadata and sample prefix visible
+/// to consumers. `samples_count` must never be zero because zero means that no
+/// published payload exists.
+pub fn publishWrittenSlot(writer: SlotWriter, samples_count: u32) void {
+    assert(writer.slot.publication_ordinal == writer.publication_ordinal);
+    assert(samples_count > 0);
+    assert(samples_count <= slot_samples_capacity);
+    assert(@atomicLoad(
+        u32,
+        &writer.slot.published_samples_count_atomic,
+        .monotonic,
+    ) == 0);
 
     @atomicStore(
         u32,
-        &slot.state,
-        @intFromEnum(SlotState.available),
+        &writer.slot.published_samples_count_atomic,
+        samples_count,
         .release,
     );
 }
 
-/// Returns an empty producer-owned slot without publishing it. This is used
-/// when capture ends before the first sample reaches a newly claimed slot.
-pub fn abandonEmptyWrite(slot: *AudioSlot) void {
-    assert(@atomicLoad(u32, &slot.state, .monotonic) ==
-        @intFromEnum(SlotState.audio_writing));
-    assert(slot.samples_count == 0);
-    assert(slot.generation > 0);
-    assert(slot.reserved == 0);
+/// `acquirePublishedSlot` returns immutable publication metadata while the
+/// shared count remains positive. The caller may read that sample prefix until
+/// the supervisor calls `releaseConsumedSlot` after retaining its transcript.
+pub fn acquirePublishedSlot(slot: *const AudioSlot) ?PublishedSlot {
+    const samples_count = @atomicLoad(
+        u32,
+        &slot.published_samples_count_atomic,
+        .acquire,
+    );
+    if (samples_count == 0) return null;
+
+    assert(samples_count <= slot_samples_capacity);
+    return .{
+        .publication_ordinal = slot.publication_ordinal,
+        .samples_count = samples_count,
+    };
+}
+
+/// `releaseConsumedSlot` returns a published slot to audio after no process can
+/// read its old PCM. Only the supervisor performs this transition.
+pub fn releaseConsumedSlot(slot: *AudioSlot) void {
+    const samples_count = @atomicLoad(
+        u32,
+        &slot.published_samples_count_atomic,
+        .monotonic,
+    );
+    assert(samples_count > 0);
+    assert(samples_count <= slot_samples_capacity);
 
     @atomicStore(
         u32,
-        &slot.state,
-        @intFromEnum(SlotState.available),
+        &slot.published_samples_count_atomic,
+        0,
         .release,
     );
+}
+
+/// `abandonEmptyWrite` verifies that audio has exposed none of its private
+/// partial bytes. No shared write is needed because zero already means that no
+/// complete payload exists.
+pub fn abandonEmptyWrite(writer: SlotWriter) void {
+    assert(writer.slot.publication_ordinal == writer.publication_ordinal);
+    assert(@atomicLoad(
+        u32,
+        &writer.slot.published_samples_count_atomic,
+        .acquire,
+    ) == 0);
 }

@@ -470,11 +470,26 @@ fn add_default_build_command(b: *std.Build) void {
     });
     configurePipeWireArtifact(b, audio_spike);
 
-    // Installation copies all three executables to `zig-out/bin`. No artifact
-    // is attached to a run step, so a normal build never records or transcribes.
+    // `voiced supervisor-spike` is one executable with supervisor, fake audio,
+    // and fake transcription roles. The internal roles are process entries, not
+    // user commands; their deterministic work establishes the final process and
+    // shared-memory contract before native model inference is attached.
+    const voiced = b.addExecutable(.{
+        .name = "voiced",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    configurePipeWireArtifact(b, voiced);
+
+    // Installation copies the executables to `zig-out/bin`. No artifact is
+    // attached to a run step, so a normal build never records or transcribes.
     b.installArtifact(model_spike);
     b.installArtifact(audio_process);
     b.installArtifact(audio_spike);
+    b.installArtifact(voiced);
 }
 
 fn configurePipeWireArtifact(

@@ -23,19 +23,26 @@ The remaining milestone work is:
 
 ## 2. Supervisor and fake workers
 
-- Create the one-binary role launcher.
-- Implement fixed shared exchanges and narrow role-specific protocols.
-- Drive the complete lifecycle with deterministic fake audio and Whisper
-  workers.
-- Establish generation checks, slot conservation assertions, deadlines,
-  cancellation, transactional text production, and worker restart behavior.
+The deterministic supervisor now establishes:
 
-This milestone should make process ownership correct before native libraries
-add asynchronous failure modes.
+- one-binary role dispatch;
+- fixed audio and transcript exchanges with narrow role protocols;
+- SCM_RIGHTS descriptor handoff;
+- one epoll loop over seqpackets, pidfds, timerfd, signalfd, and eventfd;
+- count-based publication and slot-conservation assertions;
+- absolute deadlines, cancellation, transactional text production, and bounded
+  worker retry;
+- deferred process replacement without worker-incarnation tags; and
+- one session identity at the exchange boundary rather than in every slot.
+
+The remaining milestone work is the resident CTranslate2 role, long-running
+public service loop, and normal stop through persistence/output. Real PipeWire
+already replaces deterministic audio without changing this ownership model;
+the deterministic role remains for repeatable process failures.
 
 ## 3. Recoverable audio process
 
-- Replace the fake audio role with direct PipeWire capture.
+- Drive direct PipeWire capture from the epoll supervisor.
 - Publish complete PCM blocks into shared slots.
 - Detect explicit device removal and missing callback progress.
 - Demonstrate that killing blocked audio preserves the published prefix.
@@ -64,8 +71,8 @@ add asynchronous failure modes.
 - Run process-level fault scenarios for every phase and worker boundary.
 - Measure stop-to-output latency for short and multi-minute recordings.
 - Verify all capacities and deadline policies at their boundaries.
-- Audit shared-memory layout, protocol decoding, file permissions, and stale
-  generation handling.
+- Audit shared-memory layout, protocol decoding, file permissions, and session
+  reset only after every prior worker is reaped.
 - Remove abstractions and configuration that the vertical slice did not need.
 
 ## Open questions

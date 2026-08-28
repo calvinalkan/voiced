@@ -17,23 +17,27 @@ private to the active session and may be discarded by cancellation.
 
 ## Audio capture
 
-The supervisor uses `audio_process.zig`, never `pipewire.zig` directly.
-`audio_process.zig` owns worker launch, the control/report protocol, shared memfd
-lifetime, publication consumption, deadlines, and forced termination. The child
-then enters `pipewire.zig`, which owns one PipeWire stream and its callback
-lifecycle. Both sides access slot state only through `audio_exchange.zig`.
+The supervisor uses `audio_process.zig`, never `pipewire.zig` directly. In the
+production path the supervisor creates the audio memfd and publication eventfd,
+then `audio_process.zig` launches the worker and transfers those descriptors in
+its fixed launch record. `pipewire.zig` owns one stream and its callback
+lifecycle. Every process interprets PCM publication through
+`audio_exchange.zig`.
 
 The audio process connects directly to PipeWire and requests mono float32 audio
 at 16 kHz where graph negotiation permits it. PipeWire may own or recycle its
 small graph buffer pool. The process copies complete callback blocks into an
 active shared audio slot.
 
-The callback publishes `samples_count` only after the corresponding sample
-bytes are readable. If the process dies during a copy, the supervisor and
-Whisper process consume only the previously published prefix.
+The callback release-publishes `published_samples_count_atomic` only after the
+corresponding sample bytes and ordinal are readable. It then performs one
+nonblocking eventfd increment when the slot becomes complete. If the process
+dies during a copy, the count remains zero and consumers see no private prefix.
 
-The callback performs bounded work. It does not allocate, send control
-messages, transcribe, persist, notify, or wait for another thread.
+The callback performs bounded work. It does not allocate, send structured
+control messages, transcribe, persist, or wait for another thread. The eventfd
+increment is only a doorbell; several slot publications may coalesce into one
+counter value.
 
 Realtime capture selects PipeWire's `client-rt.conf` as well as requesting its
 realtime process callback. The configuration loads PipeWire's realtime module,
@@ -82,14 +86,24 @@ remains a fallback for failures that produce no useful event.
 
 ## Eager chunk pipeline
 
+An audio slot has one shared publication value:
+
 ```text
-free → filling → sealed → transcribing → produced → free
+published_samples_count_atomic = 0   no complete PCM is visible
+published_samples_count_atomic > 0   one immutable PCM prefix is visible
 ```
 
-Only the audio process writes a filling slot. Only the Whisper process reads a
-sealed or transcribing slot. The supervisor authorizes every transition and
-does not release a slot until its transcription result is safely represented in
+The audio process privately tracks its filling slot. The supervisor privately
+tracks the one in-flight transcription. Whisper never changes audio-slot state:
+it reads the published prefix named by a supervisor command. The supervisor
+restores the count to zero only after the corresponding text is represented in
 the session transcript.
+
+The transcript mailbox uses one atomic state so cancellation and publication
+cannot both win. Zero is empty, one is cancelled, and values from two encode a
+committed UTF-8 byte count plus two. The worker writes text and metadata first,
+then release-CASes empty to published; cancellation atomically exchanges any
+state to cancelled. A valid empty transcription is therefore value two.
 
 A provisional boundary policy is:
 
@@ -182,8 +196,9 @@ When Whisper fails, the current slot remains sealed. The supervisor may restart
 the model and retry that slot once. Repeated failures terminate the session
 with an explicit error; retry loops are always bounded.
 
-Worker events from an earlier generation cannot publish samples, text, or
-lifecycle transitions into the current session.
+A replacement starts only after the prior worker is reaped and its complete
+epoll batch is consumed. No prior-session process can therefore publish samples,
+text, or lifecycle transitions into reset storage.
 
 ## Bounds to validate
 

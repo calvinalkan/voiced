@@ -8,6 +8,7 @@
 const std = @import("std");
 const pipewire = @import("pipewire.zig");
 const audio_exchange = @import("audio_exchange.zig");
+const descriptor_handoff = @import("descriptor_handoff.zig");
 const assert = std.debug.assert;
 const stderr = std.debug.print;
 
@@ -22,20 +23,58 @@ const worker_error_message_capacity = pipewire.setup_error_message_capacity;
 // import the worker-private PipeWire or exchange modules.
 pub const ControlCommand = pipewire.ControlCommand;
 pub const Outcome = pipewire.Outcome;
+pub const FailureOutcome = pipewire.FailureOutcome;
 pub const TimelineValidation = pipewire.TimelineValidation;
 pub const SetupErrorStage = pipewire.SetupErrorStage;
+pub const SetupFailureStage = enum(u32) {
+    file_descriptor_limits_query = @intFromEnum(SetupErrorStage.file_descriptor_limits_query),
+    file_descriptor_limit = @intFromEnum(SetupErrorStage.file_descriptor_limit),
+    memory_lock_limits_query = @intFromEnum(SetupErrorStage.memory_lock_limits_query),
+    main_loop_create = @intFromEnum(SetupErrorStage.main_loop_create),
+    callback_event_create = @intFromEnum(SetupErrorStage.callback_event_create),
+    callback_event_register = @intFromEnum(SetupErrorStage.callback_event_register),
+    control_socket_register = @intFromEnum(SetupErrorStage.control_socket_register),
+    properties_create = @intFromEnum(SetupErrorStage.properties_create),
+    property_config = @intFromEnum(SetupErrorStage.property_config),
+    property_media_type = @intFromEnum(SetupErrorStage.property_media_type),
+    property_media_category = @intFromEnum(SetupErrorStage.property_media_category),
+    property_media_role = @intFromEnum(SetupErrorStage.property_media_role),
+    property_target = @intFromEnum(SetupErrorStage.property_target),
+    stream_create = @intFromEnum(SetupErrorStage.stream_create),
+    source_resolution = @intFromEnum(SetupErrorStage.source_resolution),
+    source_resolution_main_loop_create = @intFromEnum(SetupErrorStage.source_resolution_main_loop_create),
+    source_resolution_context_create = @intFromEnum(SetupErrorStage.source_resolution_context_create),
+    source_resolution_core_connect = @intFromEnum(SetupErrorStage.source_resolution_core_connect),
+    source_resolution_core_observer_register = @intFromEnum(SetupErrorStage.source_resolution_core_observer_register),
+    source_resolution_registry_create = @intFromEnum(SetupErrorStage.source_resolution_registry_create),
+    source_resolution_registry_observer_register = @intFromEnum(SetupErrorStage.source_resolution_registry_observer_register),
+    source_resolution_node_bind = @intFromEnum(SetupErrorStage.source_resolution_node_bind),
+    source_resolution_device_bind = @intFromEnum(SetupErrorStage.source_resolution_device_bind),
+    source_resolution_sync = @intFromEnum(SetupErrorStage.source_resolution_sync),
+    source_resolution_main_loop = @intFromEnum(SetupErrorStage.source_resolution_main_loop),
+    source_observer_create = @intFromEnum(SetupErrorStage.source_observer_create),
+    source_registry_create = @intFromEnum(SetupErrorStage.source_registry_create),
+    source_observer_register = @intFromEnum(SetupErrorStage.source_observer_register),
+    server_observer_register = @intFromEnum(SetupErrorStage.server_observer_register),
+    stream_connect = @intFromEnum(SetupErrorStage.stream_connect),
+};
 pub const RuntimeErrorStage = pipewire.RuntimeErrorStage;
+pub const FailureStage = pipewire.FailureStage;
 pub const ErrorDomain = pipewire.ErrorDomain;
+pub const FailureDomain = pipewire.FailureDomain;
 pub const sample_rate_hz = audio_exchange.sample_rate_hz;
 pub const slots_count = audio_exchange.slots_count;
 pub const slot_duration_seconds_max = audio_exchange.slot_duration_seconds_max;
 pub const callback_samples_count_max = audio_exchange.callback_samples_count_max;
+pub const target_name_bytes_capacity = target_name_capacity;
 pub const audio_exchange_size = @sizeOf(AudioExchange);
+pub const schedulerPolicyName = pipewire.schedulerPolicyName;
+
+pub const Source = pipewire.Source;
 
 pub const StartOptions = struct {
-    generation: u64,
-    target: ?[:0]const u8,
-    configured_device_serial: ?[:0]const u8,
+    session_id: u64,
+    source: Source,
     recording_samples_target: u32,
     slot_samples_boundary: u32,
     consumer_delay_ms: u32,
@@ -44,7 +83,7 @@ pub const StartOptions = struct {
 
 /// The fixed process report is intentionally value-only: every string owns a
 /// bounded array, and no field contains an address from the worker process.
-pub const Report = extern struct {
+const WireReport = extern struct {
     worker_succeeded: u8,
     shared_memory_is_locked: u8,
     shared_memory_lock_error_code: i32,
@@ -112,30 +151,660 @@ pub const Report = extern struct {
     teardown_error_message: [worker_error_message_capacity]u8,
 };
 
-/// Borrows the final report and ordered published samples from `AudioProcess`.
-/// Both remain valid until `killAndReap` releases the process handle.
-pub const Result = struct {
-    report: *const Report,
-    samples: []const f32,
-    slots_consumed_before_final_report: u32,
+/// Setup failure has no sample payload. Successful setup returns one logical
+/// capture report and borrows ordered samples until `killAndReap`.
+pub const Result = union(enum) {
+    setup_failed: SetupFailure,
+    captured: struct {
+        report: CaptureReport,
+        samples: []const f32,
+        slots_consumed_before_final_report: u32,
+    },
+};
+
+pub const Failure = struct {
+    stage: FailureStage,
+    domain: FailureDomain,
+    code: i64,
+    message: [worker_error_message_capacity]u8,
+    message_size: u16,
+
+    pub fn messageBytes(failure: *const Failure) []const u8 {
+        return failure.message[0..failure.message_size];
+    }
+};
+
+pub const SetupFailure = struct {
+    stage: SetupFailureStage,
+    domain: FailureDomain,
+    code: i64,
+    message: [worker_error_message_capacity]u8,
+    message_size: u16,
+    pipewire_version: [pipewire.pipewire_version_capacity]u8,
+    pipewire_version_size: u8,
+};
+
+pub const MemoryLockResult = union(enum) {
+    locked: u64,
+    unavailable: struct {
+        error_code: i32,
+        limit_bytes: u64,
+    },
+};
+
+pub const ResolvedSource = struct {
+    node_id: u32,
+    node_object_serial: u64,
+    device_id: u32,
+    device_object_serial: u64,
+    node_name: [pipewire.source_identity_text_capacity]u8,
+    node_name_size: u16,
+    node_description: [pipewire.source_identity_text_capacity]u8,
+    node_description_size: u16,
+    device_serial: [pipewire.source_identity_text_capacity]u8,
+    device_serial_size: u16,
+    device_description: [pipewire.source_identity_text_capacity]u8,
+    device_description_size: u16,
+};
+
+pub const CallbackSamplesRange = struct {
+    minimum: u32,
+    maximum: u32,
+};
+
+pub const CallbackObservation = struct {
+    thread_id: i32,
+    scheduler_policy: ?i32,
+    scheduler_priority: ?i32,
+    callbacks_count: u64,
+    missing_buffers_count: u32,
+    clipped_samples_count: u32,
+    header_metadata_buffers_count: u32,
+    header_gap_buffers_count: u32,
+    header_gap_samples_count: u32,
+    samples_range: ?CallbackSamplesRange,
+    duration_ns_max: u64,
+    gap_ns_max: u64,
+};
+
+pub const CaptureFailure = struct {
+    outcome: FailureOutcome,
+    failure: Failure,
+};
+
+pub const CaptureEnd = union(enum) {
+    completed,
+    stopped,
+    cancelled,
+    failed: CaptureFailure,
+};
+
+pub const NegotiatedFormat = struct {
+    sample_rate_hz: u32,
+    channels_count: u32,
+};
+
+pub const CaptureReport = struct {
+    end: CaptureEnd,
+    teardown_failure: ?Failure,
+    memory_lock: MemoryLockResult,
+    timeline_validation: TimelineValidation,
+    pipewire_headers_version: [pipewire.pipewire_version_capacity]u8,
+    pipewire_headers_version_size: u8,
+    pipewire_library_version: [pipewire.pipewire_version_capacity]u8,
+    pipewire_library_version_size: u8,
+    pipewire_server_version: [pipewire.pipewire_version_capacity]u8,
+    pipewire_server_version_size: u8,
+    source: ?ResolvedSource,
+    negotiated_format: ?NegotiatedFormat,
+    samples_count: u32,
+    published_samples_count: u32,
+    slot_publications_count: u32,
+    main_loop_thread_id: i32,
+    callback: ?CallbackObservation,
+};
+
+/// The raw fixed record exists only at the process transport boundary. Ordinary
+/// supervisors receive one of these payload-shaped logical alternatives.
+pub const WorkerReport = union(enum) {
+    setup_failed: SetupFailure,
+    captured: CaptureReport,
 };
 
 pub const AudioProcess = opaque {};
+
+/// Encodes the audio control protocol behind the process boundary. Supervisors
+/// choose a logical command and never import PipeWire transport records.
+pub fn sendControl(socket: std.posix.fd_t, command: ControlCommand) !void {
+    assert(socket >= 0);
+    const packet: pipewire.ControlPacket = .{
+        .command = @intFromEnum(command),
+        .reserved = 0,
+    };
+    while (true) {
+        const bytes = std.mem.asBytes(&packet);
+        const result = std.os.linux.sendto(
+            socket,
+            bytes.ptr,
+            bytes.len,
+            std.os.linux.MSG.NOSIGNAL,
+            null,
+            0,
+        );
+        switch (std.os.linux.errno(result)) {
+            .SUCCESS => {
+                assert(result == bytes.len);
+                return;
+            },
+            .INTR => continue,
+            .PIPE, .CONNRESET => return error.AudioControlPeerClosed,
+            else => return error.AudioControlSendFailed,
+        }
+    }
+}
 
 // The installed `audio-process` worker executable enters through this private
 // function. Exporting it as the root entry is separate from the five operations
 // imported by the spike and, later, the supervisor.
 pub const main = workerMain;
 
-const WorkerLaunchPacket = extern struct {
-    exchange_generation: u64,
-    recording_samples_target: u32,
-    slot_samples_boundary: u32,
-    process_realtime: u8,
-    target_name_size: u16,
-    configured_device_serial_size: u16,
-    target_name: [target_name_capacity]u8,
-    configured_device_serial: [target_name_capacity]u8,
+/// `PipeWireWorker` is the real audio role used by the one-binary supervisor.
+/// The supervisor sends bounded capture settings and transfers the audio memfd
+/// plus publication eventfd in one launch message. The worker returns the same
+/// structured final report already proven by the standalone audio process.
+pub const PipeWireWorker = struct {
+    pub const protocol_version: u16 = 2;
+
+    pub const LaunchOptions = struct {
+        session_id: u64,
+        source: Source,
+        recording_samples_target: u32,
+        slot_samples_boundary: u32,
+        process_realtime: bool,
+    };
+
+    pub const WireLaunch = extern struct {
+        version: u16,
+        reserved: u16,
+        session_id: u64,
+        recording_samples_target: u32,
+        slot_samples_boundary: u32,
+        process_realtime: u8,
+        source_kind: u8,
+        source_size: u16,
+        source: [target_name_capacity]u8,
+    };
+
+    /// `sendLaunch` keeps descriptor transfer and fixed-record construction on
+    /// one side of the process API. The sender retains both descriptors; the
+    /// worker receives close-on-exec duplicates referring to the same objects.
+    pub fn sendLaunch(
+        control_socket: std.posix.fd_t,
+        audio_exchange_fd: std.posix.fd_t,
+        publication_event_fd: std.posix.fd_t,
+        options: LaunchOptions,
+    ) !void {
+        assert(control_socket >= 0);
+        assert(audio_exchange_fd >= 0);
+        assert(publication_event_fd >= 0);
+        assert(options.session_id > 0);
+        assert(options.recording_samples_target > 0);
+        assert(options.recording_samples_target <= 90 * audio_exchange.sample_rate_hz);
+        assert(options.slot_samples_boundary >= audio_exchange.callback_samples_count_max);
+        assert(options.slot_samples_boundary <= audio_exchange.slot_samples_capacity);
+        switch (options.source) {
+            .default => {},
+            .node_name, .device_serial => |source| {
+                assert(source.len > 0);
+                assert(source.len < target_name_capacity);
+            },
+        }
+
+        const launch_packet = buildLaunchPacket(options);
+        const descriptors = [_]std.posix.fd_t{
+            audio_exchange_fd,
+            publication_event_fd,
+        };
+        try descriptor_handoff.send(control_socket, &launch_packet, &descriptors);
+    }
+
+    /// `decodeTrustedReport` validates the fixed transport record and returns
+    /// exactly one logical outcome. The worker is trusted process-internal code,
+    /// so malformed records assert rather than becoming an external-input path.
+    pub fn decodeTrustedReport(
+        report: WireReport,
+        exchange: *const AudioExchange,
+        options: LaunchOptions,
+    ) WorkerReport {
+        const launch_packet = buildLaunchPacket(options);
+        validateReportPacket(
+            &report,
+            launch_packet,
+            options.recording_samples_target +
+                audio_exchange.callback_samples_count_max,
+            exchange,
+        );
+        if (report.worker_succeeded == 0) {
+            return .{ .setup_failed = .{
+                .stage = @enumFromInt(report.setup_error_stage),
+                .domain = @enumFromInt(report.setup_error_domain),
+                .code = report.setup_error_code,
+                .message = report.error_message,
+                .message_size = report.error_message_size,
+                .pipewire_version = report.pipewire_version,
+                .pipewire_version_size = report.pipewire_version_size,
+            } };
+        }
+
+        const outcome: Outcome = @enumFromInt(report.outcome);
+        const end: CaptureEnd = switch (outcome) {
+            .completed => .completed,
+            .stopped => .stopped,
+            .cancelled => .cancelled,
+            else => .{ .failed = .{
+                .outcome = @enumFromInt(@intFromEnum(outcome)),
+                .failure = .{
+                    .stage = @enumFromInt(report.runtime_error_stage),
+                    .domain = @enumFromInt(report.runtime_error_domain),
+                    .code = report.runtime_error_code,
+                    .message = report.error_message,
+                    .message_size = report.error_message_size,
+                },
+            } },
+        };
+        const teardown_failure: ?Failure = if (report.teardown_error_stage == @intFromEnum(RuntimeErrorStage.none))
+            null
+        else
+            .{
+                .stage = @enumFromInt(report.teardown_error_stage),
+                .domain = @enumFromInt(report.teardown_error_domain),
+                .code = report.teardown_error_code,
+                .message = report.teardown_error_message,
+                .message_size = report.teardown_error_message_size,
+            };
+        const source: ?ResolvedSource = if (report.source_is_resolved == 1)
+            .{
+                .node_id = report.source_node_id,
+                .node_object_serial = report.source_node_object_serial,
+                .device_id = report.source_device_id,
+                .device_object_serial = report.source_device_object_serial,
+                .node_name = report.source_node_name,
+                .node_name_size = report.source_node_name_size,
+                .node_description = report.source_node_description,
+                .node_description_size = report.source_node_description_size,
+                .device_serial = report.source_device_serial,
+                .device_serial_size = report.source_device_serial_size,
+                .device_description = report.source_device_description,
+                .device_description_size = report.source_device_description_size,
+            }
+        else
+            null;
+        const callback: ?CallbackObservation = if (report.callback_thread_id == 0)
+            null
+        else
+            .{
+                .thread_id = report.callback_thread_id,
+                .scheduler_policy = if (report.callback_scheduler_policy < 0)
+                    null
+                else
+                    report.callback_scheduler_policy,
+                .scheduler_priority = if (report.callback_scheduler_priority < 0)
+                    null
+                else
+                    report.callback_scheduler_priority,
+                .callbacks_count = report.callbacks_count,
+                .missing_buffers_count = report.missing_buffers_count,
+                .clipped_samples_count = report.clipped_samples_count,
+                .header_metadata_buffers_count = report.header_metadata_buffers_count,
+                .header_gap_buffers_count = report.header_gap_buffers_count,
+                .header_gap_samples_count = report.header_gap_samples_count,
+                .samples_range = if (report.block_samples_count_min == 0)
+                    null
+                else
+                    .{
+                        .minimum = report.block_samples_count_min,
+                        .maximum = report.block_samples_count_max,
+                    },
+                .duration_ns_max = report.callback_duration_ns_max,
+                .gap_ns_max = report.callback_gap_ns_max,
+            };
+        const memory_lock: MemoryLockResult = if (report.shared_memory_is_locked == 1)
+            .{ .locked = report.shared_memory_lock_limit_bytes }
+        else
+            .{ .unavailable = .{
+                .error_code = report.shared_memory_lock_error_code,
+                .limit_bytes = report.shared_memory_lock_limit_bytes,
+            } };
+        return .{ .captured = .{
+            .end = end,
+            .teardown_failure = teardown_failure,
+            .memory_lock = memory_lock,
+            .timeline_validation = @enumFromInt(report.timeline_validation),
+            .pipewire_headers_version = report.pipewire_headers_version,
+            .pipewire_headers_version_size = report.pipewire_headers_version_size,
+            .pipewire_library_version = report.pipewire_library_version,
+            .pipewire_library_version_size = report.pipewire_library_version_size,
+            .pipewire_server_version = report.pipewire_server_version,
+            .pipewire_server_version_size = report.pipewire_server_version_size,
+            .source = source,
+            .negotiated_format = if (report.negotiated_sample_rate_hz == 0)
+                null
+            else
+                .{
+                    .sample_rate_hz = report.negotiated_sample_rate_hz,
+                    .channels_count = report.negotiated_channels_count,
+                },
+            .samples_count = report.samples_count,
+            .published_samples_count = report.published_samples_count,
+            .slot_publications_count = report.slot_publications_count,
+            .main_loop_thread_id = report.main_loop_thread_id,
+            .callback = callback,
+        } };
+    }
+
+    /// Receives and decodes one complete worker report without exposing the
+    /// fixed transport record. Outer null means not ready; inner null means the
+    /// socket closed before another report.
+    pub fn receiveReportNonblocking(
+        socket: std.posix.fd_t,
+        exchange: *const AudioExchange,
+        options: LaunchOptions,
+    ) ??WorkerReport {
+        var wire: WireReport = undefined;
+        const result = std.os.linux.recvfrom(
+            socket,
+            std.mem.asBytes(&wire).ptr,
+            @sizeOf(WireReport),
+            std.os.linux.MSG.TRUNC | std.os.linux.MSG.DONTWAIT,
+            null,
+            null,
+        );
+        switch (std.os.linux.errno(result)) {
+            .SUCCESS => {
+                if (result == 0) return @as(?WorkerReport, null);
+                assert(result == @sizeOf(WireReport));
+                return decodeTrustedReport(wire, exchange, options);
+            },
+            .AGAIN => return null,
+            .CONNRESET => return @as(?WorkerReport, null),
+            else => @trap(),
+        }
+    }
+
+    /// `run` enters one real PipeWire capture after exec. It binds its lifetime
+    /// to the expected supervisor before receiving shared resources, then owns
+    /// and closes every descriptor installed by `SCM_RIGHTS`.
+    pub fn run(
+        control_socket: std.posix.fd_t,
+        expected_supervisor_pid: std.os.linux.pid_t,
+    ) !void {
+        assert(control_socket >= 0);
+        assert(expected_supervisor_pid > 1);
+
+        try bindWorkerLifetimeToSupervisor(expected_supervisor_pid);
+        unblockServiceSignals();
+        defer closeFileDescriptor(control_socket);
+
+        var launch_packet: WireLaunch = undefined;
+        var shared_descriptors = try descriptor_handoff.receive(
+            control_socket,
+            &launch_packet,
+        );
+        defer shared_descriptors.deinit();
+
+        assert(shared_descriptors.values[0] != control_socket);
+        assert(shared_descriptors.values[1] != control_socket);
+        assert(shared_descriptors.values[0] != shared_descriptors.values[1]);
+        try runAudioWorkerSession(
+            control_socket,
+            shared_descriptors.values[0],
+            shared_descriptors.values[1],
+            launch_packet,
+        );
+    }
+
+    fn buildLaunchPacket(options: LaunchOptions) WireLaunch {
+        var launch_packet: WireLaunch = std.mem.zeroes(WireLaunch);
+        launch_packet.version = protocol_version;
+        launch_packet.session_id = options.session_id;
+        launch_packet.recording_samples_target = options.recording_samples_target;
+        launch_packet.slot_samples_boundary = options.slot_samples_boundary;
+        launch_packet.process_realtime = @intFromBool(options.process_realtime);
+        launch_packet.source_kind = @intFromEnum(std.meta.activeTag(options.source));
+        switch (options.source) {
+            .default => {},
+            .node_name, .device_serial => |source| {
+                @memcpy(launch_packet.source[0..source.len], source);
+                launch_packet.source_size = @intCast(source.len);
+            },
+        }
+        return launch_packet;
+    }
+
+    fn decodeTrustedLaunch(wire: *const WireLaunch) LaunchOptions {
+        assert(wire.version == protocol_version);
+        assert(wire.reserved == 0);
+        assert(wire.session_id > 0);
+        assert(wire.recording_samples_target > 0);
+        assert(wire.recording_samples_target <= 90 * audio_exchange.sample_rate_hz);
+        assert(wire.slot_samples_boundary >= audio_exchange.callback_samples_count_max);
+        assert(wire.slot_samples_boundary <= audio_exchange.slot_samples_capacity);
+        assert(wire.process_realtime <= 1);
+        assert(wire.source_size < wire.source.len);
+        assert(std.mem.indexOfScalar(u8, wire.source[0..wire.source_size], 0) == null);
+        assert(wire.source[wire.source_size] == 0);
+
+        const source_text = wire.source[0..wire.source_size :0];
+        const source: Source = switch (@as(std.meta.Tag(Source), @enumFromInt(wire.source_kind))) {
+            .default => source: {
+                assert(wire.source_size == 0);
+                break :source .default;
+            },
+            .node_name => source: {
+                assert(wire.source_size > 0);
+                break :source .{ .node_name = source_text };
+            },
+            .device_serial => source: {
+                assert(wire.source_size > 0);
+                break :source .{ .device_serial = source_text };
+            },
+        };
+        return .{
+            .session_id = wire.session_id,
+            .source = source,
+            .recording_samples_target = wire.recording_samples_target,
+            .slot_samples_boundary = wire.slot_samples_boundary,
+            .process_realtime = wire.process_realtime == 1,
+        };
+    }
+
+    comptime {
+        assert(@sizeOf(WireLaunch) == 288);
+    }
+};
+
+const WorkerLaunchPacket = PipeWireWorker.WireLaunch;
+
+/// `FakeWorker` drives the production process and shared-exchange contracts
+/// without PipeWire. The supervisor uses it to establish lifecycle, deadline,
+/// cancellation, slot-pressure, and transcription behavior deterministically.
+pub const FakeWorker = struct {
+    pub const protocol_version: u16 = 1;
+
+    pub const LaunchOptions = struct {
+        session_id: u64,
+        chunks_count: u32,
+        publication_interval_ms: u32,
+    };
+
+    const WireLaunch = extern struct {
+        version: u16,
+        reserved: u16,
+        session_id: u64,
+        chunks_count: u32,
+        publication_interval_ms: u32,
+    };
+
+    pub const ReportKind = enum(u16) {
+        ready,
+        completed,
+        pipeline_full,
+        cancelled,
+    };
+
+    pub const ReportPacket = extern struct {
+        kind: u16,
+        reserved: u16,
+    };
+
+    comptime {
+        assert(@sizeOf(WireLaunch) == 24);
+        assert(@sizeOf(ReportPacket) == 4);
+    }
+
+    pub fn sendLaunch(
+        socket: std.posix.fd_t,
+        audio_exchange_fd: std.posix.fd_t,
+        publication_event_fd: std.posix.fd_t,
+        options: LaunchOptions,
+    ) !void {
+        assert(options.session_id > 0);
+        assert(options.chunks_count > 0);
+        assert(options.chunks_count <= 32);
+        const wire: WireLaunch = .{
+            .version = protocol_version,
+            .reserved = 0,
+            .session_id = options.session_id,
+            .chunks_count = options.chunks_count,
+            .publication_interval_ms = options.publication_interval_ms,
+        };
+        const descriptors = [_]std.posix.fd_t{
+            audio_exchange_fd,
+            publication_event_fd,
+        };
+        try descriptor_handoff.send(socket, &wire, &descriptors);
+    }
+
+    pub fn decodeTrustedReport(report: ReportPacket) ReportKind {
+        assert(report.reserved == 0);
+        return @enumFromInt(report.kind);
+    }
+
+    pub fn run(
+        control_socket: std.posix.fd_t,
+        expected_supervisor_pid: std.os.linux.pid_t,
+    ) !void {
+        assert(control_socket >= 0);
+        assert(expected_supervisor_pid > 1);
+
+        try bindWorkerLifetimeToSupervisor(expected_supervisor_pid);
+        unblockServiceSignals();
+        defer closeFileDescriptor(control_socket);
+
+        var launch_packet: WireLaunch = undefined;
+        var shared_descriptors = try descriptor_handoff.receive(
+            control_socket,
+            &launch_packet,
+        );
+        defer shared_descriptors.deinit();
+
+        assert(launch_packet.version == protocol_version);
+        assert(launch_packet.reserved == 0);
+        assert(launch_packet.session_id > 0);
+        assert(launch_packet.chunks_count > 0);
+        assert(launch_packet.chunks_count <= 32);
+
+        const mapped_exchange = try mapAudioExchange(shared_descriptors.values[0]);
+        defer mapped_exchange.unmap();
+        const exchange = mapped_exchange.exchange;
+        assert(exchange.version == audio_exchange.format_version);
+        assert(exchange.session_id == launch_packet.session_id);
+
+        try sendFakeReport(control_socket, .ready);
+        for (0..launch_packet.chunks_count) |publication_ordinal_usize| {
+            if (receiveFakeControl(control_socket)) |command| {
+                assert(command == .cancel);
+                try sendFakeReport(control_socket, .cancelled);
+                return;
+            }
+
+            const publication_ordinal: u32 = @intCast(publication_ordinal_usize);
+            var selected_writer: ?audio_exchange.SlotWriter = null;
+            const preferred_slot_index = publication_ordinal % audio_exchange.slots_count;
+            for (0..audio_exchange.slots_count) |slot_offset| {
+                const slot_index = (preferred_slot_index + slot_offset) %
+                    audio_exchange.slots_count;
+                selected_writer = audio_exchange.tryAcquireWriter(
+                    exchange,
+                    audio_exchange.SlotIndex.fromArrayIndex(slot_index),
+                    publication_ordinal,
+                );
+                if (selected_writer != null) break;
+            }
+            const writer = selected_writer orelse {
+                try sendFakeReport(control_socket, .pipeline_full);
+                return;
+            };
+
+            const fake_samples_count: u32 = audio_exchange.sample_rate_hz;
+            for (writer.slot.samples[0..fake_samples_count], 0..) |*sample, sample_index| {
+                sample.* = @as(f32, @floatFromInt(sample_index % 100)) / 100.0;
+            }
+            audio_exchange.publishWrittenSlot(writer, fake_samples_count);
+            writeFakePublicationEvent(shared_descriptors.values[1]);
+
+            for (0..launch_packet.publication_interval_ms) |_| {
+                sleepMilliseconds(1);
+                if (receiveFakeControl(control_socket)) |command| {
+                    assert(command == .cancel);
+                    try sendFakeReport(control_socket, .cancelled);
+                    return;
+                }
+            }
+        }
+
+        try sendFakeReport(control_socket, .completed);
+    }
+
+    fn sendFakeReport(socket: std.posix.fd_t, kind: ReportKind) !void {
+        const report: ReportPacket = .{
+            .kind = @intFromEnum(kind),
+            .reserved = 0,
+        };
+        try sendPacket(socket, std.mem.asBytes(&report));
+    }
+
+    fn receiveFakeControl(socket: std.posix.fd_t) ?pipewire.ControlCommand {
+        var control_packet: pipewire.ControlPacket = undefined;
+        const receive_result = std.os.linux.recvfrom(
+            socket,
+            std.mem.asBytes(&control_packet).ptr,
+            @sizeOf(pipewire.ControlPacket),
+            std.os.linux.MSG.TRUNC | std.os.linux.MSG.DONTWAIT,
+            null,
+            null,
+        );
+        switch (std.os.linux.errno(receive_result)) {
+            .SUCCESS => {
+                assert(receive_result == @sizeOf(pipewire.ControlPacket));
+                assert(control_packet.reserved == 0);
+                return @enumFromInt(control_packet.command);
+            },
+            .AGAIN => return null,
+            else => @trap(),
+        }
+    }
+
+    fn writeFakePublicationEvent(event_fd: std.posix.fd_t) void {
+        const increment: u64 = 1;
+        const write_result = std.os.linux.write(
+            event_fd,
+            std.mem.asBytes(&increment).ptr,
+            @sizeOf(u64),
+        );
+        assert(std.os.linux.errno(write_result) == .SUCCESS);
+        assert(write_result == @sizeOf(u64));
+    }
 };
 
 const MappedAudioExchange = struct {
@@ -149,13 +818,34 @@ const MappedAudioExchange = struct {
     }
 };
 
+const PendingPublishedSlot = struct {
+    index: audio_exchange.SlotIndex,
+    ready_at_monotonic_ns: u64,
+};
+
 const PublishedAudioConsumer = struct {
     samples: []f32,
     samples_count: usize,
     next_publication_ordinal: u32,
-    pending_slot_index: ?u8,
-    pending_slot_ready_at_ns: u64,
+    pending: ?PendingPublishedSlot,
     slots_consumed_before_final_report: u32,
+};
+
+const RequestedControl = struct {
+    command: pipewire.ControlCommand,
+    deadline_monotonic_ns: u64,
+};
+
+const SupervisionState = union(enum) {
+    awaiting_callbacks: u64,
+    recording: u64,
+    control_requested: RequestedControl,
+    reported,
+};
+
+const ProgressObservation = struct {
+    callbacks_count: u64,
+    samples_count: u32,
 };
 
 const Process = struct {
@@ -163,22 +853,16 @@ const Process = struct {
     io: Io,
     exchange_fd: std.posix.fd_t,
     mapped_exchange: MappedAudioExchange,
+    publication_event_fd: std.posix.fd_t,
     supervisor_socket: std.posix.fd_t,
     worker: std.process.Child,
     launch_packet: WorkerLaunchPacket,
     consumer_delay_ms: u32,
     consumer: PublishedAudioConsumer,
 
-    setup_deadline_ns: u64,
     recording_deadline_ns: u64,
-    sample_progress_deadline_ns: u64,
-    control_deadline_ns: u64,
-    observed_callbacks_count: u64,
-    observed_samples_count: u32,
-    control_requested: ?pipewire.ControlCommand,
-
-    report: Report,
-    result: ?Result,
+    supervision: SupervisionState,
+    progress: ProgressObservation,
 };
 
 /// Creates the shared exchange, launches one isolated worker, sends its fixed
@@ -187,20 +871,18 @@ pub fn start(
     init: std.process.Init,
     options: StartOptions,
 ) !*AudioProcess {
-    assert(options.generation > 0);
+    assert(options.session_id > 0);
     assert(options.recording_samples_target > 0);
     assert(options.recording_samples_target <= 90 * audio_exchange.sample_rate_hz);
     assert(options.slot_samples_boundary >= audio_exchange.callback_samples_count_max);
     assert(options.slot_samples_boundary <= audio_exchange.slot_samples_capacity);
     assert(options.consumer_delay_ms <= 10_000);
-    assert(options.target == null or options.configured_device_serial == null);
-    if (options.target) |target| {
-        assert(target.len > 0);
-        assert(target.len < target_name_capacity);
-    }
-    if (options.configured_device_serial) |device_serial| {
-        assert(device_serial.len > 0);
-        assert(device_serial.len < target_name_capacity);
+    switch (options.source) {
+        .default => {},
+        .node_name, .device_serial => |source| {
+            assert(source.len > 0);
+            assert(source.len < target_name_capacity);
+        },
     }
 
     const exchange_fd = try std.posix.memfd_create(
@@ -233,7 +915,18 @@ pub fn start(
     const mapped_exchange = try mapAudioExchange(exchange_fd);
     var exchange_is_mapped = true;
     errdefer if (exchange_is_mapped) mapped_exchange.unmap();
-    audio_exchange.initialize(mapped_exchange.exchange, options.generation);
+    audio_exchange.initialize(mapped_exchange.exchange, options.session_id);
+
+    const publication_event_result = std.os.linux.eventfd(
+        0,
+        std.os.linux.EFD.NONBLOCK,
+    );
+    if (std.os.linux.errno(publication_event_result) != .SUCCESS) {
+        return error.AudioPublicationEventCreationFailed;
+    }
+    const publication_event_fd: std.posix.fd_t = @intCast(publication_event_result);
+    var publication_event_fd_is_owned = true;
+    errdefer if (publication_event_fd_is_owned) closeFileDescriptor(publication_event_fd);
 
     var sockets: [2]std.posix.fd_t = undefined;
     const socket_pair_result = std.os.linux.socketpair(
@@ -276,6 +969,12 @@ pub fn start(
         "{d}",
         .{exchange_fd},
     );
+    var publication_event_fd_text_buffer: [32]u8 = undefined;
+    const publication_event_fd_text = try std.fmt.bufPrint(
+        &publication_event_fd_text_buffer,
+        "{d}",
+        .{publication_event_fd},
+    );
     var supervisor_pid_text_buffer: [32]u8 = undefined;
     const supervisor_pid_text = try std.fmt.bufPrint(
         &supervisor_pid_text_buffer,
@@ -308,6 +1007,7 @@ pub fn start(
             worker_path,
             worker_socket_text,
             exchange_fd_text,
+            publication_event_fd_text,
             supervisor_pid_text,
         },
     });
@@ -315,37 +1015,21 @@ pub fn start(
     closeFileDescriptor(worker_socket);
     worker_socket_is_owned = false;
 
-    var launch_packet: WorkerLaunchPacket = std.mem.zeroes(WorkerLaunchPacket);
-    launch_packet.exchange_generation = options.generation;
-    launch_packet.recording_samples_target = options.recording_samples_target;
-    launch_packet.slot_samples_boundary = options.slot_samples_boundary;
-    launch_packet.process_realtime = @intFromBool(options.process_realtime);
-    if (options.target) |target| {
-        @memcpy(launch_packet.target_name[0..target.len], target);
-        launch_packet.target_name_size = @intCast(target.len);
-    }
-    if (options.configured_device_serial) |device_serial| {
-        @memcpy(
-            launch_packet.configured_device_serial[0..device_serial.len],
-            device_serial,
-        );
-        launch_packet.configured_device_serial_size = @intCast(device_serial.len);
-    }
+    const launch_packet = PipeWireWorker.buildLaunchPacket(.{
+        .session_id = options.session_id,
+        .source = options.source,
+        .recording_samples_target = options.recording_samples_target,
+        .slot_samples_boundary = options.slot_samples_boundary,
+        .process_realtime = options.process_realtime,
+    });
 
-    assert(launch_packet.exchange_generation > 0);
+    assert(launch_packet.session_id > 0);
     assert(launch_packet.recording_samples_target > 0);
     assert(launch_packet.slot_samples_boundary >= audio_exchange.callback_samples_count_max);
     assert(launch_packet.slot_samples_boundary <= audio_exchange.slot_samples_capacity);
     assert(launch_packet.process_realtime <= 1);
-    assert(launch_packet.target_name_size == 0 or
-        launch_packet.configured_device_serial_size == 0);
-    assert(launch_packet.target_name_size < launch_packet.target_name.len);
-    assert(launch_packet.configured_device_serial_size <
-        launch_packet.configured_device_serial.len);
-    assert(launch_packet.target_name[launch_packet.target_name_size] == 0);
-    assert(launch_packet.configured_device_serial[
-        launch_packet.configured_device_serial_size
-    ] == 0);
+    assert(launch_packet.source_size < launch_packet.source.len);
+    assert(launch_packet.source[launch_packet.source_size] == 0);
     try sendPacket(supervisor_socket, std.mem.asBytes(&launch_packet));
 
     const samples_capacity = options.recording_samples_target +
@@ -363,6 +1047,7 @@ pub fn start(
         .io = init.io,
         .exchange_fd = exchange_fd,
         .mapped_exchange = mapped_exchange,
+        .publication_event_fd = publication_event_fd,
         .supervisor_socket = supervisor_socket,
         .worker = worker,
         .launch_packet = launch_packet,
@@ -371,24 +1056,23 @@ pub fn start(
             .samples = samples,
             .samples_count = 0,
             .next_publication_ordinal = 0,
-            .pending_slot_index = null,
-            .pending_slot_ready_at_ns = 0,
+            .pending = null,
             .slots_consumed_before_final_report = 0,
         },
-        .setup_deadline_ns = supervision_started_ns + 3 * std.time.ns_per_s,
         .recording_deadline_ns = supervision_started_ns +
             (@as(u64, recording_seconds) + 10) * std.time.ns_per_s,
-        .sample_progress_deadline_ns = 0,
-        .control_deadline_ns = 0,
-        .observed_callbacks_count = 0,
-        .observed_samples_count = 0,
-        .control_requested = null,
-        .report = undefined,
-        .result = null,
+        .supervision = .{
+            .awaiting_callbacks = supervision_started_ns + 3 * std.time.ns_per_s,
+        },
+        .progress = .{
+            .callbacks_count = 0,
+            .samples_count = 0,
+        },
     };
 
     exchange_fd_is_owned = false;
     exchange_is_mapped = false;
+    publication_event_fd_is_owned = false;
     supervisor_socket_is_owned = false;
     return @ptrCast(process);
 }
@@ -404,22 +1088,22 @@ pub fn requestCancel(process_opaque: *AudioProcess) !void {
 }
 
 /// Advances publication consumption and process supervision for at most
-/// `timeout_ms`. `null` means the worker remains active; a returned result stays
-/// borrowed from the process until `killAndReap`.
+/// `timeout_ms`. `null` means the worker remains active. A returned result owns
+/// its report and borrows only its sample slice from the process.
 pub fn receiveReport(
     process_opaque: *AudioProcess,
     timeout_ms: u16,
-) !?*const Result {
+) !?Result {
     const process = processImplementation(process_opaque);
     assert(timeout_ms > 0);
-    assert(process.result == null);
     assert(process.worker.id != null);
+    assert(process.supervision != .reported);
 
     const now_ns = monotonicNanoseconds();
     while (consumeNextPublishedSlot(
         &process.consumer,
         process.mapped_exchange.exchange,
-        process.launch_packet.exchange_generation,
+        process.launch_packet.session_id,
         process.launch_packet.slot_samples_boundary,
         process.consumer_delay_ms,
         now_ns,
@@ -428,24 +1112,51 @@ pub fn receiveReport(
         process.consumer.slots_consumed_before_final_report += 1;
     }
 
-    var poll_descriptors = [_]std.posix.pollfd{.{
-        .fd = process.supervisor_socket,
-        .events = std.posix.POLL.IN,
-        .revents = 0,
-    }};
+    var poll_descriptors = [_]std.posix.pollfd{
+        .{
+            .fd = process.supervisor_socket,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        },
+        .{
+            .fd = process.publication_event_fd,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        },
+    };
     if (try std.posix.poll(&poll_descriptors, timeout_ms) > 0) {
+        if (poll_descriptors[1].revents & std.posix.POLL.IN != 0) {
+            _ = try readEventCounter(process.publication_event_fd);
+            while (consumeNextPublishedSlot(
+                &process.consumer,
+                process.mapped_exchange.exchange,
+                process.launch_packet.session_id,
+                process.launch_packet.slot_samples_boundary,
+                process.consumer_delay_ms,
+                monotonicNanoseconds(),
+                false,
+            )) {
+                process.consumer.slots_consumed_before_final_report += 1;
+            }
+        }
+        if (poll_descriptors[1].revents &
+            (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0)
+        {
+            return error.AudioPublicationEventFailed;
+        }
+
         if (poll_descriptors[0].revents & std.posix.POLL.IN != 0) {
+            var report: WireReport = undefined;
             receivePacket(
                 process.supervisor_socket,
-                std.mem.asBytes(&process.report),
+                std.mem.asBytes(&report),
             ) catch |packet_error| switch (packet_error) {
                 error.WorkerSocketClosed => {
                     try reportUnexpectedWorkerExit(&process.worker, process.io);
                 },
                 else => return packet_error,
             };
-            try finishReport(process);
-            return &process.result.?;
+            return try finishReport(process, report);
         }
         if (poll_descriptors[0].revents &
             (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0)
@@ -458,21 +1169,29 @@ pub fn receiveReport(
     const callbacks_count = audio_exchange.acquireAudioCallbacksCount(
         process.mapped_exchange.exchange,
     );
-    assert(callbacks_count >= process.observed_callbacks_count);
-    process.observed_callbacks_count = callbacks_count;
+    const callbacks_count_previous = process.progress.callbacks_count;
+    assert(callbacks_count >= callbacks_count_previous);
+    process.progress.callbacks_count = callbacks_count;
+    if (callbacks_count > callbacks_count_previous) {
+        switch (process.supervision) {
+            .awaiting_callbacks, .recording => process.supervision = .{
+                .recording = deadline_now_ns + 2 * std.time.ns_per_s,
+            },
+            .control_requested => {},
+            .reported => unreachable,
+        }
+    }
 
     const samples_count = audio_exchange.acquireAudioSamplesCount(
         process.mapped_exchange.exchange,
     );
-    assert(samples_count >= process.observed_samples_count);
+    assert(samples_count >= process.progress.samples_count);
     assert(samples_count <= process.consumer.samples.len);
-    if (samples_count > process.observed_samples_count) {
-        process.observed_samples_count = samples_count;
-        process.sample_progress_deadline_ns = deadline_now_ns + 2 * std.time.ns_per_s;
-    }
+    process.progress.samples_count = samples_count;
 
-    if (process.control_requested) |command| {
-        if (deadline_now_ns >= process.control_deadline_ns) {
+    if (process.supervision == .control_requested) {
+        const control = process.supervision.control_requested;
+        if (deadline_now_ns >= control.deadline_monotonic_ns) {
             stderr(
                 "Audio worker control deadline exceeded\n" ++
                     "Command: {s}\n" ++
@@ -481,9 +1200,9 @@ pub fn receiveReport(
                     "Callbacks observed: {d}\n" ++
                     "Samples observed: {d}\n",
                 .{
-                    @tagName(command),
-                    process.observed_callbacks_count,
-                    process.observed_samples_count,
+                    @tagName(control.command),
+                    process.progress.callbacks_count,
+                    process.progress.samples_count,
                 },
             );
             return error.AudioWorkerControlDeadlineExceeded;
@@ -491,10 +1210,8 @@ pub fn receiveReport(
         return null;
     }
 
-    const requested_target = if (process.launch_packet.target_name_size > 0)
-        process.launch_packet.target_name[0..process.launch_packet.target_name_size]
-    else if (process.launch_packet.configured_device_serial_size > 0)
-        process.launch_packet.configured_device_serial[0..process.launch_packet.configured_device_serial_size]
+    const requested_target = if (process.launch_packet.source_size > 0)
+        process.launch_packet.source[0..process.launch_packet.source_size]
     else
         "default source";
     const processing_mode = if (process.launch_packet.process_realtime == 1)
@@ -502,12 +1219,12 @@ pub fn receiveReport(
     else
         "main loop";
 
-    if (process.observed_samples_count == 0 and
-        deadline_now_ns >= process.setup_deadline_ns)
+    if (process.supervision == .awaiting_callbacks and
+        deadline_now_ns >= process.supervision.awaiting_callbacks)
     {
         stderr(
             "Audio worker deadline exceeded\n" ++
-                "Stage: waiting_for_first_samples\n" ++
+                "Stage: waiting_for_callback_progress\n" ++
                 "Deadline: 3000 ms\n" ++
                 "Target: {s}\n" ++
                 "Processing: {s}\n" ++
@@ -516,18 +1233,18 @@ pub fn receiveReport(
             .{
                 requested_target,
                 processing_mode,
-                process.observed_callbacks_count,
-                process.observed_samples_count,
+                process.progress.callbacks_count,
+                process.progress.samples_count,
             },
         );
         return error.AudioWorkerSetupDeadlineExceeded;
     }
-    if (process.observed_samples_count > 0 and
-        deadline_now_ns >= process.sample_progress_deadline_ns)
+    if (process.supervision == .recording and
+        deadline_now_ns >= process.supervision.recording)
     {
         stderr(
             "Audio worker deadline exceeded\n" ++
-                "Stage: waiting_for_sample_progress\n" ++
+                "Stage: waiting_for_callback_progress\n" ++
                 "Deadline: 2000 ms\n" ++
                 "Target: {s}\n" ++
                 "Processing: {s}\n" ++
@@ -536,8 +1253,8 @@ pub fn receiveReport(
             .{
                 requested_target,
                 processing_mode,
-                process.observed_callbacks_count,
-                process.observed_samples_count,
+                process.progress.callbacks_count,
+                process.progress.samples_count,
             },
         );
         return error.AudioWorkerProgressDeadlineExceeded;
@@ -553,8 +1270,8 @@ pub fn receiveReport(
             .{
                 requested_target,
                 processing_mode,
-                process.observed_callbacks_count,
-                process.observed_samples_count,
+                process.progress.callbacks_count,
+                process.progress.samples_count,
             },
         );
         return error.AudioWorkerRecordingDeadlineExceeded;
@@ -579,6 +1296,7 @@ pub fn killAndReap(process_opaque: *AudioProcess) !void {
     // operating error. Returning early would leak the mapping and descriptors
     // while also hiding which cleanup operation still requires diagnosis.
     closeFileDescriptor(process.supervisor_socket);
+    closeFileDescriptor(process.publication_event_fd);
     process.mapped_exchange.unmap();
     closeFileDescriptor(process.exchange_fd);
     allocator.free(process.consumer.samples);
@@ -593,44 +1311,54 @@ fn processImplementation(process: *AudioProcess) *Process {
 
 fn requestControl(process: *Process, command: pipewire.ControlCommand) !void {
     assert(process.worker.id != null);
-    assert(process.result == null);
-    assert(process.control_requested == null);
+    assert(process.supervision == .awaiting_callbacks or
+        process.supervision == .recording);
 
-    const packet: pipewire.ControlPacket = .{
-        .command = @intFromEnum(command),
-        .reserved = 0,
-    };
-    try sendPacket(process.supervisor_socket, std.mem.asBytes(&packet));
-    process.control_requested = command;
-    process.control_deadline_ns = monotonicNanoseconds() + 2 * std.time.ns_per_s;
+    try sendControl(process.supervisor_socket, command);
+    process.supervision = .{ .control_requested = .{
+        .command = command,
+        .deadline_monotonic_ns = monotonicNanoseconds() + 2 * std.time.ns_per_s,
+    } };
 
-    assert(process.control_requested == command);
-    assert(process.control_deadline_ns > 0);
+    assert(process.supervision.control_requested.command == command);
+    assert(process.supervision.control_requested.deadline_monotonic_ns > 0);
 }
 
-fn finishReport(process: *Process) !void {
-    assert(process.result == null);
+fn finishReport(process: *Process, report: WireReport) !Result {
     validateReportPacket(
-        &process.report,
+        &report,
         process.launch_packet,
         process.consumer.samples.len,
         process.mapped_exchange.exchange,
     );
 
-    while (process.consumer.next_publication_ordinal <
-        process.report.slot_publications_count)
-    {
+    const launch = PipeWireWorker.decodeTrustedLaunch(&process.launch_packet);
+    const worker_report = PipeWireWorker.decodeTrustedReport(
+        report,
+        process.mapped_exchange.exchange,
+        launch,
+    );
+    const publications_count = switch (worker_report) {
+        .setup_failed => 0,
+        .captured => |capture| capture.slot_publications_count,
+    };
+    const published_samples_count = switch (worker_report) {
+        .setup_failed => 0,
+        .captured => |capture| capture.published_samples_count,
+    };
+
+    while (process.consumer.next_publication_ordinal < publications_count) {
         assert(consumeNextPublishedSlot(
             &process.consumer,
             process.mapped_exchange.exchange,
-            process.launch_packet.exchange_generation,
+            process.launch_packet.session_id,
             process.launch_packet.slot_samples_boundary,
             process.consumer_delay_ms,
             monotonicNanoseconds(),
             true,
         ));
     }
-    assert(process.consumer.samples_count == process.report.published_samples_count);
+    assert(process.consumer.samples_count == published_samples_count);
 
     const worker_term = try waitForWorkerExit(&process.worker, process.io, 1_000);
     switch (worker_term) {
@@ -638,16 +1366,20 @@ fn finishReport(process: *Process) !void {
         else => unreachable,
     }
     assert(process.worker.id == null);
+    process.supervision = .reported;
 
-    process.result = .{
-        .report = &process.report,
-        .samples = process.consumer.samples[0..process.consumer.samples_count],
-        .slots_consumed_before_final_report = process.consumer.slots_consumed_before_final_report,
+    return switch (worker_report) {
+        .setup_failed => |failure| .{ .setup_failed = failure },
+        .captured => |capture| .{ .captured = .{
+            .report = capture,
+            .samples = process.consumer.samples[0..process.consumer.samples_count],
+            .slots_consumed_before_final_report = process.consumer.slots_consumed_before_final_report,
+        } },
     };
 }
 
 fn validateReportPacket(
-    report: *const Report,
+    report: *const WireReport,
     launch: WorkerLaunchPacket,
     samples_capacity: usize,
     exchange: *const AudioExchange,
@@ -799,15 +1531,19 @@ fn validateReportPacket(
     assert(report.header_gap_samples_count <= report.samples_count);
     assert(report.callbacks_count == audio_exchange.acquireAudioCallbacksCount(exchange));
     assert(report.samples_count == audio_exchange.acquireAudioSamplesCount(exchange));
+    if (report.callbacks_count == 0) {
+        assert(report.callback_thread_id == 0);
+    } else {
+        assert(report.callback_thread_id > 0);
+    }
     if (report.samples_count == 0) {
         assert(report.published_samples_count == 0);
         assert(report.slot_publications_count == 0);
-        assert(report.callback_thread_id == 0);
         assert(report.block_samples_count_min == 0);
         assert(report.block_samples_count_max == 0);
     } else {
         assert(report.source_is_resolved == 1);
-        assert(report.callback_thread_id > 0);
+        assert(report.callbacks_count > 0);
         assert(report.negotiated_sample_rate_hz == audio_exchange.sample_rate_hz);
         assert(report.negotiated_channels_count == audio_exchange.channels_count);
         assert(report.block_samples_count_min > 0);
@@ -847,6 +1583,9 @@ fn workerMain(init: std.process.Init) !void {
     const exchange_fd_text = arguments.next() orelse {
         return error.InvalidWorkerArguments;
     };
+    const publication_event_fd_text = arguments.next() orelse {
+        return error.InvalidWorkerArguments;
+    };
     const supervisor_pid_text = arguments.next() orelse {
         return error.InvalidWorkerArguments;
     };
@@ -862,22 +1601,36 @@ fn workerMain(init: std.process.Init) !void {
         exchange_fd_text,
         10,
     );
+    const publication_event_fd = try std.fmt.parseInt(
+        std.posix.fd_t,
+        publication_event_fd_text,
+        10,
+    );
     const supervisor_pid = try std.fmt.parseInt(
         std.os.linux.pid_t,
         supervisor_pid_text,
         10,
     );
-    try runAudioWorker(supervisor_socket, exchange_fd, supervisor_pid);
+    try runAudioWorker(
+        supervisor_socket,
+        exchange_fd,
+        publication_event_fd,
+        supervisor_pid,
+    );
 }
 
 fn runAudioWorker(
     supervisor_socket: std.posix.fd_t,
     exchange_fd: std.posix.fd_t,
+    publication_event_fd: std.posix.fd_t,
     expected_supervisor_pid: std.os.linux.pid_t,
 ) !void {
     assert(supervisor_socket >= 0);
     assert(exchange_fd >= 0);
+    assert(publication_event_fd >= 0);
     assert(supervisor_socket != exchange_fd);
+    assert(supervisor_socket != publication_event_fd);
+    assert(exchange_fd != publication_event_fd);
     assert(expected_supervisor_pid > 1);
 
     // Arm the kernel-enforced lifetime relationship before touching inherited
@@ -889,37 +1642,36 @@ fn runAudioWorker(
 
     defer closeFileDescriptor(supervisor_socket);
     defer closeFileDescriptor(exchange_fd);
+    defer closeFileDescriptor(publication_event_fd);
 
     var launch_packet: WorkerLaunchPacket = undefined;
     try receivePacket(supervisor_socket, std.mem.asBytes(&launch_packet));
 
-    // Assert the launch assumptions where the worker consumes them, paired with
-    // the supervisor's assertions immediately before send.
-    assert(launch_packet.exchange_generation > 0);
-    assert(launch_packet.recording_samples_target > 0);
-    assert(launch_packet.recording_samples_target <= 90 * audio_exchange.sample_rate_hz);
-    assert(launch_packet.slot_samples_boundary >= audio_exchange.callback_samples_count_max);
-    assert(launch_packet.slot_samples_boundary <= audio_exchange.slot_samples_capacity);
-    assert(launch_packet.process_realtime <= 1);
-    assert(launch_packet.target_name_size == 0 or
-        launch_packet.configured_device_serial_size == 0);
-    assert(launch_packet.target_name_size < launch_packet.target_name.len);
-    assert(launch_packet.configured_device_serial_size <
-        launch_packet.configured_device_serial.len);
-    assert(std.mem.indexOfScalar(
-        u8,
-        launch_packet.target_name[0..launch_packet.target_name_size],
-        0,
-    ) == null);
-    assert(launch_packet.target_name[launch_packet.target_name_size] == 0);
-    assert(std.mem.indexOfScalar(
-        u8,
-        launch_packet.configured_device_serial[0..launch_packet.configured_device_serial_size],
-        0,
-    ) == null);
-    assert(launch_packet.configured_device_serial[
-        launch_packet.configured_device_serial_size
-    ] == 0);
+    try runAudioWorkerSession(
+        supervisor_socket,
+        exchange_fd,
+        publication_event_fd,
+        launch_packet,
+    );
+}
+
+fn runAudioWorkerSession(
+    supervisor_socket: std.posix.fd_t,
+    exchange_fd: std.posix.fd_t,
+    publication_event_fd: std.posix.fd_t,
+    launch_packet: WorkerLaunchPacket,
+) !void {
+    assert(supervisor_socket >= 0);
+    assert(exchange_fd >= 0);
+    assert(publication_event_fd >= 0);
+    assert(supervisor_socket != exchange_fd);
+    assert(supervisor_socket != publication_event_fd);
+    assert(exchange_fd != publication_event_fd);
+
+    // Decode the fixed transport record once. Ordinary worker setup below uses
+    // the logical source union, so a default source cannot carry stale text and
+    // named source variants cannot exist without their required name.
+    const launch = PipeWireWorker.decodeTrustedLaunch(&launch_packet);
 
     const mapped_exchange = try mapAudioExchange(exchange_fd);
     defer mapped_exchange.unmap();
@@ -929,240 +1681,338 @@ fn runAudioWorker(
     // assumptions are visible without following an assertion helper.
     assert(mapped_exchange.exchange.version == audio_exchange.format_version);
     assert(mapped_exchange.exchange.reserved == 0);
-    assert(mapped_exchange.exchange.generation == launch_packet.exchange_generation);
-    assert(mapped_exchange.exchange.audio_callbacks_count == 0);
-    assert(mapped_exchange.exchange.audio_samples_count == 0);
+    assert(mapped_exchange.exchange.session_id == launch.session_id);
+    assert(mapped_exchange.exchange.audio_callbacks_count_atomic == 0);
+    assert(mapped_exchange.exchange.audio_samples_count_atomic == 0);
     assert(mapped_exchange.exchange.reserved_2 == 0);
     for (&mapped_exchange.exchange.slots) |*slot| {
-        assert(slot.state == audio_exchange.slot_state_available);
-        assert(slot.samples_count == 0);
-        assert(slot.generation == 0);
+        assert(@atomicLoad(
+            u32,
+            &slot.published_samples_count_atomic,
+            .acquire,
+        ) == 0);
         assert(slot.publication_ordinal == 0);
-        assert(slot.reserved == 0);
     }
 
-    const target: ?[:0]const u8 = if (launch_packet.target_name_size == 0)
-        null
-    else target: {
-        launch_packet.target_name[launch_packet.target_name_size] = 0;
-        break :target launch_packet.target_name[0..launch_packet.target_name_size :0];
-    };
-    const configured_device_serial: ?[:0]const u8 =
-        if (launch_packet.configured_device_serial_size == 0)
-            null
-        else configured: {
-            launch_packet.configured_device_serial[
-                launch_packet.configured_device_serial_size
-            ] = 0;
-            break :configured launch_packet.configured_device_serial[0..launch_packet.configured_device_serial_size :0];
-        };
-    assert(target == null or configured_device_serial == null);
-
-    var setup_error: pipewire.SetupError = std.mem.zeroes(pipewire.SetupError);
-
-    const worker_report = pipewire.run(.{
+    const worker_result = pipewire.run(.{
         .exchange = mapped_exchange.exchange,
+        .publication_event_fd = publication_event_fd,
         .control_socket = supervisor_socket,
-        .target = target,
-        .configured_device_serial = configured_device_serial,
-        .recording_samples_target = launch_packet.recording_samples_target,
-        .slot_samples_boundary = launch_packet.slot_samples_boundary,
-        .process_realtime = launch_packet.process_realtime == 1,
-    }, &setup_error);
+        .source = launch.source,
+        .recording_samples_target = launch.recording_samples_target,
+        .slot_samples_boundary = launch.slot_samples_boundary,
+        .process_realtime = launch.process_realtime,
+    });
 
-    var report_packet: Report = std.mem.zeroes(Report);
-    if (worker_report) |worker_succeeded| {
-        assert(setup_error.stage == .none);
-        assert(setup_error.domain == .none);
-        assert(setup_error.code == 0);
-        assert(setup_error.message_size == 0);
-        assert(setup_error.pipewire_version_size == 0);
-        assert(worker_succeeded.error_message_size <= worker_succeeded.error_message.len);
-        assert(worker_succeeded.teardown_error_message_size <=
-            worker_succeeded.teardown_error_message.len);
-        assert(worker_succeeded.pipewire_headers_version_size > 0);
-        assert(worker_succeeded.pipewire_headers_version_size <=
-            worker_succeeded.pipewire_headers_version.len);
-        assert(worker_succeeded.pipewire_library_version_size > 0);
-        assert(worker_succeeded.pipewire_library_version_size <=
-            worker_succeeded.pipewire_library_version.len);
-        assert(worker_succeeded.pipewire_server_version_size <=
-            worker_succeeded.pipewire_server_version.len);
-        assert(worker_succeeded.source_identity.node_name_size <=
-            worker_succeeded.source_identity.node_name.len);
-        assert(worker_succeeded.source_identity.node_description_size <=
-            worker_succeeded.source_identity.node_description.len);
-        assert(worker_succeeded.source_identity.device_serial_size <=
-            worker_succeeded.source_identity.device_serial.len);
-        assert(worker_succeeded.source_identity.device_description_size <=
-            worker_succeeded.source_identity.device_description.len);
-        if (worker_succeeded.samples_count > 0) {
-            assert(worker_succeeded.source_identity.is_resolved);
-        }
-        switch (worker_succeeded.outcome) {
-            .completed, .stopped, .cancelled => {
-                assert(worker_succeeded.runtime_error.stage == .none);
-                assert(worker_succeeded.runtime_error.domain == .none);
-                assert(worker_succeeded.runtime_error.code == 0);
-                assert(worker_succeeded.error_message_size == 0);
-            },
-            else => {
-                assert(worker_succeeded.runtime_error.stage != .none);
-                assert(worker_succeeded.runtime_error.domain != .none);
-                assert(worker_succeeded.error_message_size > 0);
-            },
-        }
-        if (worker_succeeded.teardown_error.stage == .none) {
-            assert(worker_succeeded.teardown_error.domain == .none);
-            assert(worker_succeeded.teardown_error.code == 0);
-            assert(worker_succeeded.teardown_error_message_size == 0);
-        } else {
-            assert(worker_succeeded.teardown_error.stage == .stream_disconnect);
-            assert(worker_succeeded.teardown_error.domain == .pipewire_result);
-            assert(worker_succeeded.teardown_error.code < 0);
-            assert(worker_succeeded.teardown_error_message_size > 0);
-        }
-        assert(worker_succeeded.samples_count <=
-            launch_packet.recording_samples_target +
-                audio_exchange.callback_samples_count_max);
-        assert(worker_succeeded.published_samples_count <=
-            worker_succeeded.samples_count);
-        report_packet.worker_succeeded = 1;
-        report_packet.shared_memory_is_locked =
-            @intFromBool(worker_succeeded.shared_memory_is_locked);
-        report_packet.shared_memory_lock_error_code =
-            worker_succeeded.shared_memory_lock_error_code;
-        report_packet.shared_memory_lock_limit_bytes =
-            worker_succeeded.shared_memory_lock_limit_bytes;
-        report_packet.outcome = @intFromEnum(worker_succeeded.outcome);
-        report_packet.error_message_size = worker_succeeded.error_message_size;
-        report_packet.runtime_error_stage = @intFromEnum(worker_succeeded.runtime_error.stage);
-        report_packet.runtime_error_domain = @intFromEnum(worker_succeeded.runtime_error.domain);
-        report_packet.runtime_error_code = worker_succeeded.runtime_error.code;
-        assert(report_packet.runtime_error_stage ==
-            @intFromEnum(worker_succeeded.runtime_error.stage));
-        assert(report_packet.runtime_error_domain ==
-            @intFromEnum(worker_succeeded.runtime_error.domain));
-        assert(report_packet.runtime_error_code == worker_succeeded.runtime_error.code);
-        @memcpy(
-            report_packet.error_message[0..worker_succeeded.error_message_size],
-            worker_succeeded.error_message[0..worker_succeeded.error_message_size],
-        );
-        report_packet.teardown_error_message_size =
-            worker_succeeded.teardown_error_message_size;
-        report_packet.teardown_error_stage =
-            @intFromEnum(worker_succeeded.teardown_error.stage);
-        report_packet.teardown_error_domain =
-            @intFromEnum(worker_succeeded.teardown_error.domain);
-        report_packet.teardown_error_code = worker_succeeded.teardown_error.code;
-        assert(report_packet.teardown_error_stage ==
-            @intFromEnum(worker_succeeded.teardown_error.stage));
-        assert(report_packet.teardown_error_domain ==
-            @intFromEnum(worker_succeeded.teardown_error.domain));
-        assert(report_packet.teardown_error_code == worker_succeeded.teardown_error.code);
-        @memcpy(
-            report_packet.teardown_error_message[0..worker_succeeded.teardown_error_message_size],
-            worker_succeeded.teardown_error_message[0..worker_succeeded.teardown_error_message_size],
-        );
-        report_packet.timeline_validation =
-            @intFromEnum(worker_succeeded.timeline_validation);
-        report_packet.pipewire_headers_version_size =
-            worker_succeeded.pipewire_headers_version_size;
-        @memcpy(
-            report_packet.pipewire_headers_version[0..worker_succeeded.pipewire_headers_version_size],
-            worker_succeeded.pipewire_headers_version[0..worker_succeeded.pipewire_headers_version_size],
-        );
-        report_packet.pipewire_library_version_size =
-            worker_succeeded.pipewire_library_version_size;
-        @memcpy(
-            report_packet.pipewire_library_version[0..worker_succeeded.pipewire_library_version_size],
-            worker_succeeded.pipewire_library_version[0..worker_succeeded.pipewire_library_version_size],
-        );
-        report_packet.pipewire_server_version_size =
-            worker_succeeded.pipewire_server_version_size;
-        @memcpy(
-            report_packet.pipewire_server_version[0..worker_succeeded.pipewire_server_version_size],
-            worker_succeeded.pipewire_server_version[0..worker_succeeded.pipewire_server_version_size],
-        );
-        report_packet.source_is_resolved =
-            @intFromBool(worker_succeeded.source_identity.is_resolved);
-        report_packet.source_node_id = worker_succeeded.source_identity.node_id;
-        report_packet.source_node_object_serial =
-            worker_succeeded.source_identity.node_object_serial;
-        report_packet.source_device_id = worker_succeeded.source_identity.device_id;
-        report_packet.source_device_object_serial =
-            worker_succeeded.source_identity.device_object_serial;
-        report_packet.source_node_name_size =
-            worker_succeeded.source_identity.node_name_size;
-        report_packet.source_node_description_size =
-            worker_succeeded.source_identity.node_description_size;
-        report_packet.source_device_serial_size =
-            worker_succeeded.source_identity.device_serial_size;
-        report_packet.source_device_description_size =
-            worker_succeeded.source_identity.device_description_size;
-        @memcpy(
-            report_packet.source_node_name[0..worker_succeeded.source_identity.node_name_size],
-            worker_succeeded.source_identity.node_name[0..worker_succeeded.source_identity.node_name_size],
-        );
-        @memcpy(
-            report_packet.source_node_description[0..worker_succeeded.source_identity.node_description_size],
-            worker_succeeded.source_identity.node_description[0..worker_succeeded.source_identity.node_description_size],
-        );
-        @memcpy(
-            report_packet.source_device_serial[0..worker_succeeded.source_identity.device_serial_size],
-            worker_succeeded.source_identity.device_serial[0..worker_succeeded.source_identity.device_serial_size],
-        );
-        @memcpy(
-            report_packet.source_device_description[0..worker_succeeded.source_identity.device_description_size],
-            worker_succeeded.source_identity.device_description[0..worker_succeeded.source_identity.device_description_size],
-        );
-        report_packet.negotiated_sample_rate_hz =
-            worker_succeeded.negotiated_sample_rate_hz;
-        report_packet.negotiated_channels_count =
-            worker_succeeded.negotiated_channels_count;
-        report_packet.samples_count = worker_succeeded.samples_count;
-        report_packet.published_samples_count =
-            worker_succeeded.published_samples_count;
-        report_packet.slot_publications_count =
-            worker_succeeded.slot_publications_count;
-        report_packet.main_loop_thread_id = worker_succeeded.main_loop_thread_id;
-        report_packet.callback_thread_id = worker_succeeded.callback_thread_id;
-        report_packet.callback_scheduler_policy =
-            worker_succeeded.callback_scheduler_policy;
-        report_packet.callback_scheduler_priority =
-            worker_succeeded.callback_scheduler_priority;
-        report_packet.callbacks_count = worker_succeeded.callbacks_count;
-        report_packet.missing_buffers_count = worker_succeeded.missing_buffers_count;
-        report_packet.clipped_samples_count = worker_succeeded.clipped_samples_count;
-        report_packet.header_metadata_buffers_count =
-            worker_succeeded.header_metadata_buffers_count;
-        report_packet.header_gap_buffers_count = worker_succeeded.header_gap_buffers_count;
-        report_packet.header_gap_samples_count = worker_succeeded.header_gap_samples_count;
-        report_packet.block_samples_count_min = worker_succeeded.block_samples_count_min;
-        report_packet.block_samples_count_max = worker_succeeded.block_samples_count_max;
-        report_packet.callback_duration_ns_max = worker_succeeded.callback_duration_ns_max;
-        report_packet.callback_gap_ns_max = worker_succeeded.callback_gap_ns_max;
-    } else |_| {
-        assert(setup_error.stage != .none);
-        assert(setup_error.domain != .none);
-        assert(setup_error.message_size > 0);
-        assert(setup_error.message_size <= setup_error.message.len);
-        assert(setup_error.pipewire_version_size > 0);
-        assert(setup_error.pipewire_version_size <= setup_error.pipewire_version.len);
+    var report_packet: WireReport = std.mem.zeroes(WireReport);
+    switch (worker_result) {
+        .captured => |capture| {
+            const capture_failure: ?pipewire.RuntimeFailure = switch (capture.end) {
+                .completed, .stopped, .cancelled => null,
+                .failed => |failure| failure.detail,
+            };
+            const outcome: pipewire.Outcome = switch (capture.end) {
+                .completed => .completed,
+                .stopped => .stopped,
+                .cancelled => .cancelled,
+                .failed => |failure| @enumFromInt(@intFromEnum(failure.outcome)),
+            };
+            const empty_runtime_error: pipewire.RuntimeError = .{
+                .stage = .none,
+                .domain = .none,
+                .code = 0,
+            };
+            const source = capture.source_identity;
+            const callback = capture.callback;
+            const worker_succeeded = .{
+                .outcome = outcome,
+                .runtime_error = if (capture_failure) |failure|
+                    pipewire.RuntimeError{
+                        .stage = @enumFromInt(@intFromEnum(failure.coordinate.stage)),
+                        .domain = @enumFromInt(@intFromEnum(failure.coordinate.domain)),
+                        .code = failure.coordinate.code,
+                    }
+                else
+                    empty_runtime_error,
+                .error_message = if (capture_failure) |failure|
+                    failure.message
+                else
+                    @as([pipewire.runtime_error_message_capacity]u8, @splat(0)),
+                .error_message_size = if (capture_failure) |failure|
+                    failure.message_size
+                else
+                    0,
+                .teardown_error = if (capture.teardown_failure) |failure|
+                    pipewire.RuntimeError{
+                        .stage = @enumFromInt(@intFromEnum(failure.coordinate.stage)),
+                        .domain = @enumFromInt(@intFromEnum(failure.coordinate.domain)),
+                        .code = failure.coordinate.code,
+                    }
+                else
+                    empty_runtime_error,
+                .teardown_error_message = if (capture.teardown_failure) |failure|
+                    failure.message
+                else
+                    @as([pipewire.runtime_error_message_capacity]u8, @splat(0)),
+                .teardown_error_message_size = if (capture.teardown_failure) |failure|
+                    failure.message_size
+                else
+                    0,
+                .timeline_validation = capture.timeline_validation,
+                .pipewire_headers_version = capture.pipewire_headers_version,
+                .pipewire_headers_version_size = capture.pipewire_headers_version_size,
+                .pipewire_library_version = capture.pipewire_library_version,
+                .pipewire_library_version_size = capture.pipewire_library_version_size,
+                .pipewire_server_version = capture.pipewire_server_version,
+                .pipewire_server_version_size = capture.pipewire_server_version_size,
+                .source_identity = .{
+                    .is_resolved = source != null,
+                    .node_id = if (source) |value| value.node_id else std.math.maxInt(u32),
+                    .node_object_serial = if (source) |value| value.node_object_serial else 0,
+                    .device_id = if (source) |value| value.device_id else std.math.maxInt(u32),
+                    .device_object_serial = if (source) |value| value.device_object_serial else 0,
+                    .node_name = if (source) |value| value.node_name else @as([pipewire.source_identity_text_capacity]u8, @splat(0)),
+                    .node_name_size = if (source) |value| value.node_name_size else 0,
+                    .node_description = if (source) |value| value.node_description else @as([pipewire.source_identity_text_capacity]u8, @splat(0)),
+                    .node_description_size = if (source) |value| value.node_description_size else 0,
+                    .device_serial = if (source) |value| value.device_serial else @as([pipewire.source_identity_text_capacity]u8, @splat(0)),
+                    .device_serial_size = if (source) |value| value.device_serial_size else 0,
+                    .device_description = if (source) |value| value.device_description else @as([pipewire.source_identity_text_capacity]u8, @splat(0)),
+                    .device_description_size = if (source) |value| value.device_description_size else 0,
+                },
+                .negotiated_sample_rate_hz = if (capture.negotiated_format) |format|
+                    format.sample_rate_hz
+                else
+                    0,
+                .negotiated_channels_count = if (capture.negotiated_format) |format|
+                    format.channels_count
+                else
+                    0,
+                .samples_count = capture.samples_count,
+                .published_samples_count = capture.published_samples_count,
+                .slot_publications_count = capture.slot_publications_count,
+                .shared_memory_is_locked = capture.memory_lock == .locked,
+                .shared_memory_lock_error_code = switch (capture.memory_lock) {
+                    .locked => 0,
+                    .unavailable => |unavailable| unavailable.error_code,
+                },
+                .shared_memory_lock_limit_bytes = switch (capture.memory_lock) {
+                    .locked => |limit| limit,
+                    .unavailable => |unavailable| unavailable.limit_bytes,
+                },
+                .main_loop_thread_id = capture.main_loop_thread_id,
+                .callback_thread_id = if (callback) |value| value.thread_id else 0,
+                .callback_scheduler_policy = if (callback) |value|
+                    value.scheduler_policy orelse -1
+                else
+                    -1,
+                .callback_scheduler_priority = if (callback) |value|
+                    value.scheduler_priority orelse -1
+                else
+                    -1,
+                .callbacks_count = if (callback) |value| value.callbacks_count else 0,
+                .missing_buffers_count = if (callback) |value| value.missing_buffers_count else 0,
+                .clipped_samples_count = if (callback) |value| value.clipped_samples_count else 0,
+                .header_metadata_buffers_count = if (callback) |value| value.header_metadata_buffers_count else 0,
+                .header_gap_buffers_count = if (callback) |value| value.header_gap_buffers_count else 0,
+                .header_gap_samples_count = if (callback) |value| value.header_gap_samples_count else 0,
+                .block_samples_count_min = if (callback) |value|
+                    if (value.samples_range) |range| range.minimum else 0
+                else
+                    0,
+                .block_samples_count_max = if (callback) |value|
+                    if (value.samples_range) |range| range.maximum else 0
+                else
+                    0,
+                .callback_duration_ns_max = if (callback) |value| value.duration_ns_max else 0,
+                .callback_gap_ns_max = if (callback) |value| value.gap_ns_max else 0,
+            };
+            assert(worker_succeeded.error_message_size <= worker_succeeded.error_message.len);
+            assert(worker_succeeded.teardown_error_message_size <=
+                worker_succeeded.teardown_error_message.len);
+            assert(worker_succeeded.pipewire_headers_version_size > 0);
+            assert(worker_succeeded.pipewire_headers_version_size <=
+                worker_succeeded.pipewire_headers_version.len);
+            assert(worker_succeeded.pipewire_library_version_size > 0);
+            assert(worker_succeeded.pipewire_library_version_size <=
+                worker_succeeded.pipewire_library_version.len);
+            assert(worker_succeeded.pipewire_server_version_size <=
+                worker_succeeded.pipewire_server_version.len);
+            assert(worker_succeeded.source_identity.node_name_size <=
+                worker_succeeded.source_identity.node_name.len);
+            assert(worker_succeeded.source_identity.node_description_size <=
+                worker_succeeded.source_identity.node_description.len);
+            assert(worker_succeeded.source_identity.device_serial_size <=
+                worker_succeeded.source_identity.device_serial.len);
+            assert(worker_succeeded.source_identity.device_description_size <=
+                worker_succeeded.source_identity.device_description.len);
+            if (worker_succeeded.samples_count > 0) {
+                assert(worker_succeeded.source_identity.is_resolved);
+            }
+            switch (worker_succeeded.outcome) {
+                .completed, .stopped, .cancelled => {
+                    assert(worker_succeeded.runtime_error.stage == .none);
+                    assert(worker_succeeded.runtime_error.domain == .none);
+                    assert(worker_succeeded.runtime_error.code == 0);
+                    assert(worker_succeeded.error_message_size == 0);
+                },
+                else => {
+                    assert(worker_succeeded.runtime_error.stage != .none);
+                    assert(worker_succeeded.runtime_error.domain != .none);
+                    assert(worker_succeeded.error_message_size > 0);
+                },
+            }
+            if (worker_succeeded.teardown_error.stage == .none) {
+                assert(worker_succeeded.teardown_error.domain == .none);
+                assert(worker_succeeded.teardown_error.code == 0);
+                assert(worker_succeeded.teardown_error_message_size == 0);
+            } else {
+                assert(worker_succeeded.teardown_error.stage == .stream_disconnect);
+                assert(worker_succeeded.teardown_error.domain == .pipewire_result);
+                assert(worker_succeeded.teardown_error.code < 0);
+                assert(worker_succeeded.teardown_error_message_size > 0);
+            }
+            assert(worker_succeeded.samples_count <=
+                launch_packet.recording_samples_target +
+                    audio_exchange.callback_samples_count_max);
+            assert(worker_succeeded.published_samples_count <=
+                worker_succeeded.samples_count);
+            report_packet.worker_succeeded = 1;
+            report_packet.shared_memory_is_locked =
+                @intFromBool(worker_succeeded.shared_memory_is_locked);
+            report_packet.shared_memory_lock_error_code =
+                worker_succeeded.shared_memory_lock_error_code;
+            report_packet.shared_memory_lock_limit_bytes =
+                worker_succeeded.shared_memory_lock_limit_bytes;
+            report_packet.outcome = @intFromEnum(worker_succeeded.outcome);
+            report_packet.error_message_size = worker_succeeded.error_message_size;
+            report_packet.runtime_error_stage = @intFromEnum(worker_succeeded.runtime_error.stage);
+            report_packet.runtime_error_domain = @intFromEnum(worker_succeeded.runtime_error.domain);
+            report_packet.runtime_error_code = worker_succeeded.runtime_error.code;
+            assert(report_packet.runtime_error_stage ==
+                @intFromEnum(worker_succeeded.runtime_error.stage));
+            assert(report_packet.runtime_error_domain ==
+                @intFromEnum(worker_succeeded.runtime_error.domain));
+            assert(report_packet.runtime_error_code == worker_succeeded.runtime_error.code);
+            @memcpy(
+                report_packet.error_message[0..worker_succeeded.error_message_size],
+                worker_succeeded.error_message[0..worker_succeeded.error_message_size],
+            );
+            report_packet.teardown_error_message_size =
+                worker_succeeded.teardown_error_message_size;
+            report_packet.teardown_error_stage =
+                @intFromEnum(worker_succeeded.teardown_error.stage);
+            report_packet.teardown_error_domain =
+                @intFromEnum(worker_succeeded.teardown_error.domain);
+            report_packet.teardown_error_code = worker_succeeded.teardown_error.code;
+            assert(report_packet.teardown_error_stage ==
+                @intFromEnum(worker_succeeded.teardown_error.stage));
+            assert(report_packet.teardown_error_domain ==
+                @intFromEnum(worker_succeeded.teardown_error.domain));
+            assert(report_packet.teardown_error_code == worker_succeeded.teardown_error.code);
+            @memcpy(
+                report_packet.teardown_error_message[0..worker_succeeded.teardown_error_message_size],
+                worker_succeeded.teardown_error_message[0..worker_succeeded.teardown_error_message_size],
+            );
+            report_packet.timeline_validation =
+                @intFromEnum(worker_succeeded.timeline_validation);
+            report_packet.pipewire_headers_version_size =
+                worker_succeeded.pipewire_headers_version_size;
+            @memcpy(
+                report_packet.pipewire_headers_version[0..worker_succeeded.pipewire_headers_version_size],
+                worker_succeeded.pipewire_headers_version[0..worker_succeeded.pipewire_headers_version_size],
+            );
+            report_packet.pipewire_library_version_size =
+                worker_succeeded.pipewire_library_version_size;
+            @memcpy(
+                report_packet.pipewire_library_version[0..worker_succeeded.pipewire_library_version_size],
+                worker_succeeded.pipewire_library_version[0..worker_succeeded.pipewire_library_version_size],
+            );
+            report_packet.pipewire_server_version_size =
+                worker_succeeded.pipewire_server_version_size;
+            @memcpy(
+                report_packet.pipewire_server_version[0..worker_succeeded.pipewire_server_version_size],
+                worker_succeeded.pipewire_server_version[0..worker_succeeded.pipewire_server_version_size],
+            );
+            report_packet.source_is_resolved =
+                @intFromBool(worker_succeeded.source_identity.is_resolved);
+            report_packet.source_node_id = worker_succeeded.source_identity.node_id;
+            report_packet.source_node_object_serial =
+                worker_succeeded.source_identity.node_object_serial;
+            report_packet.source_device_id = worker_succeeded.source_identity.device_id;
+            report_packet.source_device_object_serial =
+                worker_succeeded.source_identity.device_object_serial;
+            report_packet.source_node_name_size =
+                worker_succeeded.source_identity.node_name_size;
+            report_packet.source_node_description_size =
+                worker_succeeded.source_identity.node_description_size;
+            report_packet.source_device_serial_size =
+                worker_succeeded.source_identity.device_serial_size;
+            report_packet.source_device_description_size =
+                worker_succeeded.source_identity.device_description_size;
+            @memcpy(
+                report_packet.source_node_name[0..worker_succeeded.source_identity.node_name_size],
+                worker_succeeded.source_identity.node_name[0..worker_succeeded.source_identity.node_name_size],
+            );
+            @memcpy(
+                report_packet.source_node_description[0..worker_succeeded.source_identity.node_description_size],
+                worker_succeeded.source_identity.node_description[0..worker_succeeded.source_identity.node_description_size],
+            );
+            @memcpy(
+                report_packet.source_device_serial[0..worker_succeeded.source_identity.device_serial_size],
+                worker_succeeded.source_identity.device_serial[0..worker_succeeded.source_identity.device_serial_size],
+            );
+            @memcpy(
+                report_packet.source_device_description[0..worker_succeeded.source_identity.device_description_size],
+                worker_succeeded.source_identity.device_description[0..worker_succeeded.source_identity.device_description_size],
+            );
+            report_packet.negotiated_sample_rate_hz =
+                worker_succeeded.negotiated_sample_rate_hz;
+            report_packet.negotiated_channels_count =
+                worker_succeeded.negotiated_channels_count;
+            report_packet.samples_count = worker_succeeded.samples_count;
+            report_packet.published_samples_count =
+                worker_succeeded.published_samples_count;
+            report_packet.slot_publications_count =
+                worker_succeeded.slot_publications_count;
+            report_packet.main_loop_thread_id = worker_succeeded.main_loop_thread_id;
+            report_packet.callback_thread_id = worker_succeeded.callback_thread_id;
+            report_packet.callback_scheduler_policy =
+                worker_succeeded.callback_scheduler_policy;
+            report_packet.callback_scheduler_priority =
+                worker_succeeded.callback_scheduler_priority;
+            report_packet.callbacks_count = worker_succeeded.callbacks_count;
+            report_packet.missing_buffers_count = worker_succeeded.missing_buffers_count;
+            report_packet.clipped_samples_count = worker_succeeded.clipped_samples_count;
+            report_packet.header_metadata_buffers_count =
+                worker_succeeded.header_metadata_buffers_count;
+            report_packet.header_gap_buffers_count = worker_succeeded.header_gap_buffers_count;
+            report_packet.header_gap_samples_count = worker_succeeded.header_gap_samples_count;
+            report_packet.block_samples_count_min = worker_succeeded.block_samples_count_min;
+            report_packet.block_samples_count_max = worker_succeeded.block_samples_count_max;
+            report_packet.callback_duration_ns_max = worker_succeeded.callback_duration_ns_max;
+            report_packet.callback_gap_ns_max = worker_succeeded.callback_gap_ns_max;
+        },
+        .setup_failed => |setup_error| {
+            assert(setup_error.message_size > 0);
+            assert(setup_error.message_size <= setup_error.message.len);
+            assert(setup_error.pipewire_version_size > 0);
+            assert(setup_error.pipewire_version_size <= setup_error.pipewire_version.len);
 
-        report_packet.error_message_size = setup_error.message_size;
-        @memcpy(
-            report_packet.error_message[0..setup_error.message_size],
-            setup_error.message[0..setup_error.message_size],
-        );
-        report_packet.setup_error_stage = @intFromEnum(setup_error.stage);
-        report_packet.setup_error_domain = @intFromEnum(setup_error.domain);
-        report_packet.setup_error_code = setup_error.code;
-        report_packet.pipewire_version_size = setup_error.pipewire_version_size;
-        @memcpy(
-            report_packet.pipewire_version[0..setup_error.pipewire_version_size],
-            setup_error.pipewire_version[0..setup_error.pipewire_version_size],
-        );
+            report_packet.error_message_size = setup_error.message_size;
+            @memcpy(
+                report_packet.error_message[0..setup_error.message_size],
+                setup_error.message[0..setup_error.message_size],
+            );
+            report_packet.setup_error_stage = @intFromEnum(setup_error.stage);
+            report_packet.setup_error_domain = @intFromEnum(setup_error.domain);
+            report_packet.setup_error_code = setup_error.code;
+            report_packet.pipewire_version_size = setup_error.pipewire_version_size;
+            @memcpy(
+                report_packet.pipewire_version[0..setup_error.pipewire_version_size],
+                setup_error.pipewire_version[0..setup_error.pipewire_version_size],
+            );
+        },
     }
 
     // Validate the exact transport record on the sending side. The supervisor
@@ -1252,59 +2102,55 @@ fn mapAudioExchange(exchange_fd: std.posix.fd_t) !MappedAudioExchange {
 fn consumeNextPublishedSlot(
     consumer: *PublishedAudioConsumer,
     exchange: *AudioExchange,
-    expected_generation: u64,
+    expected_session_id: u64,
     slot_samples_boundary: u32,
     consumer_delay_ms: u32,
     now_ns: u64,
     ignore_consumer_delay: bool,
 ) bool {
-    assert(expected_generation > 0);
-    assert(exchange.generation == expected_generation);
+    assert(expected_session_id > 0);
+    assert(exchange.session_id == expected_session_id);
     assert(slot_samples_boundary >= audio_exchange.callback_samples_count_max);
     assert(slot_samples_boundary <= audio_exchange.slot_samples_capacity);
     assert(consumer_delay_ms <= 10_000);
     assert(consumer.samples_count <= consumer.samples.len);
-    if (consumer.pending_slot_index) |slot_index| {
-        assert(slot_index < audio_exchange.slots_count);
-    }
-
-    if (consumer.pending_slot_index == null) {
+    if (consumer.pending == null) {
         // Physical indices are unrelated to publication order after recycling.
         // Find the one release-published slot carrying the next ordinal; later
         // ordinals remain untouched until every earlier prefix has been copied.
         for (&exchange.slots, 0..) |*slot, slot_index| {
             const publication = audio_exchange.acquirePublishedSlot(slot) orelse continue;
-            assert(publication.generation == expected_generation);
             assert(publication.publication_ordinal >=
                 consumer.next_publication_ordinal);
             if (publication.publication_ordinal == consumer.next_publication_ordinal) {
-                consumer.pending_slot_index = @intCast(slot_index);
+                consumer.pending = .{
+                    .index = audio_exchange.SlotIndex.fromArrayIndex(slot_index),
+                    .ready_at_monotonic_ns = if (consumer_delay_ms == 0)
+                        0
+                    else
+                        now_ns + @as(u64, consumer_delay_ms) * std.time.ns_per_ms,
+                };
                 break;
             }
         }
-        if (consumer.pending_slot_index == null) return false;
+        if (consumer.pending == null) return false;
 
         // Keeping the slot published during this delay models a consumer that
         // owns shared audio while performing expensive work. Audio can continue
         // through other slots, then reports pipeline pressure if all three stay
         // occupied. A zero delay exercises the normal immediate handoff path.
-        if (!ignore_consumer_delay and consumer_delay_ms > 0) {
-            consumer.pending_slot_ready_at_ns = now_ns +
-                @as(u64, consumer_delay_ms) * std.time.ns_per_ms;
-            return false;
-        }
+        if (!ignore_consumer_delay and consumer_delay_ms > 0) return false;
     }
 
-    if (!ignore_consumer_delay and now_ns < consumer.pending_slot_ready_at_ns) {
+    const pending = consumer.pending.?;
+    if (!ignore_consumer_delay and now_ns < pending.ready_at_monotonic_ns) {
         return false;
     }
 
-    assert(consumer.pending_slot_index != null);
-    const slot = &exchange.slots[consumer.pending_slot_index.?];
+    const slot = &exchange.slots[pending.index.arrayIndex()];
     const publication_optional = audio_exchange.acquirePublishedSlot(slot);
     assert(publication_optional != null);
     const publication = publication_optional.?;
-    assert(publication.generation == expected_generation);
     assert(publication.publication_ordinal == consumer.next_publication_ordinal);
     assert(publication.samples_count <= slot_samples_boundary);
     assert(publication.samples_count <=
@@ -1318,13 +2164,12 @@ fn consumeNextPublishedSlot(
     );
     consumer.samples_count += publication.samples_count;
     consumer.next_publication_ordinal += 1;
-    consumer.pending_slot_index = null;
-    consumer.pending_slot_ready_at_ns = 0;
+    consumer.pending = null;
     audio_exchange.releaseConsumedSlot(slot);
 
     assert(consumer.samples_count == samples_count_before + publication.samples_count);
     assert(consumer.next_publication_ordinal == publication_ordinal_before + 1);
-    assert(consumer.pending_slot_index == null);
+    assert(consumer.pending == null);
     return true;
 }
 
@@ -1358,7 +2203,7 @@ fn waitForWorkerExit(
     const pidfd: std.posix.fd_t = @intCast(pidfd_result);
     defer closeFileDescriptor(pidfd);
 
-    // Receiving a Report or socket EOF ends protocol supervision, not process
+    // Receiving a report or socket EOF ends protocol supervision, not process
     // supervision. Native teardown or an internal defect can still stop the
     // worker before it exits. A pidfd becomes readable only when that exact
     // process exits, so this deadline cannot be confused by PID reuse and keeps
@@ -1382,7 +2227,7 @@ fn waitForWorkerExit(
 fn reportUnexpectedWorkerExit(worker: *std.process.Child, io: Io) !noreturn {
     assert(worker.id != null);
 
-    // SOCK_SEQPACKET EOF says only that no Report can arrive; it does not prove
+    // SOCK_SEQPACKET EOF says only that no report can arrive; it does not prove
     // the process exited. Wait through the bounded pidfd path before classifying
     // an assertion, signal, or exit code so a worker that closes the socket and
     // hangs cannot wedge its supervisor.
@@ -1407,6 +2252,29 @@ fn reportUnexpectedWorkerExit(worker: *std.process.Child, io: Io) !noreturn {
         ),
     }
     return error.AudioWorkerExitedWithoutReport;
+}
+
+fn readEventCounter(event_fd: std.posix.fd_t) !u64 {
+    assert(event_fd >= 0);
+
+    var counter: u64 = 0;
+    while (true) {
+        const read_result = std.os.linux.read(
+            event_fd,
+            std.mem.asBytes(&counter).ptr,
+            @sizeOf(u64),
+        );
+        switch (std.os.linux.errno(read_result)) {
+            .SUCCESS => {
+                assert(read_result == @sizeOf(u64));
+                assert(counter > 0);
+                return counter;
+            },
+            .INTR => continue,
+            .AGAIN => return error.AudioPublicationEventNotReady,
+            else => return error.AudioPublicationEventReadFailed,
+        }
+    }
 }
 
 fn sendPacket(socket: std.posix.fd_t, packet: []const u8) !void {
@@ -1461,6 +2329,28 @@ fn receivePacket(socket: std.posix.fd_t, packet: []u8) !void {
             },
             .INTR => continue,
             else => return error.WorkerPacketReceiveFailed,
+        }
+    }
+}
+
+fn unblockServiceSignals() void {
+    var signal_mask = std.posix.sigemptyset();
+    std.posix.sigaddset(&signal_mask, .TERM);
+    std.posix.sigaddset(&signal_mask, .INT);
+    std.posix.sigprocmask(std.posix.SIG.UNBLOCK, &signal_mask, null);
+}
+
+fn sleepMilliseconds(milliseconds: u32) void {
+    var requested: std.os.linux.timespec = .{
+        .sec = @intCast(milliseconds / 1000),
+        .nsec = @intCast((milliseconds % 1000) * std.time.ns_per_ms),
+    };
+    var remaining: std.os.linux.timespec = undefined;
+    while (true) {
+        switch (std.os.linux.errno(std.os.linux.nanosleep(&requested, &remaining))) {
+            .SUCCESS => return,
+            .INTR => requested = remaining,
+            else => unreachable,
         }
     }
 }

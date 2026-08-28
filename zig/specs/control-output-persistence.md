@@ -98,7 +98,7 @@ Notifications should identify the current operation and actionable failures
 without accumulating stale “transcribing” notifications. A failed paste should
 say that clipboard and persisted text remain available when that is true.
 
-Operational logs use real journal priorities and include generation, phase,
+Operational logs use real journal priorities and include session ID, phase,
 worker role, deadline, and concise failure reason. They must not include PCM or
 transcript text.
 

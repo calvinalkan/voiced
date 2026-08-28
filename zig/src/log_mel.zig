@@ -11,8 +11,10 @@ const Simd = @Vector(simd_lanes_count, f32);
 const sample_rate_hz: u32 = 16_000;
 const fft_samples_count: u32 = 400;
 const fft_bins_count: u32 = fft_samples_count / 2 + 1;
+const dft_coefficients_count = fft_bins_count * fft_samples_count;
 const hop_samples_count: u32 = 160;
 const mel_bins_count: u32 = 80;
+const mel_filters_count = mel_bins_count * fft_bins_count;
 const simd_lanes_count: u32 = 8;
 
 comptime {
@@ -35,30 +37,28 @@ pub const Extractor = struct {
     /// `init` allocates immutable coefficient tables for repeated extraction.
     /// The caller must keep `extractor` at a stable address until `deinit`.
     pub fn init(extractor: *Extractor, allocator: Allocator) !void {
-        const dft_coefficients_count = fft_bins_count * fft_samples_count;
-        const mel_filters_count = mel_bins_count * fft_bins_count;
-
         const hann_window = try allocator.alloc(f32, fft_samples_count);
         errdefer allocator.free(hann_window);
+
         const dft_cosines = try allocator.alloc(f32, dft_coefficients_count);
         errdefer allocator.free(dft_cosines);
+
         const dft_sines = try allocator.alloc(f32, dft_coefficients_count);
         errdefer allocator.free(dft_sines);
+
         const mel_filters = try allocator.alloc(f32, mel_filters_count);
         errdefer allocator.free(mel_filters);
 
         // NumPy's periodic Hann window is `hanning(401)[:-1]` for a 400-point DFT.
         for (hann_window, 0..) |*coefficient, sample_index| {
-            const angle = 2.0 * std.math.pi *
-                @as(f64, @floatFromInt(sample_index)) / fft_samples_count;
+            const angle = 2.0 * std.math.pi * @as(f64, @floatFromInt(sample_index)) / fft_samples_count;
             coefficient.* = @floatCast(0.5 - 0.5 * @cos(angle));
         }
 
         for (0..fft_bins_count) |fft_bin_index| {
             for (0..fft_samples_count) |sample_index| {
                 const coefficient_index = fft_bin_index * fft_samples_count + sample_index;
-                const angle = 2.0 * std.math.pi *
-                    @as(f64, @floatFromInt(fft_bin_index * sample_index)) / fft_samples_count;
+                const angle = 2.0 * std.math.pi * @as(f64, @floatFromInt(fft_bin_index * sample_index)) / fft_samples_count;
 
                 dft_cosines[coefficient_index] = @floatCast(@cos(angle));
                 dft_sines[coefficient_index] = @floatCast(@sin(angle));
@@ -109,21 +109,25 @@ pub const Extractor = struct {
 
         const center_padding_samples_count = fft_samples_count / 2;
         const tail_padding_samples_count = hop_samples_count;
-        const centered_samples_count = samples.len +
-            2 * center_padding_samples_count + tail_padding_samples_count;
+        const centered_samples_count = samples.len + 2 * center_padding_samples_count + tail_padding_samples_count;
+
         const centered_samples = try extractor.allocator.alloc(f32, centered_samples_count);
         defer extractor.allocator.free(centered_samples);
 
         for (0..center_padding_samples_count) |padding_index| {
             centered_samples[padding_index] = samples[center_padding_samples_count - padding_index];
         }
+
         @memcpy(
             centered_samples[center_padding_samples_count..][0..samples.len],
             samples,
         );
+
         const tail_padding_offset = center_padding_samples_count + samples.len;
         const tail_padding = centered_samples[tail_padding_offset..][0..tail_padding_samples_count];
+
         @memset(tail_padding, 0.0);
+
         for (0..center_padding_samples_count) |padding_index| {
             const source_index = samples.len + tail_padding_samples_count - 2 - padding_index;
             const target_index = center_padding_samples_count + samples.len +

@@ -314,28 +314,56 @@ graph interval.
 
 ---
 
-## 15. Real supervisor and role launcher — **next major milestone**
+## 15. Real supervisor and role launcher — **in progress**
 
-The audio spike parent is a test harness, not the final supervisor. Its reusable
-process boundary is now isolated in `audio_process.zig`: the future supervisor
-needs only `start`, `requestStop`, `requestCancel`, `receiveReport`, and
-`killAndReap`. `pipewire.zig` remains private to the audio worker, while
-`audio_exchange.zig` owns shared slot transitions.
+The one-binary process and event-loop boundary is implemented under
+`voiced supervisor-spike`. It supports deterministic roles for repeatable fault
+scenarios and the real PipeWire role with deterministic transcription. It now
+proves:
 
-Still needed:
+- one executable dispatching supervisor, audio, and transcription roles;
+- one epoll loop over role seqpackets, pidfds, timerfd, signalfd, and audio
+  publication eventfd;
+- role-specific launch and runtime protocols;
+- explicit memfd/eventfd transfer with `SCM_RIGHTS` and close-on-exec receipt;
+- deferred worker replacement without worker-incarnation state;
+- current absolute deadline evaluation without deadline-incarnation state;
+- role operations that carry their own deadline, with separate capture,
+  cancellation, report-exit, and forced-termination meanings;
+- count-based PCM and UTF-8 publication with `_atomic` field naming;
+- no shared filling, transcribing, or produced slot states;
+- one retained in-flight retry count rather than a per-chunk retry table;
+- transcript recovery when a worker dies after publishing text but before its
+  notification packet;
+- bounded retry, pipeline-full drain, cancellation, signal shutdown, and
+  parent-death containment;
+- real PipeWire descriptor handoff and PCM publication through the same event
+  loop, including setup, callback-progress, teardown, and session deadlines;
+- real completion and valid-prefix failure drain, including a reportless audio
+  worker death after earlier slot publication;
+- setup-failure discard, supervisor cancellation, worker-crash containment,
+  default and explicit target selection, and realtime or main-loop capture;
+- pidfd-authoritative signaling and reaping without a second stored PID;
+- one tagged source choice instead of mutually exclusive target optionals;
+- four-byte transcription commands, transcription notifications, and fake-audio
+  notifications whose payload state remains authoritative in shared memory.
 
-- one executable with supervisor/audio/Whisper roles;
-- one supervisor event loop;
-- lifecycle phases and generation ownership;
-- separate role-specific protocols;
-- timerfd/pidfd/signalfd/epoll integration;
-- stale-generation rejection;
-- worker startup and replacement;
-- deterministic fake audio and Whisper workers;
-- transcript exchange;
-- bounded recovery state machine.
+The reduced-state process suite completed fifty runs of each normal, burst,
+slow-consumer, crash-before-result, crash-after-result, repeated-crash, and hang
+scenario without failure. Burst publication combined three eventfd increments
+into one wakeup while preserving all three slot ordinals. The real PipeWire
+worker also retained normal, stop, cancel, and pipeline-full behavior after the
+same count-based audio exchange and publication eventfd were installed.
 
-This should be implemented with fake workers before attaching the resident model.
+Still needed before this milestone is complete:
+
+- replace deterministic transcription with the resident CTranslate2 role;
+- retain the transcription process across more than one session;
+- add the public control socket and long-running idle/session loop;
+- implement normal-stop drain through final persistence/output rather than
+  printing the fake transcript;
+- finish recovery policy above the supervisor's now-integrated PipeWire setup,
+  progress, teardown, session, report, and process-exit observations.
 
 ---
 
@@ -431,8 +459,10 @@ Still needed:
 
 # Recommended order from here
 
-1. Build the supervisor with deterministic fake workers.
-2. Add the resident Whisper worker and eager chunking.
+1. Attach the resident Whisper worker and measure eager chunking against real
+   PipeWire publications.
+2. Retain that model worker across sessions and add the long-running control
+   loop.
 3. Add persistence, clipboard, CLI, and systemd operation.
 4. Perform final integration hardening.
 

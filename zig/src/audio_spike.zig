@@ -10,7 +10,7 @@ const stderr = std.debug.print;
 
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
-const AudioProcessReport = audio_process.Report;
+const AudioProcessReport = audio_process.CaptureReport;
 
 const target_name_capacity = 256;
 const wav_header_size: u32 = 44;
@@ -21,8 +21,7 @@ const RequestedControl = struct {
 };
 
 const Arguments = struct {
-    target: ?[:0]const u8,
-    configured_device_serial: ?[:0]const u8,
+    source: audio_process.Source,
     output_path: []const u8,
     recording_seconds: u8,
     slot_seconds: u8,
@@ -59,9 +58,10 @@ pub fn main(init: std.process.Init) !void {
         );
         return err;
     };
-    const requested_source = arguments.target orelse
-        arguments.configured_device_serial orelse
-        "default source";
+    const requested_source: []const u8 = switch (arguments.source) {
+        .default => "default source",
+        .node_name, .device_serial => |source| source,
+    };
 
     // Remove stale experiment output before microphone setup. A setup timeout,
     // worker crash, or cancellation must never leave an older WAV looking like
@@ -72,9 +72,8 @@ pub fn main(init: std.process.Init) !void {
     };
 
     const process = try audio_process.start(init, .{
-        .generation = 1,
-        .target = arguments.target,
-        .configured_device_serial = arguments.configured_device_serial,
+        .session_id = 1,
+        .source = arguments.source,
         .recording_samples_target = @as(u32, arguments.recording_seconds) * audio_process.sample_rate_hz,
         .slot_samples_boundary = @as(u32, arguments.slot_seconds) * audio_process.sample_rate_hz,
         .consumer_delay_ms = arguments.consumer_delay_ms,
@@ -103,49 +102,46 @@ pub fn main(init: std.process.Init) !void {
             break completed;
         }
     };
-    const process_report = result.report;
+    const capture = switch (result) {
+        .setup_failed => |failure| {
+            stderr(
+                "Audio worker setup error\n" ++
+                    "Stage: {s}\n" ++
+                    "Error: domain={s}, code={d}\n" ++
+                    "PipeWire library: {s}\n" ++
+                    "Target: {s}\n" ++
+                    "Processing: {s}\n" ++
+                    "Detail: {s}\n",
+                .{
+                    @tagName(failure.stage),
+                    @tagName(failure.domain),
+                    failure.code,
+                    failure.pipewire_version[0..failure.pipewire_version_size],
+                    requested_source,
+                    if (arguments.process_realtime) "realtime" else "main loop",
+                    failure.message[0..failure.message_size],
+                },
+            );
+            return error.AudioWorkerFailed;
+        },
+        .captured => |completed| completed,
+    };
+    const process_report = &capture.report;
 
-    if (process_report.worker_succeeded == 0) {
-        const error_stage: audio_process.SetupErrorStage =
-            @enumFromInt(process_report.setup_error_stage);
-        const error_domain: audio_process.ErrorDomain =
-            @enumFromInt(process_report.setup_error_domain);
-        stderr(
-            "Audio worker setup error\n" ++
-                "Stage: {s}\n" ++
-                "Error: domain={s}, code={d}\n" ++
-                "PipeWire library: {s}\n" ++
-                "Target: {s}\n" ++
-                "Processing: {s}\n" ++
-                "Detail: {s}\n",
-            .{
-                @tagName(error_stage),
-                @tagName(error_domain),
-                process_report.setup_error_code,
-                process_report.pipewire_version[0..process_report.pipewire_version_size],
-                requested_source,
-                if (arguments.process_realtime) "realtime" else "main loop",
-                process_report.error_message[0..process_report.error_message_size],
-            },
-        );
-        return error.AudioWorkerFailed;
-    }
-
-    const outcome: audio_process.Outcome = @enumFromInt(process_report.outcome);
-    if (outcome != .cancelled) {
+    if (process_report.end != .cancelled) {
         try writePcm16Wav(
             init.io,
             init.gpa,
             arguments.output_path,
-            result.samples,
+            capture.samples,
         );
     }
 
     const consumer: ConsumptionSummary = .{
-        .samples_count = result.samples.len,
+        .samples_count = capture.samples.len,
         .next_publication_ordinal = process_report.slot_publications_count,
         .pending_slot_index = null,
-        .slots_consumed_before_final_report = result.slots_consumed_before_final_report,
+        .slots_consumed_before_final_report = capture.slots_consumed_before_final_report,
     };
     report(&arguments, process_report, &consumer);
 }
@@ -164,8 +160,7 @@ fn parseArguments(
     first_argument: ?[:0]const u8,
     process_arguments: *std.process.Args.Iterator,
 ) !Arguments {
-    var target: ?[:0]const u8 = null;
-    var configured_device_serial: ?[:0]const u8 = null;
+    var source: audio_process.Source = .default;
     var output_path: ?[:0]const u8 = null;
     var recording_seconds: ?u8 = null;
     var slot_seconds: ?u8 = null;
@@ -177,17 +172,13 @@ fn parseArguments(
     var option = first_argument;
     while (option) |option_text| : (option = process_arguments.next()) {
         if (std.mem.eql(u8, option_text, "--target")) {
-            if (target != null or configured_device_serial != null) {
-                return error.InvalidArguments;
-            }
-            target = process_arguments.next() orelse return error.InvalidArguments;
+            if (source != .default) return error.InvalidArguments;
+            source = .{ .node_name = process_arguments.next() orelse
+                return error.InvalidArguments };
         } else if (std.mem.eql(u8, option_text, "--device-serial")) {
-            if (configured_device_serial != null or target != null) {
-                return error.InvalidArguments;
-            }
-            configured_device_serial = process_arguments.next() orelse {
-                return error.InvalidArguments;
-            };
+            if (source != .default) return error.InvalidArguments;
+            source = .{ .device_serial = process_arguments.next() orelse
+                return error.InvalidArguments };
         } else if (std.mem.eql(u8, option_text, "--output")) {
             if (output_path != null) return error.InvalidArguments;
             output_path = process_arguments.next() orelse return error.InvalidArguments;
@@ -253,20 +244,17 @@ fn parseArguments(
 
     const output_path_required = output_path orelse return error.InvalidArguments;
     if (output_path_required.len == 0) return error.InvalidArguments;
-    if (target) |target_name| {
-        if (target_name.len == 0 or target_name.len >= target_name_capacity) {
-            return error.InvalidArguments;
-        }
-    }
-    if (configured_device_serial) |device_serial| {
-        if (device_serial.len == 0 or device_serial.len >= target_name_capacity) {
-            return error.InvalidArguments;
-        }
+    switch (source) {
+        .default => {},
+        .node_name, .device_serial => |source_text| {
+            if (source_text.len == 0 or source_text.len >= target_name_capacity) {
+                return error.InvalidArguments;
+            }
+        },
     }
 
     const arguments: Arguments = .{
-        .target = target,
-        .configured_device_serial = configured_device_serial,
+        .source = source,
         .output_path = output_path_required,
         .recording_seconds = recording_seconds orelse 5,
         .slot_seconds = slot_seconds orelse audio_process.slot_duration_seconds_max,
@@ -283,14 +271,12 @@ fn parseArguments(
     if (arguments.requested_control) |control| {
         assert(control.after_ms <= 90_000);
     }
-    assert(arguments.target == null or arguments.configured_device_serial == null);
-    if (arguments.target) |target_name| {
-        assert(target_name.len > 0);
-        assert(target_name.len < target_name_capacity);
-    }
-    if (arguments.configured_device_serial) |device_serial| {
-        assert(device_serial.len > 0);
-        assert(device_serial.len < target_name_capacity);
+    switch (arguments.source) {
+        .default => {},
+        .node_name, .device_serial => |source_text| {
+            assert(source_text.len > 0);
+            assert(source_text.len < target_name_capacity);
+        },
     }
     return arguments;
 }
@@ -379,9 +365,107 @@ fn linuxErrorNameFromCode(error_code: i32) []const u8 {
 
 fn report(
     arguments: *const Arguments,
-    process_report: *const AudioProcessReport,
+    capture_report: *const AudioProcessReport,
     consumer: *const ConsumptionSummary,
 ) void {
+    const outcome: audio_process.Outcome = switch (capture_report.end) {
+        .completed => .completed,
+        .stopped => .stopped,
+        .cancelled => .cancelled,
+        .failed => |failure| @enumFromInt(@intFromEnum(failure.outcome)),
+    };
+    const failure: ?audio_process.Failure = switch (capture_report.end) {
+        .completed, .stopped, .cancelled => null,
+        .failed => |capture_failure| capture_failure.failure,
+    };
+    const source = capture_report.source;
+    const callback = capture_report.callback;
+    const process_report = &.{
+        .worker_succeeded = @as(u8, 1),
+        .shared_memory_is_locked = @as(u8, @intFromBool(capture_report.memory_lock == .locked)),
+        .shared_memory_lock_error_code = switch (capture_report.memory_lock) {
+            .locked => 0,
+            .unavailable => |unavailable| unavailable.error_code,
+        },
+        .shared_memory_lock_limit_bytes = switch (capture_report.memory_lock) {
+            .locked => |limit| limit,
+            .unavailable => |unavailable| unavailable.limit_bytes,
+        },
+        .outcome = @intFromEnum(outcome),
+        .error_message = if (failure) |value| value.message else @as([4096]u8, @splat(0)),
+        .error_message_size = if (failure) |value| value.message_size else 0,
+        .runtime_error_stage = if (failure) |value| @intFromEnum(value.stage) else 0,
+        .runtime_error_domain = if (failure) |value| @intFromEnum(value.domain) else 0,
+        .runtime_error_code = if (failure) |value| value.code else 0,
+        .teardown_error_message = if (capture_report.teardown_failure) |value|
+            value.message
+        else
+            @as([4096]u8, @splat(0)),
+        .teardown_error_message_size = if (capture_report.teardown_failure) |value|
+            value.message_size
+        else
+            0,
+        .teardown_error_stage = if (capture_report.teardown_failure) |value|
+            @intFromEnum(value.stage)
+        else
+            0,
+        .teardown_error_domain = if (capture_report.teardown_failure) |value|
+            @intFromEnum(value.domain)
+        else
+            0,
+        .teardown_error_code = if (capture_report.teardown_failure) |value| value.code else 0,
+        .timeline_validation = @intFromEnum(capture_report.timeline_validation),
+        .pipewire_headers_version = capture_report.pipewire_headers_version,
+        .pipewire_headers_version_size = capture_report.pipewire_headers_version_size,
+        .pipewire_library_version = capture_report.pipewire_library_version,
+        .pipewire_library_version_size = capture_report.pipewire_library_version_size,
+        .pipewire_server_version = capture_report.pipewire_server_version,
+        .pipewire_server_version_size = capture_report.pipewire_server_version_size,
+        .source_is_resolved = @as(u8, @intFromBool(source != null)),
+        .source_node_id = if (source) |value| value.node_id else std.math.maxInt(u32),
+        .source_node_object_serial = if (source) |value| value.node_object_serial else 0,
+        .source_device_id = if (source) |value| value.device_id else std.math.maxInt(u32),
+        .source_device_object_serial = if (source) |value| value.device_object_serial else 0,
+        .source_node_name = if (source) |value| value.node_name else @as([256]u8, @splat(0)),
+        .source_node_name_size = if (source) |value| value.node_name_size else 0,
+        .source_node_description = if (source) |value| value.node_description else @as([256]u8, @splat(0)),
+        .source_node_description_size = if (source) |value| value.node_description_size else 0,
+        .source_device_serial = if (source) |value| value.device_serial else @as([256]u8, @splat(0)),
+        .source_device_serial_size = if (source) |value| value.device_serial_size else 0,
+        .source_device_description = if (source) |value| value.device_description else @as([256]u8, @splat(0)),
+        .source_device_description_size = if (source) |value| value.device_description_size else 0,
+        .negotiated_sample_rate_hz = if (capture_report.negotiated_format) |format|
+            format.sample_rate_hz
+        else
+            0,
+        .negotiated_channels_count = if (capture_report.negotiated_format) |format|
+            format.channels_count
+        else
+            0,
+        .samples_count = capture_report.samples_count,
+        .published_samples_count = capture_report.published_samples_count,
+        .slot_publications_count = capture_report.slot_publications_count,
+        .main_loop_thread_id = capture_report.main_loop_thread_id,
+        .callback_thread_id = if (callback) |value| value.thread_id else 0,
+        .callback_scheduler_policy = if (callback) |value| value.scheduler_policy orelse -1 else -1,
+        .callback_scheduler_priority = if (callback) |value| value.scheduler_priority orelse -1 else -1,
+        .callbacks_count = if (callback) |value| value.callbacks_count else 0,
+        .missing_buffers_count = if (callback) |value| value.missing_buffers_count else 0,
+        .clipped_samples_count = if (callback) |value| value.clipped_samples_count else 0,
+        .header_metadata_buffers_count = if (callback) |value| value.header_metadata_buffers_count else 0,
+        .header_gap_buffers_count = if (callback) |value| value.header_gap_buffers_count else 0,
+        .header_gap_samples_count = if (callback) |value| value.header_gap_samples_count else 0,
+        .block_samples_count_min = if (callback) |value|
+            if (value.samples_range) |range| range.minimum else 0
+        else
+            0,
+        .block_samples_count_max = if (callback) |value|
+            if (value.samples_range) |range| range.maximum else 0
+        else
+            0,
+        .callback_duration_ns_max = if (callback) |value| value.duration_ns_max else 0,
+        .callback_gap_ns_max = if (callback) |value| value.gap_ns_max else 0,
+    };
     assert(arguments.output_path.len > 0);
     assert(arguments.consumer_delay_ms <= 10_000);
     assert(process_report.worker_succeeded == 1);
@@ -410,12 +494,7 @@ fn report(
     assert(consumer.next_publication_ordinal == process_report.slot_publications_count);
     assert(consumer.pending_slot_index == null);
 
-    var outcome_is_valid = false;
-    inline for (@typeInfo(audio_process.Outcome).@"enum".fields) |outcome_field| {
-        if (process_report.outcome == outcome_field.value) outcome_is_valid = true;
-    }
-    assert(outcome_is_valid);
-    const outcome: audio_process.Outcome = @enumFromInt(process_report.outcome);
+    assert(process_report.outcome == @intFromEnum(outcome));
     const timeline_validation: audio_process.TimelineValidation =
         @enumFromInt(process_report.timeline_validation);
     const timeline_validation_name = switch (timeline_validation) {
@@ -426,15 +505,15 @@ fn report(
         "unknown"
     else
         process_report.pipewire_server_version[0..process_report.pipewire_server_version_size];
-    const selection_mode = if (arguments.target != null)
-        "explicit node name"
-    else if (arguments.configured_device_serial != null)
-        "configured device.serial"
-    else
-        "current default";
-    const target = arguments.target orelse
-        arguments.configured_device_serial orelse
-        "default source";
+    const selection_mode = switch (arguments.source) {
+        .default => "current default",
+        .node_name => "explicit node name",
+        .device_serial => "configured device.serial",
+    };
+    const target: []const u8 = switch (arguments.source) {
+        .default => "default source",
+        .node_name, .device_serial => |source_text| source_text,
+    };
     const actual_source = if (process_report.source_is_resolved == 0)
         "unresolved"
     else if (process_report.source_node_description_size > 0)

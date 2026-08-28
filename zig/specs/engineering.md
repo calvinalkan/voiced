@@ -35,13 +35,15 @@ The implementation should assert at least:
 
 - compile-time capacity arithmetic, field widths, offsets, sizes, and atomic
   alignment;
-- one authoritative session generation across active buffers and messages;
-- valid source and destination states for every transition;
-- conservation of every audio slot across free, filling, ready, and busy sets;
+- one authoritative session ID at the supervisor and exchange boundaries;
+- zero/positive publication-count transitions for every shared payload;
+- conservation of every audio slot across audio-private, published, and
+  supervisor in-flight ownership;
 - sample, text, queue, and protocol counts within their capacities;
 - payload visibility before release publication;
 - transcript write offsets matching the produced prefix;
-- deadlines belonging to the phase and worker generation they may terminate;
+- absolute deadlines agreeing with the current worker operation they may
+  terminate;
 - no active worker access before a canceled session reuses its buffers; and
 - no output before normal session commit.
 
@@ -101,7 +103,8 @@ zig/src/
 ├── pipewire.zig
 ├── audio_process.zig
 ├── audio_exchange.zig
-├── transcriber.zig
+├── transcription_process.zig
+├── descriptor_handoff.zig
 ├── output.zig
 └── config.zig
 ```
@@ -114,7 +117,9 @@ part of the intended design.
 
 Shared structs use an externally defined layout and fixed-width fields. Their
 critical offsets, sizes, and alignments have compile-time assertions. They do
-not contain process-local pointers.
+not contain process-local pointers. Every struct field accessed through an
+atomic operation has an `_atomic` suffix; ordinary-looking field names never
+hide atomic access.
 
 Socket messages use explicit bounded encoding. Logical Zig unions should not be
 sent by treating their compiler-selected memory layout as a wire format.
@@ -128,7 +133,10 @@ reader acquires publication
 read only the published prefix
 ```
 
-Generation checks protect every delayed event and shared region reuse.
+One session ID identifies the active exchange. A worker must acknowledge that it
+can no longer publish, or be reaped, before the supervisor resets shared storage.
+Worker replacement is deferred until the complete current epoll batch has been
+consumed, which removes the need for worker-incarnation event tags.
 
 ## Dependencies
 
@@ -167,7 +175,7 @@ shared mappings, worker exits, and observable output. Tests should cover:
 - microphone removal and callback stall;
 - audio setup and teardown hangs;
 - Whisper failure, hang, cancellation, and restart;
-- stale generation messages;
+- readiness batches containing a worker's final packet and exit together;
 - slot and transcript capacity boundaries;
 - persistence, clipboard, and paste failures;
 - shutdown with active work; and

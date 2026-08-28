@@ -1,10 +1,11 @@
-# Voiced Zig spikes
+# Voiced Zig implementation
 
-Two standalone binaries isolate the native boundaries selected for the Zig
-implementation:
+Three executable entry points establish the native boundaries and supervisor:
 
-- `audio-spike` launches an isolated audio worker that records PipeWire blocks
-  into a supervisor-created shared exchange.
+- `voiced supervisor-spike` runs the one-binary supervisor with deterministic
+  roles, or with real PipeWire audio and deterministic transcription.
+- `audio-spike` independently exercises the same PipeWire worker and writes
+  retained PCM to WAV.
 - `model-spike` computes Whisper log-Mel features and measures CTranslate2
   transcription.
 
@@ -13,25 +14,30 @@ through Zig's bundled C++ toolchain. It statically links verified Intel oneMKL
 and OpenMP archives. The audio spike dynamically links the desktop's PipeWire
 client library.
 
-The audio implementation has four explicit module boundaries:
+The supervisor implementation remains shallow:
 
 ```text
-audio_spike.zig
-    └── audio_process.zig
-          ├── pipewire.zig
-          └── audio_exchange.zig
+main.zig
+└── supervisor.zig
+    ├── audio_process.zig
+    │   ├── pipewire.zig
+    │   └── audio_exchange.zig
+    ├── transcription_process.zig
+    └── descriptor_handoff.zig
 ```
 
-`pipewire.zig` owns stream setup, source observation, realtime callbacks,
-validation, and teardown. `audio_exchange.zig` owns only the fixed shared-memory
-layout and slot transitions. `audio_process.zig` owns the memfd, worker launch,
-fixed packets, process deadlines, stop/cancel transmission, pidfd waiting, slot
-consumption, and forced termination. Its supervisor-facing operations are
-`start`, `requestStop`, `requestCancel`, `receiveReport`, and `killAndReap`.
-`start` resolves and launches the installed sibling `audio-process` worker, so
-the spike contains no worker-role dispatch or process arguments.
-`audio_spike.zig` imports only `audio_process.zig` and owns only argument parsing,
-scheduled experiment control, WAV output, and human-readable measurements.
+`main.zig` chooses the user-facing supervisor spike or one private worker role.
+`supervisor.zig` owns epoll ordering, session outcome, absolute deadlines,
+retries, slot release, and final transcript acceptance. Deterministic roles use
+exactly the seqpacket, pidfd, memfd, eventfd, descriptor-handoff, and
+parent-death contracts used by the attached PipeWire role and intended for the
+resident CTranslate2 role.
+
+`audio-spike` remains a focused adapter over five operations from
+`audio_process.zig`: `start`, `requestStop`, `requestCancel`, `receiveReport`,
+and `killAndReap`. `pipewire.zig` owns the real stream and callbacks;
+`audio_exchange.zig` owns count-based PCM publication. The transcription result
+mailbox belongs to `transcription_process.zig`.
 
 Install PipeWire's development package once so pkg-config can supply its public
 headers and linker name:
@@ -54,12 +60,36 @@ zig build setup-native
 zig build setup-models
 ```
 
-Build both spikes and the private `audio-process` worker without running any of
-them:
+Build the supervisor, both boundary spikes, and the private real-audio worker
+without running any of them:
 
 ```bash
 zig build -Doptimize=ReleaseSafe
 ```
+
+Exercise the complete process boundary without opening a microphone or loading a
+model:
+
+```bash
+./zig-out/bin/voiced supervisor-spike normal
+./zig-out/bin/voiced supervisor-spike burst_publications
+./zig-out/bin/voiced supervisor-spike transcription_crash_after_result
+```
+
+Replace only deterministic audio with the real default PipeWire source:
+
+```bash
+./zig-out/bin/voiced supervisor-spike pipewire \
+  --seconds 5 \
+  --slot-seconds 1
+```
+
+This command drives real PCM publications through the supervisor while the
+transcription role still emits deterministic `chunk-N` text. It accepts the
+same `--device-serial`, low-level `--target`, and `--main-loop` source controls
+as the audio experiment. Capture setup, sample-progress, teardown, session, and
+worker-exit deadlines now belong to the epoll supervisor rather than the WAV
+adapter.
 
 ReleaseSafe is the production policy. It retains `std.debug.assert`, overflow,
 bounds, enum, and other Zig runtime-safety checks around trusted lifecycle and
