@@ -3,6 +3,7 @@
 //! CTranslate2 C ABI.
 
 const std = @import("std");
+const gpt2_text = @import("gpt2_text.zig");
 const log_mel = @import("log_mel.zig");
 const assert = std.debug.assert;
 const stderr = std.debug.print;
@@ -21,6 +22,8 @@ const log_mel_values_count: u32 = @intCast(bridge.log_mel_values_count);
 const transcript_size_max: u32 = 64 * 1024;
 const threads_count_default: u8 = 4;
 const threads_count_max: u8 = 32;
+const decoding_beam_size_default: u8 = 1;
+const decoding_beam_size_max: u8 = 16;
 const measurement_runs_count_default: u8 = 3;
 const measurement_runs_count_max: u8 = 9;
 
@@ -32,7 +35,15 @@ const Arguments = struct {
     model_path: [:0]const u8,
     audio_path: [:0]const u8,
     threads_count: u8,
+    decoding_beam_size: u8,
     measurement_runs_count: u8,
+    input_gain: f32,
+};
+
+const GeneratedText = struct {
+    size: u32,
+    no_speech_probability: f32,
+    average_log_probability: f32,
 };
 
 const Benchmark = struct {
@@ -42,6 +53,8 @@ const Benchmark = struct {
     measurement_elapsed_ns_min: u64,
     measurement_elapsed_ns_median: u64,
     measurement_elapsed_ns_max: u64,
+    no_speech_probability: f32,
+    average_log_probability: f32,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -53,14 +66,33 @@ pub fn main(init: std.process.Init) !void {
 
     assert(arguments.threads_count > 0);
     assert(arguments.threads_count <= threads_count_max);
+    assert(arguments.decoding_beam_size > 0);
+    assert(arguments.decoding_beam_size <= decoding_beam_size_max);
     assert(arguments.measurement_runs_count > 0);
     assert(arguments.measurement_runs_count <= measurement_runs_count_max);
     assert(arguments.measurement_runs_count % 2 == 1);
+    assert(std.math.isFinite(arguments.input_gain));
+    assert(arguments.input_gain > 0);
+    assert(arguments.input_gain <= 1);
 
     // ── Load Fixture ──
 
     const samples = try load_fixture_audio(io, gpa, arguments.audio_path);
     defer gpa.free(samples);
+
+    // Fixture WAVs already use the production signed 16-bit representation.
+    // Apply experimental attenuation in place so the benchmark never creates a
+    // parallel float waveform that production does not have.
+    for (samples) |*sample| {
+        const scaled = @round(
+            @as(f32, @floatFromInt(sample.*)) * arguments.input_gain,
+        );
+        sample.* = @intFromFloat(std.math.clamp(
+            scaled,
+            @as(f32, std.math.minInt(i16)),
+            @as(f32, std.math.maxInt(i16)),
+        ));
+    }
 
     // ── Extract Log-Mel Features ──
 
@@ -70,7 +102,6 @@ pub fn main(init: std.process.Init) !void {
 
     const feature_extraction_started = Io.Clock.awake.now(io);
     const features = try extractor.calculate(samples);
-    defer gpa.free(features.values);
     const feature_extraction_elapsed_ns = measure_elapsed_awake_ns(io, feature_extraction_started);
 
     // ── Load Model ──
@@ -81,6 +112,7 @@ pub fn main(init: std.process.Init) !void {
     const model = bridge.model_create(
         arguments.model_path.ptr,
         arguments.threads_count,
+        arguments.decoding_beam_size,
         &bridge_error,
     ) orelse {
         stderr(
@@ -107,11 +139,11 @@ pub fn main(init: std.process.Init) !void {
     );
     const warmup_elapsed_ns = measure_elapsed_awake_ns(io, warmup_started);
 
-    var gpt2_encoded_text_size: u32 = 0;
+    var generated_text: GeneratedText = undefined;
     var measurement_elapsed_ns: [measurement_runs_count_max]u64 = undefined;
     for (measurement_elapsed_ns[0..arguments.measurement_runs_count]) |*elapsed_ns| {
         const transcription_started = Io.Clock.awake.now(io);
-        gpt2_encoded_text_size = try transcribe_log_mel_features(
+        generated_text = try transcribe_log_mel_features(
             model,
             features,
             &gpt2_encoded_text_buffer,
@@ -127,10 +159,11 @@ pub fn main(init: std.process.Init) !void {
     // ── Decode And Report ──
 
     var transcript_buffer: [transcript_size_max]u8 = undefined;
-    const transcript = try decode_gpt2_encoded_text(
+    const decoded_text = try gpt2_text.decodeInto(
         &transcript_buffer,
-        gpt2_encoded_text_buffer[0..gpt2_encoded_text_size],
+        gpt2_encoded_text_buffer[0..generated_text.size],
     );
+    const transcript = std.mem.trim(u8, decoded_text, " \t\r\n");
     const benchmark: Benchmark = .{
         .feature_extraction_elapsed_ns = feature_extraction_elapsed_ns,
         .model_load_elapsed_ns = model_load_elapsed_ns,
@@ -138,6 +171,8 @@ pub fn main(init: std.process.Init) !void {
         .measurement_elapsed_ns_min = measurements[0],
         .measurement_elapsed_ns_median = measurements[measurement_median_index],
         .measurement_elapsed_ns_max = measurements[measurements.len - 1],
+        .no_speech_probability = generated_text.no_speech_probability,
+        .average_log_probability = generated_text.average_log_probability,
     };
 
     report_model_spike(&arguments, samples.len, features.frames_count, transcript, &benchmark);
@@ -148,7 +183,7 @@ fn transcribe_log_mel_features(
     features: log_mel.Features,
     gpt2_encoded_text_buffer: *[transcript_size_max]u8,
     bridge_error_out: *bridge.Error,
-) !u32 {
+) !GeneratedText {
     assert(features.values.len == @as(usize, log_mel_values_count));
     assert(features.frames_count == log_mel_frames_count);
     assert(gpt2_encoded_text_buffer.len == transcript_size_max);
@@ -157,6 +192,8 @@ fn transcribe_log_mel_features(
         .bytes = gpt2_encoded_text_buffer,
         .capacity = gpt2_encoded_text_buffer.len,
         .size = 0,
+        .no_speech_probability = 0,
+        .average_log_probability = 0,
     };
 
     const transcription_succeeded = bridge.model_transcribe(
@@ -176,59 +213,17 @@ fn transcribe_log_mel_features(
     }
 
     assert(gpt2_encoded_text_out.size <= gpt2_encoded_text_buffer.len);
+    assert(std.math.isFinite(gpt2_encoded_text_out.no_speech_probability));
+    assert(gpt2_encoded_text_out.no_speech_probability >= 0);
+    assert(gpt2_encoded_text_out.no_speech_probability <= 1);
+    assert(std.math.isFinite(gpt2_encoded_text_out.average_log_probability));
+    assert(gpt2_encoded_text_out.average_log_probability <= 0);
 
-    return gpt2_encoded_text_out.size;
-}
-
-fn decode_gpt2_encoded_text(
-    transcript_buffer: *[transcript_size_max]u8,
-    gpt2_encoded_text: []const u8,
-) ![]const u8 {
-    const unmapped: u16 = 256;
-    var byte_by_codepoint: [512]u16 = @splat(unmapped);
-    var codepoint: u16 = 0;
-
-    // GPT-2 leaves visible Latin-1 bytes at their Unicode code points and maps
-    // every remaining byte, in byte order, to consecutive code points at 256.
-    for (0..256) |byte| {
-        const is_visible = (byte >= 33 and byte <= 126) or
-            (byte >= 161 and byte <= 172) or
-            (byte >= 174 and byte <= 255);
-
-        if (is_visible) {
-            byte_by_codepoint[byte] = @intCast(byte);
-        } else {
-            while (byte_by_codepoint[codepoint] != unmapped) : (codepoint += 1) {}
-            byte_by_codepoint[256 + codepoint] = @intCast(byte);
-            codepoint += 1;
-        }
-    }
-
-    var transcript_size: usize = 0;
-    var iterator = (try std.unicode.Utf8View.init(gpt2_encoded_text)).iterator();
-
-    while (iterator.nextCodepoint()) |gpt2_codepoint| {
-        if (gpt2_codepoint >= byte_by_codepoint.len) {
-            return error.InvalidGpt2TokenCodepoint;
-        }
-
-        const byte = byte_by_codepoint[gpt2_codepoint];
-        if (byte == unmapped) {
-            return error.InvalidGpt2TokenCodepoint;
-        }
-        if (transcript_size == transcript_buffer.len) {
-            return error.TranscriptExceedsLimit;
-        }
-
-        transcript_buffer[transcript_size] = @intCast(byte);
-        transcript_size += 1;
-    }
-
-    if (!std.unicode.utf8ValidateSlice(transcript_buffer[0..transcript_size])) {
-        return error.InvalidTranscriptUtf8;
-    }
-
-    return std.mem.trim(u8, transcript_buffer[0..transcript_size], " \t\r\n");
+    return .{
+        .size = gpt2_encoded_text_out.size,
+        .no_speech_probability = gpt2_encoded_text_out.no_speech_probability,
+        .average_log_probability = gpt2_encoded_text_out.average_log_probability,
+    };
 }
 
 fn measure_elapsed_awake_ns(io: Io, started: Io.Timestamp) u64 {
@@ -254,7 +249,9 @@ fn parse_arguments(
     var model_path: ?[:0]const u8 = null;
     var audio_path: ?[:0]const u8 = null;
     var threads_count: ?u8 = null;
+    var decoding_beam_size: ?u8 = null;
     var measurement_runs_count: ?u8 = null;
+    var input_gain: ?f32 = null;
 
     while (iterator.next()) |option| {
         if (std.mem.eql(u8, option, "--model")) {
@@ -284,6 +281,19 @@ fn parse_arguments(
             threads_count = count;
             continue;
         }
+        if (std.mem.eql(u8, option, "--beam-size")) {
+            if (decoding_beam_size != null) {
+                return usage();
+            }
+
+            const size_text = iterator.next() orelse return usage();
+            const size = std.fmt.parseInt(u8, size_text, 10) catch return usage();
+            if (size == 0 or size > decoding_beam_size_max) {
+                return usage();
+            }
+            decoding_beam_size = size;
+            continue;
+        }
         if (std.mem.eql(u8, option, "--runs")) {
             if (measurement_runs_count != null) {
                 return usage();
@@ -302,7 +312,15 @@ fn parse_arguments(
             measurement_runs_count = count;
             continue;
         }
+        if (std.mem.eql(u8, option, "--input-gain")) {
+            if (input_gain != null) return usage();
 
+            const gain_text = iterator.next() orelse return usage();
+            const gain = std.fmt.parseFloat(f32, gain_text) catch return usage();
+            if (!std.math.isFinite(gain) or gain <= 0 or gain > 1) return usage();
+            input_gain = gain;
+            continue;
+        }
         return usage();
     }
 
@@ -311,8 +329,11 @@ fn parse_arguments(
     const model_path_required = model_path orelse return usage();
     const audio_path_required = audio_path orelse return usage();
     const threads_count_resolved = threads_count orelse threads_count_default;
+    const decoding_beam_size_resolved =
+        decoding_beam_size orelse decoding_beam_size_default;
     const measurement_runs_count_resolved =
         measurement_runs_count orelse measurement_runs_count_default;
+    const input_gain_resolved = input_gain orelse 1.0;
 
     if (model_path_required.len == 0) {
         return usage();
@@ -323,28 +344,36 @@ fn parse_arguments(
 
     assert(threads_count_resolved > 0);
     assert(threads_count_resolved <= threads_count_max);
+    assert(decoding_beam_size_resolved > 0);
+    assert(decoding_beam_size_resolved <= decoding_beam_size_max);
     assert(measurement_runs_count_resolved > 0);
     assert(measurement_runs_count_resolved <= measurement_runs_count_max);
     assert(measurement_runs_count_resolved % 2 == 1);
+    assert(std.math.isFinite(input_gain_resolved));
+    assert(input_gain_resolved > 0);
+    assert(input_gain_resolved <= 1);
 
     arguments.* = .{
         .model_path = model_path_required,
         .audio_path = audio_path_required,
         .threads_count = threads_count_resolved,
+        .decoding_beam_size = decoding_beam_size_resolved,
         .measurement_runs_count = measurement_runs_count_resolved,
+        .input_gain = input_gain_resolved,
     };
 }
 
 fn usage() error{InvalidArguments} {
     stderr(
         "usage: model-spike --model <model-directory> --audio <wav-path> " ++
-            "[--threads <1-32>] [--runs <odd 1-9>]\n",
+            "[--threads <1-32>] [--beam-size <1-16>] " ++
+            "[--runs <odd 1-9>] [--input-gain <0-1>]\n",
         .{},
     );
     return error.InvalidArguments;
 }
 
-fn load_fixture_audio(io: Io, gpa: Allocator, audio_path: []const u8) ![]f32 {
+fn load_fixture_audio(io: Io, gpa: Allocator, audio_path: []const u8) ![]i16 {
     const wav_file_size_max = 32 * 1024 * 1024;
     const samples_count_max = 15 * 60 * sample_rate_hz;
 
@@ -365,17 +394,16 @@ fn load_fixture_audio(io: Io, gpa: Allocator, audio_path: []const u8) ![]f32 {
         return error.AudioDurationExceedsLimit;
     }
 
-    const samples = try gpa.alloc(f32, samples_count);
+    const samples = try gpa.alloc(i16, samples_count);
     errdefer gpa.free(samples);
 
     for (samples, 0..) |*sample, sample_index| {
         const sample_offset = sample_index * @sizeOf(i16);
-        const sample_i16 = std.mem.readInt(
+        sample.* = std.mem.readInt(
             i16,
             sample_bytes[sample_offset..][0..@sizeOf(i16)],
             .little,
         );
-        sample.* = @as(f32, @floatFromInt(sample_i16)) / 32768.0;
     }
 
     assert(samples.len == samples_count);
@@ -510,6 +538,11 @@ fn report_model_spike(
     assert(frames_count > 0);
     assert(benchmark.measurement_elapsed_ns_min <= benchmark.measurement_elapsed_ns_median);
     assert(benchmark.measurement_elapsed_ns_median <= benchmark.measurement_elapsed_ns_max);
+    assert(std.math.isFinite(benchmark.no_speech_probability));
+    assert(benchmark.no_speech_probability >= 0);
+    assert(benchmark.no_speech_probability <= 1);
+    assert(std.math.isFinite(benchmark.average_log_probability));
+    assert(benchmark.average_log_probability <= 0);
 
     const audio_duration_ns = @divExact(
         @as(u64, samples_count) * std.time.ns_per_s,
@@ -528,13 +561,18 @@ fn report_model_spike(
             "Model: {s}\n" ++
             "Audio: {s}\n" ++
             "Audio duration: {d}.{d} s\n" ++
+            "Input gain: {d:.4}\n" ++
+            "PCM storage: signed 16-bit\n" ++
             "Log-Mel frames: {d}\n" ++
             "Threads: {d}\n" ++
+            "Beam size: {d}\n" ++
             "Measured runs: {d}\n" ++
             "Log-Mel extraction: {d} ms\n" ++
             "Model load: {d} ms\n" ++
             "Warm-up: {d} ms\n" ++
             "Transcription: {d}/{d}/{d} ms min/median/max\n" ++
+            "No-speech probability: {d:.6}\n" ++
+            "Average log probability: {d:.6}\n" ++
             "Realtime factor: {d}.{d:0>3}x median\n" ++
             "Peak RSS: {d}.{d} MiB\n",
         .{
@@ -543,8 +581,10 @@ fn report_model_spike(
             arguments.audio_path,
             @divFloor(audio_duration_ns, std.time.ns_per_s),
             @divFloor(audio_duration_ns * 10, std.time.ns_per_s) % 10,
+            arguments.input_gain,
             frames_count,
             arguments.threads_count,
+            arguments.decoding_beam_size,
             arguments.measurement_runs_count,
             @divFloor(benchmark.feature_extraction_elapsed_ns, std.time.ns_per_ms),
             @divFloor(benchmark.model_load_elapsed_ns, std.time.ns_per_ms),
@@ -552,6 +592,8 @@ fn report_model_spike(
             @divFloor(benchmark.measurement_elapsed_ns_min, std.time.ns_per_ms),
             @divFloor(benchmark.measurement_elapsed_ns_median, std.time.ns_per_ms),
             @divFloor(benchmark.measurement_elapsed_ns_max, std.time.ns_per_ms),
+            benchmark.no_speech_probability,
+            benchmark.average_log_probability,
             @divFloor(realtime_factor_thousandths, 1000),
             realtime_factor_thousandths % 1000,
             @divFloor(peak_rss_mib_tenths, 10),

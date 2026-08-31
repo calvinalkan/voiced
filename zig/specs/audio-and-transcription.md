@@ -26,8 +26,8 @@ lifecycle. Every process interprets PCM publication through
 
 The audio process connects directly to PipeWire and requests mono float32 audio
 at 16 kHz where graph negotiation permits it. PipeWire may own or recycle its
-small graph buffer pool. The process copies complete callback blocks into an
-active shared audio slot.
+small graph buffer pool. The process validates each complete callback block and
+quantizes it directly into an active signed 16-bit shared audio slot.
 
 The callback release-publishes `published_samples_count_atomic` only after the
 corresponding sample bytes and ordinal are readable. It then performs one
@@ -105,31 +105,43 @@ committed UTF-8 byte count plus two. The worker writes text and metadata first,
 then release-CASes empty to published; cancellation atomically exchanges any
 state to cancelled. A valid empty transcription is therefore value two.
 
-A provisional boundary policy is:
+The production timing policy is:
 
 ```text
-before 20 seconds   continue filling
-20–28 seconds       prefer the next detected silence
-at 30 seconds       force a boundary
+physical slot capacity       30 seconds
+minimum internal chunk       20 seconds
+natural boundary candidate   300 ms quiet
+automatic stop               800 ms quiet
+forced boundary              30 seconds
 ```
 
-These numbers are starting points, not compatibility promises. Fixture quality,
-stop-to-output latency, and real dictation traces should determine them.
+`audio_policy.zig` is the authoritative source for these named constants and
+their sample-count conversions. A slot continues filling until it has at least
+20 seconds of audio and the activity detector has observed 300 ms of continuous
+quiet. Capture forces publication at 30 seconds when no qualifying pause occurs.
+In `listen` mode, observed activity followed by 800 ms of continuous quiet ends
+the recording independently of the internal chunk minimum. If the same quiet
+run already caused a natural publication at 300 ms, its remaining private
+confirmation tail is discarded instead of becoming a silence-only model chunk.
 
-A silence boundary should not need audio overlap. A forced boundary may retain
-a short overlap and deduplicate repeated boundary text. The implementation
-should add this complexity only after a fixture demonstrates that a hard split
-harms output.
+Natural and forced boundaries currently publish independent PCM ranges. A hard
+experimental split demonstrated one recoverable divided word, but 250 ms and
+500 ms overlaps increased total word errors across broader cuts and dense speech.
+Text-only deduplication could not distinguish repeated overlap from intentional
+repetition or repair a different word chosen by the preceding chunk. Voiced must
+not add overlap without timestamp-aware reconciliation or stronger quality
+evidence.
 
 If all slots are occupied, voiced stops capture and drains the retained slots.
 It must never overwrite untranscribed audio or allocate an additional slot.
 
 ## Whisper inference
 
-The selected backend is CTranslate2 4.6.2 with the English Whisper `small.en`
-model and an intentionally narrow C ABI bridge. Fixture measurements retained
-the current faster-whisper transcription quality while outperforming the
-other measured native candidates on longer technical dictation.
+The selected backend is CTranslate2 4.6.2 with an intentionally narrow C ABI
+bridge. Runtime configuration names a model by publisher and variant rather
+than by filesystem path. `Systran/faster-whisper-small.en` is the default for
+technical dictation quality; `Systran/faster-whisper-base.en` is the lower-memory,
+lower-latency alternative. The setup command installs and verifies both.
 
 CTranslate2, cpu_features, and spdlog sources are pinned and compiled with
 voiced. Static Intel oneMKL and OpenMP archives provide the measured CPU
@@ -139,16 +151,44 @@ a model without rebuilding voiced. The daemon performs no implicit network
 access; a setup command downloads to a temporary location, verifies pinned
 digests, and atomically installs the complete model.
 
-The Whisper process loads its model and creates reusable inference state during
-startup. It processes sealed chunks sequentially by ordinal while capture fills
-a different slot. Previous-text conditioning remains enabled so adjacent
-chunks preserve spelling and sentence continuity. If the bridge does not carry
-that context reliably across calls, the process retains and supplies a fixed
-tail of token IDs explicitly.
+Model residency is explicit. `session` starts loading and one silent warm-up
+alongside capture, then destroys the worker after output. `service` requires a
+ready worker before capture and keeps it across recordings once the long-running
+control loop owns multiple sessions. The one-session supervisor spike waits for
+readiness but necessarily shuts the worker down when its command exits.
 
-CTranslate2 reads log-Mel features derived directly from shared-slot PCM. It may
-allocate internally; that allocation remains confined to the worker process.
-Zig-owned model-worker buffers and queues remain fixed after initialization.
+The Whisper process handles sealed chunks sequentially by ordinal while capture
+fills a different slot. Chunks are decoded independently: measured previous-text
+prompting did not repair hard splits and worsened one fixture, while PCM overlap
+introduced more errors than it removed in the broader boundary probe.
+
+CTranslate2 reads float32 log-Mel features derived directly from shared-slot
+signed 16-bit PCM. The extractor converts samples into its centered DFT
+workspace and reuses its maximum-sized scratch and feature buffers across
+warm-up and every transcription; it never materializes a second complete float
+waveform. CTranslate2 may allocate internally, but Zig-owned model-worker
+buffers and queues remain fixed after initialization.
+
+The audio slot records whether its own PCM crossed the adaptive activity
+threshold. The model worker commits that observation, no-speech probability,
+average log probability, and text before atomically publishing the mailbox.
+Result recovery after worker death therefore makes the same acceptance decision
+as ordinary packet delivery.
+
+Worker-ready and result packets carry model-load, warm-up, feature-extraction,
+and inference durations as integer nanoseconds. The supervisor returns their
+counts, totals, and maxima in one `SessionTimingReport`, along with the complete
+command duration, audio duration, and post-audio drain duration. Human-readable
+logs render that report but are not its authoritative representation.
+
+Voiced accepts nonempty text only when activity was observed and Whisper's
+no-speech probability is below 0.60. An inactive chunk at or above 0.60 is normal
+`no_speech`; a disagreement becomes `speech_detection_conflict`, and empty model
+output after observed activity becomes `speech_unrecognized`. These failures
+report the model evidence without logging transcript text. The disagreement path
+is intentional: a volume detector cannot distinguish very quiet speech from all
+non-speech sounds, so Voiced neither publishes a hallucination nor silently
+discards uncertain speech.
 
 ## Stop and cancel
 
@@ -200,19 +240,29 @@ A replacement starts only after the prior worker is reaped and its complete
 epoll batch is consumed. No prior-session process can therefore publish samples,
 text, or lifecycle transitions into reset storage.
 
-## Bounds to validate
+## Bounds
 
-The implementation must choose and assert explicit values for:
+Three 30-second signed 16-bit slots use about 2.75 MiB regardless of session
+duration; the supervisor reuses them after transcription instead of retaining
+session PCM. The maximum recording duration defaults to one hour and remains a
+configuration value. Reaching it stops and finalizes successfully rather than
+truncating or discarding the session. Its `u16` representation provides a
+natural fail-safe ceiling of 65,535 seconds, or 18 hours, 12 minutes, and 15
+seconds.
 
-- audio slots count;
-- samples per slot;
-- maximum total session duration;
-- transcript byte capacity;
-- pending worker-event capacity;
+The supervisor allocates transcript storage once when the session starts. Its
+capacity is 64 UTF-8 bytes per configured audio second plus one complete 4 KiB
+mailbox result. The rate budget is independent of publication boundaries, while
+the extra result guarantees that one maximum-sized publication fits beyond the
+rate-derived capacity. One hour reserves 234,496 bytes, or about 229 KiB, on the
+heap rather than inside the supervisor's stack. The natural duration ceiling
+reserves about 4 MiB. Accepted output beyond this fixed capacity is a structured
+`transcript_capacity_exceeded` failure; the supervisor never grows or truncates
+the transcript.
+
+Still to validate and lock:
+
+- the 4 KiB result mailbox against the decoder's maximum output;
 - capture setup, progress, and teardown deadlines;
 - inference, cancellation, and model-startup deadlines; and
-- retry counts.
-
-The provisional fifteen-minute session maximum protects against accidental
-recording. Reaching it should stop and finalize successfully rather than
-truncate or discard the session.
+- bounded retry counts.

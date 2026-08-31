@@ -19,15 +19,20 @@ pub const slots_count: u32 = 3;
 pub const slot_duration_seconds_max: u32 = 30;
 pub const slot_samples_capacity: u32 = sample_rate_hz * slot_duration_seconds_max;
 
-// One callback may copy at most 100 ms of mono float32 audio. This is not a
-// PipeWire format requirement: it bounds realtime validation and copying.
+// One callback may publish at most 100 ms of mono audio. This is not a
+// PipeWire format requirement: it bounds realtime validation and conversion.
 pub const callback_samples_count_max: u32 = sample_rate_hz / 10;
 
-pub const format_version: u32 = 5;
+pub const format_version: u32 = 7;
+
+pub const TimelineValidation = enum(u32) {
+    header_only = 1,
+    full = 2,
+};
 
 pub const AudioExchange = extern struct {
     version: u32,
-    reserved: u32,
+    timeline_validation_atomic: u32,
     session_id: u64,
 
     // These counters report callback liveness; slot publication alone may be
@@ -40,12 +45,20 @@ pub const AudioExchange = extern struct {
 };
 
 pub const AudioSlot = extern struct {
-    // Audio writes `publication_ordinal` and `samples`, then release-stores a
-    // positive count. The supervisor acquire-loads that count before reading
-    // either field and release-stores zero only after the text is retained.
+    // Audio writes every metadata field and the sample prefix, then
+    // release-stores a positive count. The supervisor acquire-loads that count
+    // before reading the immutable publication and restores zero only after its
+    // transcript is retained.
     published_samples_count_atomic: u32,
     publication_ordinal: u32,
-    samples: [slot_samples_capacity]f32,
+    contains_activity: u32,
+    reserved: u32,
+
+    // Capture quantizes PipeWire's normalized F32 input directly into this
+    // signed 16-bit array. The model converts it directly into the reusable
+    // centered workspace required by log-Mel extraction, with no intermediate
+    // normalized float waveform.
+    samples: [slot_samples_capacity]i16,
 };
 
 pub const SlotIndex = enum(u8) {
@@ -68,9 +81,15 @@ pub const SlotWriter = struct {
     publication_ordinal: u32,
 };
 
+pub const SlotPublication = struct {
+    samples_count: u32,
+    contains_activity: bool,
+};
+
 pub const PublishedSlot = struct {
     publication_ordinal: u32,
     samples_count: u32,
+    contains_activity: bool,
 };
 
 pub const PublishedSlotRef = struct {
@@ -85,12 +104,13 @@ comptime {
     assert(callback_samples_count_max > 0);
     assert(callback_samples_count_max <= slot_samples_capacity);
 
+    assert(@offsetOf(AudioExchange, "timeline_validation_atomic") % @alignOf(u32) == 0);
     assert(@offsetOf(AudioExchange, "audio_callbacks_count_atomic") % @alignOf(u64) == 0);
     assert(@offsetOf(AudioExchange, "audio_samples_count_atomic") % @alignOf(u32) == 0);
     assert(@offsetOf(AudioExchange, "slots") % @alignOf(AudioSlot) == 0);
     assert(@offsetOf(AudioSlot, "published_samples_count_atomic") % @alignOf(u32) == 0);
-    assert(@offsetOf(AudioSlot, "samples") % @alignOf(f32) == 0);
-    assert(@sizeOf(AudioSlot) == 8 + slot_samples_capacity * @sizeOf(f32));
+    assert(@offsetOf(AudioSlot, "samples") % @alignOf(i16) == 0);
+    assert(@sizeOf(AudioSlot) == 16 + slot_samples_capacity * @sizeOf(i16));
 }
 
 /// `initialize` assigns a fresh session to an exchange that no worker can still
@@ -103,7 +123,7 @@ pub fn initialize(exchange: *AudioExchange, session_id: u64) void {
     exchange.session_id = session_id;
 
     assert(exchange.version == format_version);
-    assert(exchange.reserved == 0);
+    assert(exchange.timeline_validation_atomic == 0);
     assert(exchange.session_id == session_id);
     assert(exchange.audio_callbacks_count_atomic == 0);
     assert(exchange.audio_samples_count_atomic == 0);
@@ -116,7 +136,50 @@ pub fn initialize(exchange: *AudioExchange, session_id: u64) void {
             .acquire,
         ) == 0);
         assert(slot.publication_ordinal == 0);
+        assert(slot.contains_activity == 0);
+        assert(slot.reserved == 0);
     }
+}
+
+/// `publishTimelineValidation` announces the capability selected from the
+/// headers used to build the worker and the PipeWire library loaded at runtime.
+/// The supervisor reads it when capture first makes sample progress and emits
+/// any degraded-mode warning once per worker.
+pub fn publishTimelineValidation(
+    exchange: *AudioExchange,
+    validation: TimelineValidation,
+) void {
+    assert(exchange.version == format_version);
+    assert(exchange.session_id > 0);
+    assert(@atomicLoad(
+        u32,
+        &exchange.timeline_validation_atomic,
+        .monotonic,
+    ) == 0);
+
+    @atomicStore(
+        u32,
+        &exchange.timeline_validation_atomic,
+        @intFromEnum(validation),
+        .release,
+    );
+}
+
+pub fn acquireTimelineValidation(
+    exchange: *const AudioExchange,
+) ?TimelineValidation {
+    assert(exchange.version == format_version);
+    assert(exchange.session_id > 0);
+
+    const encoded = @atomicLoad(
+        u32,
+        &exchange.timeline_validation_atomic,
+        .acquire,
+    );
+    if (encoded == 0) return null;
+    assert(encoded == @intFromEnum(TimelineValidation.header_only) or
+        encoded == @intFromEnum(TimelineValidation.full));
+    return @enumFromInt(encoded);
 }
 
 /// `publishAudioCallbacksCount` release-publishes callback progress separately
@@ -216,22 +279,24 @@ pub fn tryAcquireWriter(
 }
 
 /// `publishWrittenSlot` makes the complete metadata and sample prefix visible
-/// to consumers. `samples_count` must never be zero because zero means that no
-/// published payload exists.
-pub fn publishWrittenSlot(writer: SlotWriter, samples_count: u32) void {
+/// to consumers. `samples_count` must be positive because zero means empty.
+pub fn publishWrittenSlot(writer: SlotWriter, publication: SlotPublication) void {
     assert(writer.slot.publication_ordinal == writer.publication_ordinal);
-    assert(samples_count > 0);
-    assert(samples_count <= slot_samples_capacity);
+    assert(publication.samples_count > 0);
+    assert(publication.samples_count <= slot_samples_capacity);
     assert(@atomicLoad(
         u32,
         &writer.slot.published_samples_count_atomic,
         .monotonic,
     ) == 0);
 
+    writer.slot.contains_activity = @intFromBool(publication.contains_activity);
+    writer.slot.reserved = 0;
+
     @atomicStore(
         u32,
         &writer.slot.published_samples_count_atomic,
-        samples_count,
+        publication.samples_count,
         .release,
     );
 }
@@ -248,9 +313,12 @@ pub fn acquirePublishedSlot(slot: *const AudioSlot) ?PublishedSlot {
     if (samples_count == 0) return null;
 
     assert(samples_count <= slot_samples_capacity);
+    assert(slot.contains_activity <= 1);
+    assert(slot.reserved == 0);
     return .{
         .publication_ordinal = slot.publication_ordinal,
         .samples_count = samples_count,
+        .contains_activity = slot.contains_activity == 1,
     };
 }
 
@@ -264,6 +332,8 @@ pub fn releaseConsumedSlot(slot: *AudioSlot) void {
     );
     assert(samples_count > 0);
     assert(samples_count <= slot_samples_capacity);
+    assert(slot.contains_activity <= 1);
+    assert(slot.reserved == 0);
 
     @atomicStore(
         u32,

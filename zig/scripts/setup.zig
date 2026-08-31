@@ -4,8 +4,8 @@
 //! wheels. The command selects a package table and publication directory:
 //!
 //!   setup native  ──> zig-pkg/mkl/
-//!   setup models  ──> $XDG_DATA_HOME/voiced/models/faster-whisper-small.en/
-//!   setup all     ──> both installations
+//!   setup models  ──> $XDG_DATA_HOME/voiced/models/Systran/{model}/
+//!   setup all     ──> both installation groups
 //!
 //! Every installation is assembled under a sibling `.tmp` directory. Direct
 //! files are retained as downloaded; ZIP payloads retain only their declared
@@ -13,6 +13,7 @@
 //! before the complete directory is published.
 
 const std = @import("std");
+const models = @import("models");
 
 const assert = std.debug.assert;
 const Io = std.Io;
@@ -223,87 +224,116 @@ fn setupModels(
     init: std.process.Init,
     http_client: *std.http.Client,
 ) !void {
-    // ── Describe Pinned CTranslate2 Model ──
-    //
-    // Systran publishes an already-converted English Whisper model. These four
-    // files form the directory consumed by CTranslate2's ModelLoader; they are
-    // not whisper.cpp GGML model files.
-    const model_revision = "d1d751a5f8271d482d14ca55d9e2deeebbae577f";
-    const model_url =
-        "https://huggingface.co/Systran/faster-whisper-small.en/resolve/" ++ model_revision ++ "/";
+    // Systran publishes both English Whisper variants already converted for
+    // CTranslate2. Each pinned repository contributes the four files consumed
+    // by `ModelLoader`; these are not whisper.cpp GGML model files.
+    const base_revision = "3d3d5dee26484f91867d81cb899cfcf72b96be6c";
+    const base_url = "https://huggingface.co/Systran/faster-whisper-base.en/resolve/" ++
+        base_revision ++ "/";
+    const small_revision = "d1d751a5f8271d482d14ca55d9e2deeebbae577f";
+    const small_url = "https://huggingface.co/Systran/faster-whisper-small.en/resolve/" ++
+        small_revision ++ "/";
 
-    const model_packages = [_]Package{.{
-        .manifest_name = "faster-whisper-small.en",
-        .version = model_revision,
-        .payloads = &.{
-            .{ .file = .{
-                .display_name = "CTranslate2 Whisper small.en configuration",
-                .url = model_url ++ "config.json",
-                .file_name = "config.json",
-                .expected_size = 2_657,
-                .expected_sha256 = "666a9605530ac1f61fa8177f3702b4dacec9966749e42610839fcc32661d5fae",
-            } },
-            .{ .file = .{
-                .display_name = "CTranslate2 Whisper small.en weights",
-                .url = model_url ++ "model.bin",
-                .file_name = "model.bin",
-                .expected_size = 483_545_366,
-                .expected_sha256 = "62b2a45b05ee59acb4a5341b33ee35e041395d378d418a18acfe4c9e768ee37a",
-            } },
-            .{ .file = .{
-                .display_name = "CTranslate2 Whisper small.en tokenizer",
-                .url = model_url ++ "tokenizer.json",
-                .file_name = "tokenizer.json",
-                .expected_size = 2_128_466,
-                .expected_sha256 = "929c5252409436dce1b38a75d1abbcb5e132d170d8e324e4e04ed915fa2d22df",
-            } },
-            .{ .file = .{
-                .display_name = "CTranslate2 Whisper small.en vocabulary",
-                .url = model_url ++ "vocabulary.txt",
-                .file_name = "vocabulary.txt",
-                .expected_size = 422_309,
-                .expected_sha256 = "ff77588746d3a2595d32ab5b69ffd7b95ce2441ac57533cb66fc3eb575a115cf",
-            } },
+    const model_installations = [_]struct {
+        model: models.Model,
+        package: Package,
+    }{
+        .{
+            .model = .{ .systran = .base_en },
+            .package = .{
+                .manifest_name = "Systran/faster-whisper-base.en",
+                .version = base_revision,
+                .payloads = &.{
+                    .{ .file = .{
+                        .display_name = "Systran Whisper base.en configuration",
+                        .url = base_url ++ "config.json",
+                        .file_name = "config.json",
+                        .expected_size = 2_227,
+                        .expected_sha256 = "f3bc3821e9fc76a27bae538e11ae5b677dcdd352b4600429ce7951d398569aeb",
+                    } },
+                    .{ .file = .{
+                        .display_name = "Systran Whisper base.en weights",
+                        .url = base_url ++ "model.bin",
+                        .file_name = "model.bin",
+                        .expected_size = 145_216_508,
+                        .expected_sha256 = "2a166925539a16005f14ff328359f9b9adb9dc4fb631bb3b227526862e93e2ef",
+                    } },
+                    .{ .file = .{
+                        .display_name = "Systran Whisper base.en tokenizer",
+                        .url = base_url ++ "tokenizer.json",
+                        .file_name = "tokenizer.json",
+                        .expected_size = 2_128_466,
+                        .expected_sha256 = "929c5252409436dce1b38a75d1abbcb5e132d170d8e324e4e04ed915fa2d22df",
+                    } },
+                    .{ .file = .{
+                        .display_name = "Systran Whisper base.en vocabulary",
+                        .url = base_url ++ "vocabulary.txt",
+                        .file_name = "vocabulary.txt",
+                        .expected_size = 422_309,
+                        .expected_sha256 = "ff77588746d3a2595d32ab5b69ffd7b95ce2441ac57533cb66fc3eb575a115cf",
+                    } },
+                },
+            },
         },
-    }};
-
-    // ── Resolve User Model Directory ──
-    //
-    // Runtime model data follows the XDG data convention instead of living
-    // beside build inputs in the repository.
-
-    const env = init.environ_map;
-
-    const models_dir_path = if (env.get("XDG_DATA_HOME")) |xdg_data_home_path|
-        try std.fs.path.join(init.gpa, &.{ xdg_data_home_path, "voiced/models" })
-    else models_dir_path: {
-        const home_path = env.get("HOME") orelse return error.HomeNotSet;
-        break :models_dir_path try std.fs.path.join(
-            init.gpa,
-            &.{ home_path, ".local/share/voiced/models" },
-        );
+        .{
+            .model = .{ .systran = .small_en },
+            .package = .{
+                .manifest_name = "Systran/faster-whisper-small.en",
+                .version = small_revision,
+                .payloads = &.{
+                    .{ .file = .{
+                        .display_name = "Systran Whisper small.en configuration",
+                        .url = small_url ++ "config.json",
+                        .file_name = "config.json",
+                        .expected_size = 2_657,
+                        .expected_sha256 = "666a9605530ac1f61fa8177f3702b4dacec9966749e42610839fcc32661d5fae",
+                    } },
+                    .{ .file = .{
+                        .display_name = "Systran Whisper small.en weights",
+                        .url = small_url ++ "model.bin",
+                        .file_name = "model.bin",
+                        .expected_size = 483_545_366,
+                        .expected_sha256 = "62b2a45b05ee59acb4a5341b33ee35e041395d378d418a18acfe4c9e768ee37a",
+                    } },
+                    .{ .file = .{
+                        .display_name = "Systran Whisper small.en tokenizer",
+                        .url = small_url ++ "tokenizer.json",
+                        .file_name = "tokenizer.json",
+                        .expected_size = 2_128_466,
+                        .expected_sha256 = "929c5252409436dce1b38a75d1abbcb5e132d170d8e324e4e04ed915fa2d22df",
+                    } },
+                    .{ .file = .{
+                        .display_name = "Systran Whisper small.en vocabulary",
+                        .url = small_url ++ "vocabulary.txt",
+                        .file_name = "vocabulary.txt",
+                        .expected_size = 422_309,
+                        .expected_sha256 = "ff77588746d3a2595d32ab5b69ffd7b95ce2441ac57533cb66fc3eb575a115cf",
+                    } },
+                },
+            },
+        },
     };
-    defer init.gpa.free(models_dir_path);
 
-    if (!std.fs.path.isAbsolute(models_dir_path)) {
-        return error.DataHomeNotAbsolute;
+    // Install each named model independently. A failed second download leaves
+    // the first model published and usable; neither model can expose a partial
+    // directory because `installPackages` assembles it under a sibling path.
+    for (model_installations) |installation| {
+        const model_dir_path = try models.allocInstalledDirectoryPath(
+            init,
+            installation.model,
+        );
+        defer init.gpa.free(model_dir_path);
+
+        try installPackages(
+            init.io,
+            init.gpa,
+            http_client,
+            &.{installation.package},
+            installation.model.name(),
+            model_dir_path,
+            "voiced-model.txt",
+        );
     }
-
-    const model_dir_path = try std.fs.path.join(
-        init.gpa,
-        &.{ models_dir_path, "faster-whisper-small.en" },
-    );
-    defer init.gpa.free(model_dir_path);
-
-    try installPackages(
-        init.io,
-        init.gpa,
-        http_client,
-        &model_packages,
-        "CTranslate2 Whisper small.en model",
-        model_dir_path,
-        "voiced-model.txt",
-    );
 }
 
 fn installPackages(

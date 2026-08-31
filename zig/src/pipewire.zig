@@ -7,7 +7,9 @@
 //! teardown.
 
 const std = @import("std");
+const audio_activity = @import("audio_activity.zig");
 const audio_exchange = @import("audio_exchange.zig");
+const audio_policy = @import("audio_policy.zig");
 const assert = std.debug.assert;
 
 // These calls use Zig's direct Linux syscall wrappers even though this binary
@@ -59,6 +61,8 @@ pub const Source = union(enum) {
     device_serial: [:0]const u8,
 };
 
+pub const AutomaticStop = audio_policy.AutomaticStop;
+
 pub const Launch = struct {
     exchange: *AudioExchange,
     publication_event_fd: std.posix.fd_t,
@@ -66,14 +70,17 @@ pub const Launch = struct {
     source: Source,
     recording_samples_target: u32,
     slot_samples_boundary: u32,
+    automatic_stop: AutomaticStop,
     process_realtime: bool,
 };
 
 /// Classifies why capture stopped so the supervisor can choose policy without
-/// parsing diagnostic text. `completed`, `stopped`, and `cancelled` are expected
-/// terminal states and therefore carry no `RuntimeError`; every other value does.
+/// parsing diagnostic text. Duration completion, automatic quiet, stop, and
+/// cancellation are expected terminal states and therefore carry no
+/// `RuntimeError`; every other value does.
 pub const Outcome = enum(u32) {
     completed,
+    automatic_stop,
     stopped,
     cancelled,
     control_error,
@@ -124,6 +131,7 @@ pub const CaptureFailure = struct {
 
 pub const CaptureEnd = union(enum) {
     completed,
+    automatic_stop,
     stopped,
     cancelled,
     failed: CaptureFailure,
@@ -136,6 +144,9 @@ pub const MemoryLockResult = union(enum) {
         limit_bytes: u64,
     },
 };
+
+pub const Activity = audio_activity.Detector.Activity;
+pub const ActivityReport = audio_activity.Detector.Report;
 
 pub const ReportCallback = struct {
     thread_id: i32,
@@ -150,6 +161,7 @@ pub const ReportCallback = struct {
     samples_range: ?CallbackSamplesRange,
     duration_ns_max: u64,
     gap_ns_max: u64,
+    activity: ActivityReport,
 };
 
 /// Returns the first terminal capture cause and all stable measurements after
@@ -446,6 +458,7 @@ const Audio = struct {
 const FillingSlot = struct {
     writer: audio_exchange.SlotWriter,
     samples_count: u32,
+    contains_activity: bool,
 };
 
 const PreviousTimeline = struct {
@@ -504,10 +517,12 @@ const RealtimeCapture = struct {
 
     recording_samples_target: u32,
     slot_samples_boundary: u32,
+    automatic_stop: AutomaticStop,
     active_slot: ?FillingSlot,
     publications_count: u32,
     samples_count: u32,
     published_samples_count: u32,
+    automatic_stop_confirmation_tail_is_private: bool,
 
     terminal_outcome_atomic: std.atomic.Value(TerminalOutcome),
     runtime_error: RuntimeError,
@@ -516,6 +531,7 @@ const RealtimeCapture = struct {
 
     main_loop_thread_id: i32,
     callback_state: CallbackState,
+    activity_detector: audio_activity.Detector,
 };
 
 const SourceEvent = union(enum) {
@@ -537,6 +553,7 @@ const SourceEvent = union(enum) {
 const TerminalOutcome = enum(u8) {
     none,
     completed,
+    automatic_stop,
     stopped,
     cancelled,
     control_error,
@@ -741,10 +758,11 @@ fn runCapture(launch: Launch, setup_error: *SetupError) !Report {
         .default, .node_name => null,
     };
     assert(launch.recording_samples_target > 0);
-    assert(launch.recording_samples_target <= 90 * audio_exchange.sample_rate_hz);
+    assert(launch.recording_samples_target <=
+        std.math.maxInt(u32) - audio_exchange.callback_samples_count_max);
     assert(launch.slot_samples_boundary >= audio_exchange.callback_samples_count_max);
     assert(launch.slot_samples_boundary <= audio_exchange.slot_samples_capacity);
-    assert(launch.exchange.reserved == 0);
+    assert(launch.exchange.timeline_validation_atomic == 0);
     assert(launch.exchange.audio_callbacks_count_atomic == 0);
     assert(launch.exchange.audio_samples_count_atomic == 0);
     assert(launch.exchange.reserved_2 == 0);
@@ -854,6 +872,13 @@ fn runCapture(launch: Launch, setup_error: *SetupError) !Report {
             pipewire.VOICED_AUDIO_PIPEWIRE_TIMELINE_VALIDATION_FULL => .full,
             else => unreachable,
         };
+    audio_exchange.publishTimelineValidation(
+        launch.exchange,
+        switch (timeline_validation) {
+            .header_only => .header_only,
+            .full => .full,
+        },
+    );
 
     // Every synchronous C wrapper clears this output before doing native work,
     // leaves it empty on success, and captures the native code and owned message
@@ -1133,10 +1158,12 @@ fn runCapture(launch: Launch, setup_error: *SetupError) !Report {
             },
             .recording_samples_target = launch.recording_samples_target,
             .slot_samples_boundary = launch.slot_samples_boundary,
+            .automatic_stop = launch.automatic_stop,
             .active_slot = null,
             .publications_count = 0,
             .samples_count = 0,
             .published_samples_count = 0,
+            .automatic_stop_confirmation_tail_is_private = false,
             .terminal_outcome_atomic = .init(.none),
             .runtime_error = .{
                 .stage = .none,
@@ -1161,6 +1188,7 @@ fn runCapture(launch: Launch, setup_error: *SetupError) !Report {
             .queue_buffer_result = 0,
             .main_loop_thread_id = linux.gettid(),
             .callback_state = .unobserved,
+            .activity_detector = .init(audio_exchange.sample_rate_hz),
         },
     };
 
@@ -1578,12 +1606,17 @@ fn runCapture(launch: Launch, setup_error: *SetupError) !Report {
     // Stream destruction is the synchronization boundary with PipeWire's data
     // thread: after it returns, no callback can still be writing the active
     // slot. Normal stop and every terminal capture result retain that complete
-    // callback-block prefix. Cancel alone abandons the private final slot; any
-    // slots published earlier remain valid, but the supervisor must discard the
-    // whole cancelled session rather than producing user-visible output.
+    // callback-block prefix. Cancel abandons the private final slot and asks the
+    // supervisor to discard the whole session. Automatic stop also abandons a
+    // private tail when an earlier natural boundary already published the
+    // complete utterance and the tail contains only the remaining quiet used to
+    // confirm that recording should end.
     const terminal_outcome = audio.realtime.terminal_outcome_atomic.load(.acquire);
     assert(terminal_outcome != .none);
-    if (terminal_outcome == .cancelled) {
+    if (terminal_outcome == .cancelled or
+        (terminal_outcome == .automatic_stop and
+            audio.realtime.automatic_stop_confirmation_tail_is_private))
+    {
         abandonUnpublishedActiveSlot(&audio.realtime);
     } else {
         publishActiveSlotIfNonEmpty(&audio.realtime);
@@ -1624,6 +1657,7 @@ fn runCapture(launch: Launch, setup_error: *SetupError) !Report {
     const outcome: Outcome = switch (terminal_outcome) {
         .none => unreachable,
         .completed => .completed,
+        .automatic_stop => .automatic_stop,
         .stopped => .stopped,
         .cancelled => .cancelled,
         .control_error => .control_error,
@@ -1643,7 +1677,7 @@ fn runCapture(launch: Launch, setup_error: *SetupError) !Report {
         .buffer_return_error => .buffer_return_error,
     };
     const runtime_error = switch (outcome) {
-        .completed, .stopped, .cancelled => RuntimeError{
+        .completed, .automatic_stop, .stopped, .cancelled => RuntimeError{
             .stage = .none,
             .domain = .none,
             .code = 0,
@@ -1736,7 +1770,7 @@ fn runCapture(launch: Launch, setup_error: *SetupError) !Report {
                 const timeline = audio.realtime.timeline_state.failed.discontinuity;
                 writeErrorMessage(
                     &audio,
-                    "PipeWire buffer timeline skipped or duplicated audio: " ++
+                    "PipeWire buffer timeline advanced beyond received audio: " ++
                         "rate={d}/{d}, previous_buffer_ticks={d}, " ++
                         "current_buffer_ticks={d}, tick_delta={d}, " ++
                         "block_samples={d}",
@@ -1772,6 +1806,7 @@ fn runCapture(launch: Launch, setup_error: *SetupError) !Report {
 
     const end: CaptureEnd = switch (outcome) {
         .completed => .completed,
+        .automatic_stop => .automatic_stop,
         .stopped => .stopped,
         .cancelled => .cancelled,
         else => .{ .failed = .{
@@ -1841,6 +1876,7 @@ fn runCapture(launch: Launch, setup_error: *SetupError) !Report {
             .samples_range = metrics.samples_range,
             .duration_ns_max = metrics.duration_ns_max,
             .gap_ns_max = metrics.gap_ns_max,
+            .activity = audio.realtime.activity_detector.report(),
         }
     else
         null;
@@ -1932,6 +1968,7 @@ fn runCapture(launch: Launch, setup_error: *SetupError) !Report {
             if (value.samples_range) |range| range.maximum else 0
         else
             0,
+        .activity = audio.realtime.activity_detector.report(),
     };
     assert(setup_error.stage == .none);
     assert(setup_error.domain == .none);
@@ -1985,7 +2022,7 @@ fn runCapture(launch: Launch, setup_error: *SetupError) !Report {
         .full => {},
     }
     switch (report.outcome) {
-        .completed, .stopped, .cancelled => {
+        .completed, .automatic_stop, .stopped, .cancelled => {
             assert(report.runtime_error.stage == .none);
             assert(report.runtime_error.domain == .none);
             assert(report.runtime_error.code == 0);
@@ -2192,6 +2229,18 @@ fn runCapture(launch: Launch, setup_error: *SetupError) !Report {
             assert(report.source_identity.is_resolved);
             assert(report.samples_count >= launch.recording_samples_target);
             assert(report.published_samples_count == report.samples_count);
+        },
+        .automatic_stop => {
+            assert(launch.automatic_stop == .after_quiet);
+            assert(report.source_identity.is_resolved);
+            assert(report.samples_count < launch.recording_samples_target);
+            assert(report.activity.active_samples_count > 0);
+            assert(report.activity.activity == .quiet);
+            assert(report.activity.activity_samples_count >=
+                audio_policy.automatic_stop_quiet_samples_count);
+            assert(report.samples_count - report.published_samples_count <=
+                audio_policy.automatic_stop_quiet_samples_count +
+                    audio_exchange.callback_samples_count_max);
         },
         .stopped => assert(report.published_samples_count == report.samples_count),
         .cancelled => assert(report.samples_count - report.published_samples_count <=
@@ -3430,24 +3479,27 @@ fn validateBufferTimeline(
 
     // Compare durations without floating point. The left side is the elapsed
     // graph duration scaled by Voiced's 16 kHz output rate; the right side is
-    // this block's duration scaled by the graph rate denominator. A resampler
-    // must round integral output samples, so one output sample is the complete
-    // tolerance. Baseline runs and stable 256-, 1024-, and 2048-frame graph
-    // quanta on PipeWire 1.0.5 produced residuals of -2 through +1 graph ticks.
-    // Quantum transitions, SIGSTOP, and CPU pressure that actually lost audio
-    // exceeded this bound by at least 344 graph ticks.
+    // this block's duration scaled by the graph rate denominator. One output
+    // sample covers the resampler's integral rounding.
+    //
+    // `pw_buffer.time` names the graph cycle that queued the buffer, not the
+    // first sample carried by it. Under load, PipeWire may legitimately combine
+    // two ready graph quanta into one dequeued block: its sample duration then
+    // exceeds the time since the preceding buffer even though no audio was
+    // duplicated. Reject only the opposite relation, where graph time advanced
+    // farther than the received samples can cover. Header `DISCONT` remains the
+    // authoritative signal for discontinuities that this one-sided fallback
+    // cannot prove.
     const buffer_ticks_delta = buffer_ticks - previous.buffer_ticks;
     const graph_duration_scaled = @as(u128, buffer_ticks_delta) *
         @as(u128, timeline.graph_rate_num) *
         @as(u128, audio_exchange.sample_rate_hz);
     const block_duration_scaled = @as(u128, block_samples_count) *
         @as(u128, timeline.graph_rate_denom);
-    const duration_difference = if (graph_duration_scaled >= block_duration_scaled)
-        graph_duration_scaled - block_duration_scaled
-    else
-        block_duration_scaled - graph_duration_scaled;
     const one_output_sample_tolerance = @as(u128, timeline.graph_rate_denom);
-    if (duration_difference > one_output_sample_tolerance) {
+    if (graph_duration_scaled >
+        block_duration_scaled + one_output_sample_tolerance)
+    {
         realtime.timeline_state = .{ .failed = .{
             .discontinuity = observation,
         } };
@@ -3496,38 +3548,55 @@ fn publishCompleteBlock(
 
     const active_slot = &realtime.active_slot.?;
     const destination_samples = active_slot.writer.slot.samples[active_slot.samples_count..][0..block_samples_count];
-    const destination_bytes = std.mem.sliceAsBytes(destination_samples);
 
     switch (block) {
         .empty => unreachable,
-        .silence => @memset(destination_bytes, 0),
+        .silence => @memset(destination_samples, 0),
         .samples => |samples| {
-            @memcpy(destination_bytes[0..samples.first_bytes.len], samples.first_bytes);
-            @memcpy(destination_bytes[samples.first_bytes.len..], samples.second_bytes);
-
-            // Float32 permits NaN, infinity, and enormous finite values, but
-            // PipeWire's normalized F32 audio contract is -1.0 through +1.0.
-            // Whisper squares FFT magnitudes, so merely requiring finiteness would
-            // still let a maximum finite sample overflow and poison later features.
-            // Reject non-finite input, but clamp ordinary overdriven audio and count
-            // each clamp for diagnostics instead of terminating a real recording.
-            // This bounded pass happens in aligned owned memory before any part of
-            // the current block becomes visible to another process.
+            // PipeWire lends normalized native F32 bytes, while the shared
+            // exchange retains signed 16-bit PCM. Validate and quantize directly
+            // into the private slot: a separate float block would add callback
+            // scratch and another complete memory pass. The activity detector
+            // consumes the same int16 destination after the block is complete.
+            //
+            // Float32 also permits NaN, infinity, and enormous finite values.
+            // Reject non-finite input; clamp ordinary overdrive before conversion
+            // and count it for diagnostics. No written sample becomes visible to
+            // another process until the slot's count is release-published.
+            var destination_index: usize = 0;
             var block_clipped_samples_count: u32 = 0;
-            for (destination_samples, 0..) |*sample, sample_index| {
-                if (!std.math.isFinite(sample.*)) {
-                    realtime.buffer_error.reason = .non_finite_sample;
-                    realtime.buffer_error.invalid_sample_index = @intCast(sample_index);
-                    return .invalid_buffer;
-                }
-                if (sample.* > 1.0) {
-                    sample.* = 1.0;
-                    block_clipped_samples_count += 1;
-                } else if (sample.* < -1.0) {
-                    sample.* = -1.0;
-                    block_clipped_samples_count += 1;
+            for ([_][]const u8{ samples.first_bytes, samples.second_bytes }) |source_bytes| {
+                assert(source_bytes.len % @sizeOf(f32) == 0);
+                var source_offset: usize = 0;
+                while (source_offset < source_bytes.len) : (source_offset += @sizeOf(f32)) {
+                    var sample = std.mem.bytesToValue(
+                        f32,
+                        source_bytes[source_offset..][0..@sizeOf(f32)],
+                    );
+                    if (!std.math.isFinite(sample)) {
+                        realtime.buffer_error.reason = .non_finite_sample;
+                        realtime.buffer_error.invalid_sample_index = @intCast(destination_index);
+                        return .invalid_buffer;
+                    }
+                    if (sample > 1.0) {
+                        sample = 1.0;
+                        block_clipped_samples_count += 1;
+                    } else if (sample < -1.0) {
+                        sample = -1.0;
+                        block_clipped_samples_count += 1;
+                    }
+
+                    destination_samples[destination_index] = @intFromFloat(
+                        std.math.clamp(
+                            @round(sample * 32768.0),
+                            @as(f32, std.math.minInt(i16)),
+                            @as(f32, std.math.maxInt(i16)),
+                        ),
+                    );
+                    destination_index += 1;
                 }
             }
+            assert(destination_index == destination_samples.len);
             realtime.callback_state.observed.clipped_samples_count +=
                 block_clipped_samples_count;
         },
@@ -3542,7 +3611,10 @@ fn publishCompleteBlock(
         realtime.callback_state.observed.header_gap_samples_count += block_samples_count;
     }
 
+    const activity = realtime.activity_detector.observe(destination_samples);
+
     active_slot.samples_count += block_samples_count;
+    if (activity.activity == .active) active_slot.contains_activity = true;
     realtime.samples_count += block_samples_count;
     assert(active_slot.samples_count <= realtime.slot_samples_boundary);
     assert(realtime.samples_count <=
@@ -3563,9 +3635,45 @@ fn publishCompleteBlock(
         };
     }
 
+    // The absolute duration is authoritative even when its final callback also
+    // completes a quiet interval. It is a caller-selected hard limit, while
+    // activity supplies only earlier publication and automatic-stop decisions.
     if (realtime.samples_count >= realtime.recording_samples_target) {
         return .completed;
     }
+
+    if (activity.activity == .active) {
+        // Speech after a natural boundary makes the current slot part of the
+        // utterance. A later automatic stop must publish it rather than treating
+        // it as the quiet confirmation tail of the preceding chunk.
+        realtime.automatic_stop_confirmation_tail_is_private = false;
+    } else if (activity.activity == .quiet and
+        realtime.automatic_stop == .after_quiet and
+        realtime.activity_detector.active_samples_count > 0 and
+        activity.activity_samples_count >=
+            audio_policy.automatic_stop_quiet_samples_count)
+    {
+        return .automatic_stop;
+    }
+
+    // Once one physical slot contains at least twenty seconds, a sustained
+    // quiet run supplies a word-safe boundary. Publication wakes Whisper while
+    // capture immediately claims another slot. Experimental boundaries below
+    // twenty seconds remain fixed so the supervisor's pressure scenarios keep
+    // their deliberate one-second behavior.
+    if (active_slot.samples_count >= audio_policy.internal_chunk_samples_count_min and
+        activity.activity == .quiet and
+        activity.activity_samples_count >=
+            audio_policy.natural_boundary_quiet_samples_count)
+    {
+        publishActiveSlotIfNonEmpty(realtime);
+        realtime.automatic_stop_confirmation_tail_is_private =
+            realtime.automatic_stop == .after_quiet;
+        if (!beginNextAvailableSlot(realtime)) {
+            return .pipeline_full;
+        }
+    }
+
     return .none;
 }
 
@@ -3591,6 +3699,7 @@ fn beginNextAvailableSlot(realtime: *RealtimeCapture) bool {
         realtime.active_slot = .{
             .writer = writer,
             .samples_count = 0,
+            .contains_activity = false,
         };
         return true;
     }
@@ -3603,10 +3712,10 @@ fn publishActiveSlotIfNonEmpty(realtime: *RealtimeCapture) void {
     assert(active_slot.samples_count <= realtime.slot_samples_boundary);
     if (active_slot.samples_count == 0) return;
 
-    audio_exchange.publishWrittenSlot(
-        active_slot.writer,
-        active_slot.samples_count,
-    );
+    audio_exchange.publishWrittenSlot(active_slot.writer, .{
+        .samples_count = active_slot.samples_count,
+        .contains_activity = active_slot.contains_activity,
+    });
 
     // The eventfd is a doorbell, not a slot queue. Several publications may
     // coalesce into one counter value; the supervisor scans all three slots by
@@ -3646,7 +3755,7 @@ fn publishRealtimeOutcome(
     // bounded numeric error beside the terminal outcome. The main-loop thread
     // turns callback-owned buffer details into prose only after stream teardown.
     switch (outcome) {
-        .completed => {},
+        .completed, .automatic_stop => {},
         .pipeline_full => recordRuntimeError(
             &realtime.runtime_error,
             .exchange_publication,
@@ -3772,7 +3881,7 @@ fn publishRealtimeOutcome(
         return;
     }
     assert(realtime.terminal_outcome_atomic.load(.acquire) == outcome);
-    if (outcome == .completed) {
+    if (outcome == .completed or outcome == .automatic_stop) {
         assert(realtime.runtime_error.stage == .none);
         assert(realtime.runtime_error.domain == .none);
         assert(realtime.runtime_error.code == 0);
@@ -3781,11 +3890,18 @@ fn publishRealtimeOutcome(
         assert(realtime.runtime_error.domain != .none);
     }
 
-    // Winning the latch establishes this callback as the terminal owner. Publish
-    // its complete callback-block prefix before signaling the main loop. A
-    // callback that lost to cancel returned above and leaves the active slot
-    // private for teardown to abandon after stream destruction.
-    publishActiveSlotIfNonEmpty(realtime);
+    // Winning the latch establishes this callback as the terminal owner. Normal
+    // completion publishes its complete callback-block prefix. Automatic stop
+    // does the same unless a natural boundary already published the utterance;
+    // in that case the current private slot contains only the additional quiet
+    // needed to confirm the stop and must never become a Whisper chunk.
+    if (outcome == .automatic_stop and
+        realtime.automatic_stop_confirmation_tail_is_private)
+    {
+        abandonUnpublishedActiveSlot(realtime);
+    } else {
+        publishActiveSlotIfNonEmpty(realtime);
+    }
 
     writeEventCounter(realtime.callback_event_fd);
 }
@@ -3828,6 +3944,7 @@ fn claimMainLoopOutcome(audio: *Audio, outcome: Outcome) bool {
     // because its callback ran last.
     const terminal_outcome: TerminalOutcome = switch (outcome) {
         .completed => .completed,
+        .automatic_stop => .automatic_stop,
         .stopped => .stopped,
         .cancelled => .cancelled,
         .control_error => .control_error,

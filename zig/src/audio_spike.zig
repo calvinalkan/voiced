@@ -27,6 +27,7 @@ const Arguments = struct {
     slot_seconds: u8,
     consumer_delay_ms: u32,
     requested_control: ?RequestedControl,
+    automatic_stop: audio_process.AutomaticStop,
     process_realtime: bool,
 };
 
@@ -53,7 +54,7 @@ pub fn main(init: std.process.Init) !void {
                 "[--seconds <1-90>] " ++
                 "[--stop-after-ms <0-90000> | --cancel-after-ms <0-90000>] " ++
                 "[--slot-seconds <1-30>] [--consumer-delay-ms <0-10000>] " ++
-                "[--main-loop]\n",
+                "[--listen] [--main-loop]\n",
             .{},
         );
         return err;
@@ -76,6 +77,7 @@ pub fn main(init: std.process.Init) !void {
         .source = arguments.source,
         .recording_samples_target = @as(u32, arguments.recording_seconds) * audio_process.sample_rate_hz,
         .slot_samples_boundary = @as(u32, arguments.slot_seconds) * audio_process.sample_rate_hz,
+        .automatic_stop = arguments.automatic_stop,
         .consumer_delay_ms = arguments.consumer_delay_ms,
         .process_realtime = arguments.process_realtime,
     });
@@ -166,6 +168,7 @@ fn parseArguments(
     var slot_seconds: ?u8 = null;
     var consumer_delay_ms: ?u32 = null;
     var requested_control: ?RequestedControl = null;
+    var automatic_stop: audio_process.AutomaticStop = .disabled;
     var process_realtime = true;
     var main_loop_was_requested = false;
 
@@ -233,6 +236,9 @@ fn parseArguments(
                 return error.InvalidArguments;
             };
             if (consumer_delay_ms.? > 10_000) return error.InvalidArguments;
+        } else if (std.mem.eql(u8, option_text, "--listen")) {
+            if (automatic_stop != .disabled) return error.InvalidArguments;
+            automatic_stop = .after_quiet;
         } else if (std.mem.eql(u8, option_text, "--main-loop")) {
             if (main_loop_was_requested) return error.InvalidArguments;
             main_loop_was_requested = true;
@@ -260,6 +266,7 @@ fn parseArguments(
         .slot_seconds = slot_seconds orelse audio_process.slot_duration_seconds_max,
         .consumer_delay_ms = consumer_delay_ms orelse 0,
         .requested_control = requested_control,
+        .automatic_stop = automatic_stop,
         .process_realtime = process_realtime,
     };
     assert(arguments.output_path.len > 0);
@@ -285,7 +292,7 @@ fn writePcm16Wav(
     io: Io,
     gpa: Allocator,
     output_path: []const u8,
-    samples: []const f32,
+    samples: []const i16,
 ) !void {
     assert(output_path.len > 0);
     assert(samples.len <=
@@ -318,16 +325,8 @@ fn writePcm16Wav(
     std.mem.writeInt(u32, wav[40..44], @intCast(sample_data_size), .little);
 
     for (samples, 0..) |sample, sample_index| {
-        // The audio worker rejects non-finite values and clamps normalized F32
-        // before publication. Assert that producer guarantee again at the final
-        // artifact boundary rather than silently repairing an internal defect.
-        assert(std.math.isFinite(sample));
-        assert(sample >= -1.0);
-        assert(sample <= 1.0);
-        const scaled_sample = @max(-32768.0, @min(32767.0, sample * 32768.0));
-        const pcm_sample: i16 = @intFromFloat(scaled_sample);
         const sample_offset = wav_header_size + sample_index * @sizeOf(i16);
-        std.mem.writeInt(i16, wav[sample_offset..][0..@sizeOf(i16)], pcm_sample, .little);
+        std.mem.writeInt(i16, wav[sample_offset..][0..@sizeOf(i16)], sample, .little);
     }
 
     // Build the complete artifact in an unnamed or randomized sibling file,
@@ -370,12 +369,13 @@ fn report(
 ) void {
     const outcome: audio_process.Outcome = switch (capture_report.end) {
         .completed => .completed,
+        .automatic_stop => .automatic_stop,
         .stopped => .stopped,
         .cancelled => .cancelled,
         .failed => |failure| @enumFromInt(@intFromEnum(failure.outcome)),
     };
     const failure: ?audio_process.Failure = switch (capture_report.end) {
-        .completed, .stopped, .cancelled => null,
+        .completed, .automatic_stop, .stopped, .cancelled => null,
         .failed => |capture_failure| capture_failure.failure,
     };
     const source = capture_report.source;
@@ -547,7 +547,8 @@ fn report(
     stderr(
         "PipeWire headers/library/server: {s}/{s}/{s}\n" ++
             "Timeline validation: {s}\n" ++
-            "Format: float32, {d} Hz, {d} channel\n" ++
+            "PipeWire input: float32, {d} Hz, {d} channel\n" ++
+            "Shared PCM: signed 16-bit\n" ++
             "Published duration: {d}.{d} s\n" ++
             "Samples captured/published: {d}/{d}\n" ++
             "Physical slots: {d}\n" ++
@@ -599,6 +600,31 @@ fn report(
             process_report.callback_gap_ns_max / std.time.ns_per_ms,
         },
     );
+
+    if (callback) |callback_observation| {
+        const activity = callback_observation.activity;
+        stderr(
+            "Activity: {s}\n" ++
+                "Activity samples unknown/quiet/active: {d}/{d}/{d}\n" ++
+                "Activity changes: {d}\n" ++
+                "Longest active/quiet runs: {d}/{d} ms\n" ++
+                "Activity RMS noise/quiet/active: {d:.6}/{d:.6}/{d:.6}\n",
+            .{
+                @tagName(activity.activity),
+                activity.unknown_samples_count,
+                activity.quiet_samples_count,
+                activity.active_samples_count,
+                activity.activity_changes_count,
+                @as(u64, activity.active_run_samples_count_max) *
+                    std.time.ms_per_s / audio_process.sample_rate_hz,
+                @as(u64, activity.quiet_run_samples_count_max) *
+                    std.time.ms_per_s / audio_process.sample_rate_hz,
+                activity.noise_floor_rms,
+                activity.quiet_threshold_rms,
+                activity.active_threshold_rms,
+            },
+        );
+    }
 
     if (process_report.source_is_resolved == 1) {
         stderr(

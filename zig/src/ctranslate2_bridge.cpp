@@ -9,6 +9,7 @@
 #include <ctranslate2/models/whisper.h>
 
 #include <cassert>
+#include <cmath>
 #include <cstring>
 #include <exception>
 #include <memory>
@@ -56,6 +57,7 @@ static void write_error_message(
 extern "C" ModelHandle *model_create(
     const char *model_directory_path,
     const uint32_t inference_threads_count,
+    const uint32_t decoding_beam_size,
     Error *error_out
 ) {
     if (error_out == nullptr) {
@@ -75,6 +77,11 @@ extern "C" ModelHandle *model_create(
     }
     if (inference_threads_count == 0) {
         write_error_message("inference thread count must be nonzero", error_out);
+
+        return nullptr;
+    }
+    if (decoding_beam_size == 0) {
+        write_error_message("decoding beam size must be nonzero", error_out);
 
         return nullptr;
     }
@@ -126,12 +133,11 @@ extern "C" ModelHandle *model_create(
             whisper_no_timestamps_token_id,
         }};
 
-        // Keep five candidate sequences while decoding, matching
-        // faster-whisper's default. Greedy decoding can commit to a locally
-        // likely repeated word and never select end-of-text; retaining several
-        // paths lets the completed utterance win instead. Return only that best
-        // sequence rather than exposing the other beam candidates to Zig.
-        model->options.beam_size = 5;
+        // Greedy decoding keeps one path. Larger caller-selected beams retain
+        // alternatives that can recover from a locally likely token before the
+        // sequence completes. Return only the best completed sequence rather
+        // than exposing the other beam candidates to Zig.
+        model->options.beam_size = decoding_beam_size;
         model->options.sampling_topk = 1;
         model->options.sampling_temperature = 1.0f;
         model->options.num_hypotheses = 1;
@@ -145,11 +151,13 @@ extern "C" ModelHandle *model_create(
         model->options.no_repeat_ngram_size = 0;
         model->options.max_length = whisper_decoder_context_tokens_count;
 
-        // The bridge needs token strings and IDs only. Scores, vocabulary
-        // logits, and silence probability would return unused result fields.
-        model->options.return_scores = false;
+        // The bridge needs token strings, IDs, the selected sequence score, and
+        // the first-step probability of Whisper's dedicated no-speech token.
+        // Complete vocabulary logits would return a large result field that Zig
+        // does not consume.
+        model->options.return_scores = true;
         model->options.return_logits_vocab = false;
-        model->options.return_no_speech_prob = false;
+        model->options.return_no_speech_prob = true;
 
         // The prompt makes the timestamp bound inactive. Blank suppression and
         // the model's default suppression list reject non-speech symbols.
@@ -197,6 +205,8 @@ extern "C" bool model_transcribe(
         return false;
     }
     gpt2_encoded_text_out->size = 0;
+    gpt2_encoded_text_out->no_speech_probability = 0.0f;
+    gpt2_encoded_text_out->average_log_probability = 0.0f;
 
     if (model == nullptr) {
         write_error_message("model handle is required", error_out);
@@ -263,6 +273,11 @@ extern "C" bool model_transcribe(
 
             return false;
         }
+        if (generation_result.scores.size() != 1) {
+            write_error_message("CTranslate2 returned an unexpected score count", error_out);
+
+            return false;
+        }
 
         const std::vector<std::string> &vocabulary_tokens = generation_result.sequences[0];
         const std::vector<std::size_t> &vocabulary_token_ids = generation_result.sequences_ids[0];
@@ -277,6 +292,44 @@ extern "C" bool model_transcribe(
 
             return false;
         }
+        if (!std::isfinite(generation_result.no_speech_prob) ||
+            generation_result.no_speech_prob < 0.0f ||
+            generation_result.no_speech_prob > 1.0f) {
+            write_error_message("CTranslate2 returned an invalid no-speech probability", error_out);
+
+            return false;
+        }
+        const float sequence_score = generation_result.scores[0];
+        if (!std::isfinite(sequence_score)) {
+            write_error_message("CTranslate2 returned an invalid sequence score", error_out);
+
+            return false;
+        }
+
+        // CTranslate2 applies the configured length penalty to its returned
+        // score. Undo that normalization, then include the end token in the
+        // denominator exactly as faster-whisper does for silence decisions.
+        const float generated_tokens_count =
+            static_cast<float>(vocabulary_token_ids.size());
+        const float cumulative_log_probability = sequence_score * std::pow(
+            generated_tokens_count,
+            model->options.length_penalty
+        );
+        const float average_log_probability = cumulative_log_probability /
+            (generated_tokens_count + 1.0f);
+        if (!std::isfinite(average_log_probability)) {
+            write_error_message(
+                "CTranslate2 returned an invalid average log probability",
+                error_out
+            );
+
+            return false;
+        }
+
+        gpt2_encoded_text_out->no_speech_probability =
+            generation_result.no_speech_prob;
+        gpt2_encoded_text_out->average_log_probability =
+            average_log_probability;
 
         // ── Write Encoded Text ──
 

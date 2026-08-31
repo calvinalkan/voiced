@@ -3,7 +3,7 @@
 Three executable entry points establish the native boundaries and supervisor:
 
 - `voiced supervisor-spike` runs the one-binary supervisor with deterministic
-  roles, or with real PipeWire audio and deterministic transcription.
+  roles, real PipeWire audio, or the complete PipeWire-to-CTranslate2 path.
 - `audio-spike` independently exercises the same PipeWire worker and writes
   retained PCM to WAV.
 - `model-spike` computes Whisper log-Mel features and measures CTranslate2
@@ -30,8 +30,8 @@ main.zig
 `supervisor.zig` owns epoll ordering, session outcome, absolute deadlines,
 retries, slot release, and final transcript acceptance. Deterministic roles use
 exactly the seqpacket, pidfd, memfd, eventfd, descriptor-handoff, and
-parent-death contracts used by the attached PipeWire role and intended for the
-resident CTranslate2 role.
+parent-death contracts used by the attached PipeWire and resident CTranslate2
+roles.
 
 `audio-spike` remains a focused adapter over five operations from
 `audio_process.zig`: `start`, `requestStop`, `requestCancel`, `receiveReport`,
@@ -46,8 +46,8 @@ headers and linker name:
 sudo apt install libpipewire-0.3-dev
 ```
 
-Install the verified Intel archives required by the build and the CTranslate2
-`small.en` model required at runtime:
+Install the verified Intel archives required by the build and both named
+CTranslate2 English Whisper models:
 
 ```bash
 zig build setup
@@ -84,12 +84,54 @@ Replace only deterministic audio with the real default PipeWire source:
   --slot-seconds 1
 ```
 
-This command drives real PCM publications through the supervisor while the
-transcription role still emits deterministic `chunk-N` text. It accepts the
-same `--device-serial`, low-level `--target`, and `--main-loop` source controls
-as the audio experiment. Capture setup, sample-progress, teardown, session, and
-worker-exit deadlines now belong to the epoll supervisor rather than the WAV
-adapter.
+`--seconds` configures the maximum duration of this recording. It defaults to
+one hour and accepts values through 65,535 seconds—the natural `u16` limit of
+18 hours, 12 minutes, and 15 seconds. Reaching it performs a normal stop and
+final drain. Add `--listen` to end early after speech followed by 800 ms of
+quiet. Without it, quiet affects internal chunk boundaries but never ends
+capture before that configured limit.
+
+Without `--model`, this command drives real PCM publications through the
+supervisor while transcription emits deterministic `chunk-N` text. Add a named model to exercise direct shared-memory inference:
+
+```bash
+./zig-out/bin/voiced supervisor-spike pipewire \
+  --seconds 25 \
+  --slot-seconds 20 \
+  --model Systran/faster-whisper-small.en \
+  --threads 4
+```
+
+`Systran/faster-whisper-small.en` is the default production choice for
+technical dictation quality. `Systran/faster-whisper-base.en` uses less memory
+and returns sooner at the measured cost of more changed words. Setup installs
+both under `$XDG_DATA_HOME/voiced/models/Systran/`, or under
+`~/.local/share/voiced/models/Systran/` when `XDG_DATA_HOME` is unset.
+
+`--model-residency session` is the default: model loading and one silent warm-up
+start alongside capture, so ordinary dictation hides most startup work.
+`--model-residency service` requires the model to be ready before capture. The
+one-session spike then shuts it down with the command; the future long-running
+service keeps that same ready worker across recordings.
+
+The model worker reuses its loaded model for every sealed slot. Each mailbox
+commit includes the audio-activity observation and Whisper confidence values
+used to accept its text. Inactive
+chunks with no-speech probability at least 0.60 become a normal `no_speech`
+result. Any disagreement between activity and model confidence fails explicitly
+instead of publishing a likely hallucination or silently discarding possible
+quiet speech. It accepts the same
+`--device-serial`, low-level `--target`, and `--main-loop` source controls as the
+audio experiment. Capture setup, sample-progress, teardown, session, inference,
+and worker-exit deadlines belong to the epoll supervisor rather than either
+worker.
+
+Model-ready and result packets already carry nanosecond timings as structured
+fields. The supervisor aggregates worker startup, model load, warm-up, feature
+extraction, and inference totals and maxima into `SessionTimingReport`, together
+with audio-start-to-finish and audio-finish-to-session-completion durations.
+Console output is only a rendering of that report; later persistence and control
+responses can consume the structured value directly.
 
 ReleaseSafe is the production policy. It retains `std.debug.assert`, overflow,
 bounds, enum, and other Zig runtime-safety checks around trusted lifecycle and
@@ -153,6 +195,28 @@ publication occupied for a controlled interval, simulating a slow model process
 and eventually producing `pipeline_full` when all three slots remain
 unavailable.
 
+The activity lines in the final report come from the adaptive volume detector
+that drives natural chunking and optional automatic stop. It calibrates the
+first 300 ms, then reports active and quiet sample counts, run lengths, the
+learned noise floor, and its hysteresis thresholds. `audio_policy.zig` fixes the
+production policy at a 30-second slot capacity, a 20-second internal minimum, a
+natural boundary after 300 ms of quiet, and automatic stop after 800 ms of quiet.
+
+Capture publishes a natural boundary only after the current slot contains at
+least 20 seconds. `--listen` arms automatic stop only after activity has been
+observed, so an idle microphone still reaches the explicit duration limit. When
+a 300 ms boundary starts Whisper early and the same quiet run reaches 800 ms,
+the worker discards the private 500 ms confirmation tail rather than sending a
+second silence-only chunk to Whisper. Explicit `--slot-seconds` values below 20
+remain fixed experimental boundaries for pipeline-pressure tests.
+
+Forced 30-second boundaries currently use no PCM overlap. A 250–500 ms overlap
+recovered one deliberately divided word, but broader cuts added more word errors
+than they removed, including on dense speech designed to force the boundary.
+Voiced therefore keeps the simpler independent chunks until timestamp-aware
+reconciliation or stronger evidence can prevent overlap from deleting or
+repeating dictated words.
+
 Neither the requested node nor the discovery result is trusted as the source
 identity. PipeWire represents
 one capture as a source-node Link into Voiced's stream node, and WirePlumber can
@@ -165,10 +229,11 @@ source belongs to a device. That stable device serial survives the unplug/replug
 case tested with the MV7; PipeWire IDs and object serials do not.
 
 The audio worker rejects callback blocks larger than 100 ms and rejects NaN or
-infinite float32 samples before publication. It clamps finite samples to
-PipeWire's normalized `[-1.0, +1.0]` range and reports the number clipped, so an
-overbearing source cannot overflow Whisper's spectral calculations. These
-checks keep validation and copying bounded on PipeWire's realtime thread.
+infinite PipeWire samples before publication. It clamps finite samples to
+PipeWire's normalized `[-1.0, +1.0]` range, reports the number clipped, and
+quantizes them directly into the shared signed 16-bit slot. These checks keep
+validation and conversion bounded on PipeWire's realtime thread; no second
+float PCM block is retained.
 
 Before capture, the worker touches every shared-exchange page and attempts to
 lock the complete mapping in memory. Locking is best effort: failure does not
@@ -189,11 +254,31 @@ valid audio-converter stream.
 PipeWire 1.0.5 adds the per-buffer timestamp needed for full timeline
 validation. When both the build headers and loaded library provide it, Voiced
 also compares every buffer's cycle with the graph clock and received sample
-duration. A skipped or duplicated interval then stops capture while retaining
-the valid prefix, even without a Header warning. Older builds continue in
-`header-only` mode and print a warning that some dropped intervals cannot be
-detected. Every successful report names the build-header, client-library, and
-server versions plus the selected validation mode.
+duration. Graph time advancing beyond the duration represented by received
+samples then stops capture while retaining the valid prefix, even without a
+Header warning. PipeWire may combine multiple ready graph quanta in one buffer;
+the validator accepts that longer block because `pw_buffer.time` identifies its
+queue cycle rather than the first contained sample. Older builds continue in
+`header-only` mode. The worker publishes that already-resolved capability before
+the first callback, so the supervisor warns once when capture starts without
+parsing the PipeWire version again. Every successful report names the
+build-header, client-library, and server versions plus the selected validation
+mode.
+
+The three shared signed 16-bit PCM slots occupy about 2.75 MiB in total
+regardless of recording length: consumed slots are reused rather than retaining
+the complete recording.
+The supervisor allocates the session transcript once at 64 UTF-8 bytes per
+configured audio second plus one 4 KiB result. The extra 4 KiB guarantees that
+one maximum-sized mailbox result fits beyond the duration-based budget. The
+one-hour default reserves about 229 KiB; the natural `u16` duration ceiling
+reserves about 4 MiB. At the one-hour default, the audio exchange, transcript
+mailbox, and aggregate transcript together occupy about 2.98 MiB of fixed
+recording/session storage, excluding the Whisper model and ordinary process or
+library overhead. If accepted model output exceeds this fixed capacity, the
+supervisor reports `transcript_capacity_exceeded` and discards the session
+instead of reallocating or truncating text. Allocation failure remains an
+ordinary session-start failure.
 
 The parent requires the first copied samples within three seconds and continued
 sample progress at least every two seconds. It uses kernel parent-death signaling
@@ -214,15 +299,19 @@ Transcribe either that recording or the checked-in fixture:
 
 ```bash
 ./zig-out/bin/model-spike \
-  --model ~/.local/share/voiced/models/faster-whisper-small.en \
+  --model ~/.local/share/voiced/models/Systran/faster-whisper-small.en \
   --audio ../test-fixtures/hello_world.wav \
   --threads 4 \
+  --beam-size 1 \
   --runs 3
 ```
 
-`--threads` defaults to 4. `--runs` defaults to 3 and must be an odd number
-between 1 and 9. `setup-models` installs under `$XDG_DATA_HOME/voiced/models`
-when `XDG_DATA_HOME` is set; otherwise it uses `~/.local/share/voiced/models`.
+`--threads` defaults to 4. `--beam-size` defaults to the selected greedy value
+of 1 and accepts 1 through 16 so decoding policy can be measured without
+rebuilding. `--runs` defaults to 3 and must be an odd number between 1 and 9.
+`--input-gain <0-1>` scales the signed 16-bit fixture in place before feature
+extraction. Unlike the supervisor's named-model option, this measurement binary
+deliberately accepts a model directory so it can probe uninstalled conversions.
 
 `-Dmkl-prefix=/path/to/prefix` overrides the downloaded
 `zig-pkg/mkl` installation. The prefix must contain `include/`,

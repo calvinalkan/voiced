@@ -66,7 +66,7 @@ const RepositoryCppCompilePolicy = struct {
 //                        └──────────────────────────────┘
 //
 // `zig build` only compiles and installs the binary. `setup-native` downloads
-// MKL/OpenMP build inputs, `setup-models` downloads the runtime model, and
+// MKL/OpenMP build inputs, `setup-models` downloads the runtime models, and
 // `setup` performs both explicitly. `update-compile-flags` writes clangd's
 // checked-in C++ flags to compile_flags.txt so Zed can pick them up for the LSP.
 fn add_default_build_command(b: *std.Build) void {
@@ -147,6 +147,15 @@ fn add_default_build_command(b: *std.Build) void {
         "-DMKL_ILP64",
         "-DSTACK_LINE_READER_BUFFER_SIZE=1024",
         "-fopenmp",
+
+        // ReleaseSafe instruments C and C++ undefined behavior as well as Zig.
+        // CTranslate2 4.6.2 contains unchecked nullable reference paths that its
+        // normal optimized build relies on never taking; the instrumentation
+        // nevertheless evaluates those paths inside native worker threads and
+        // aborts valid Whisper inference. Keep ReleaseSafe for repository-owned
+        // Zig and boundary code, but compile this pinned upstream library with
+        // the native release assumptions under which it is supported.
+        "-fno-sanitize=undefined",
     };
 
     // This list is the CPU-only `SOURCES` list from the pinned CTranslate2
@@ -284,6 +293,14 @@ fn add_default_build_command(b: *std.Build) void {
         "-std=c99",
         "-DCT2_X86_BUILD",
         "-DSTACK_LINE_READER_BUFFER_SIZE=1024",
+
+        // cpu_features compares its four-byte vendor constants through pointers
+        // that may originate at an unaligned string-literal address. x86 permits
+        // the load, but Zig's ReleaseSafe alignment instrumentation traps before
+        // feature detection can run. Disable only that check for this pinned
+        // upstream C source; voiced's Zig assertions and runtime safety remain
+        // active, and the detector still runs before any dispatched AVX kernel.
+        "-fno-sanitize=alignment",
     };
     // This is cpu_features' portable implementation set. Platform macros make
     // only the Linux x86 implementation provide this target's feature probes;
@@ -482,7 +499,28 @@ fn add_default_build_command(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    voiced.root_module.addImport("models", b.createModule(.{
+        .root_source_file = b.path("src/models.zig"),
+    }));
     configurePipeWireArtifact(b, voiced);
+
+    // The production role launcher contains the same resident model runtime as
+    // `model-spike`. The transcription child reaches these objects only after
+    // the supervisor selects its private model role, while the audio child
+    // continues to use only the PipeWire portion of the executable.
+    voiced.root_module.linkLibrary(ctranslate2_library);
+    voiced.root_module.addObjectFile(c_boundary.getEmittedBin());
+    voiced.root_module.addObjectFile(avx_kernel.getEmittedBin());
+    voiced.root_module.addObjectFile(avx2_kernel.getEmittedBin());
+    voiced.root_module.addObjectFile(avx512_kernel.getEmittedBin());
+    voiced.root_module.addObjectFile(mkl_libraries.path(b, "libmkl_intel_ilp64.a"));
+    voiced.root_module.addObjectFile(mkl_libraries.path(b, "libmkl_intel_thread.a"));
+    voiced.root_module.addObjectFile(mkl_libraries.path(b, "libmkl_core.a"));
+    voiced.root_module.addObjectFile(mkl_libraries.path(b, "libiomp5.a"));
+    voiced.root_module.linkSystemLibrary("dl", .{});
+    voiced.root_module.linkSystemLibrary("m", .{});
+    voiced.root_module.linkSystemLibrary("pthread", .{});
+    voiced.root_module.link_libcpp = true;
 
     // Installation copies the executables to `zig-out/bin`. No artifact is
     // attached to a run step, so a normal build never records or transcribes.
@@ -617,6 +655,9 @@ fn add_setup_tool(b: *std.Build) *std.Build.Step.Compile {
             .optimize = .ReleaseSafe,
         }),
     });
+    setup_tool.root_module.addImport("models", b.createModule(.{
+        .root_source_file = b.path("src/models.zig"),
+    }));
 
     // This pure-Zig host tool does not need LLVM code generation. The native
     // backend avoids a long cold compile before the first dependency download.
@@ -646,15 +687,15 @@ fn add_setup_models_command(
     b: *std.Build,
     setup_tool: *std.Build.Step.Compile,
 ) void {
-    // The model is runtime data under the user's XDG data directory, never a
-    // build input or an implicit network dependency of the installed binary.
+    // Models are runtime data under the user's XDG data directory, never build
+    // inputs or implicit network dependencies of the installed binary.
     const run_setup_models = b.addRunArtifact(setup_tool);
     run_setup_models.addArg("models");
     run_setup_models.setCwd(b.path(""));
 
     const setup_models = b.step(
         "setup-models",
-        "Download and verify the CTranslate2 Whisper small.en model",
+        "Download and verify the named CTranslate2 Whisper models",
     );
     setup_models.dependOn(&run_setup_models.step);
 }
@@ -671,7 +712,7 @@ fn add_setup_all_command(
 
     const setup_all = b.step(
         "setup",
-        "Download and verify native dependencies and the CTranslate2 model",
+        "Download and verify native dependencies and CTranslate2 models",
     );
     setup_all.dependOn(&run_setup_all.step);
 }

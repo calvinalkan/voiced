@@ -6,8 +6,9 @@
 //! `pipewire.run` operation.
 
 const std = @import("std");
-const pipewire = @import("pipewire.zig");
 const audio_exchange = @import("audio_exchange.zig");
+const audio_policy = @import("audio_policy.zig");
+const pipewire = @import("pipewire.zig");
 const descriptor_handoff = @import("descriptor_handoff.zig");
 const assert = std.debug.assert;
 const stderr = std.debug.print;
@@ -22,6 +23,7 @@ const worker_error_message_capacity = pipewire.setup_error_message_capacity;
 // These are process-contract vocabulary, re-exported so callers never need to
 // import the worker-private PipeWire or exchange modules.
 pub const ControlCommand = pipewire.ControlCommand;
+pub const AutomaticStop = pipewire.AutomaticStop;
 pub const Outcome = pipewire.Outcome;
 pub const FailureOutcome = pipewire.FailureOutcome;
 pub const TimelineValidation = pipewire.TimelineValidation;
@@ -65,6 +67,12 @@ pub const FailureDomain = pipewire.FailureDomain;
 pub const sample_rate_hz = audio_exchange.sample_rate_hz;
 pub const slots_count = audio_exchange.slots_count;
 pub const slot_duration_seconds_max = audio_exchange.slot_duration_seconds_max;
+pub const internal_chunk_duration_seconds_min =
+    audio_policy.internal_chunk_duration_seconds_min;
+pub const natural_boundary_quiet_duration_ms =
+    audio_policy.natural_boundary_quiet_duration_ms;
+pub const automatic_stop_quiet_duration_ms =
+    audio_policy.automatic_stop_quiet_duration_ms;
 pub const callback_samples_count_max = audio_exchange.callback_samples_count_max;
 pub const target_name_bytes_capacity = target_name_capacity;
 pub const audio_exchange_size = @sizeOf(AudioExchange);
@@ -77,8 +85,24 @@ pub const StartOptions = struct {
     source: Source,
     recording_samples_target: u32,
     slot_samples_boundary: u32,
+    automatic_stop: AutomaticStop = .disabled,
     consumer_delay_ms: u32,
     process_realtime: bool,
+};
+
+const WireActivityReport = extern struct {
+    activity: u32,
+    activity_samples_count: u32,
+    observed_samples_count: u32,
+    unknown_samples_count: u32,
+    quiet_samples_count: u32,
+    active_samples_count: u32,
+    changes_count: u32,
+    active_run_samples_count_max: u32,
+    quiet_run_samples_count_max: u32,
+    noise_floor_rms: f32,
+    quiet_threshold_rms: f32,
+    active_threshold_rms: f32,
 };
 
 /// The fixed process report is intentionally value-only: every string owns a
@@ -146,6 +170,7 @@ const WireReport = extern struct {
     block_samples_count_max: u32,
     callback_duration_ns_max: u64,
     callback_gap_ns_max: u64,
+    activity: WireActivityReport,
 
     error_message: [worker_error_message_capacity]u8,
     teardown_error_message: [worker_error_message_capacity]u8,
@@ -157,7 +182,7 @@ pub const Result = union(enum) {
     setup_failed: SetupFailure,
     captured: struct {
         report: CaptureReport,
-        samples: []const f32,
+        samples: []const i16,
         slots_consumed_before_final_report: u32,
     },
 };
@@ -212,6 +237,8 @@ pub const CallbackSamplesRange = struct {
     maximum: u32,
 };
 
+pub const ActivityReport = pipewire.ActivityReport;
+
 pub const CallbackObservation = struct {
     thread_id: i32,
     scheduler_policy: ?i32,
@@ -225,6 +252,7 @@ pub const CallbackObservation = struct {
     samples_range: ?CallbackSamplesRange,
     duration_ns_max: u64,
     gap_ns_max: u64,
+    activity: ActivityReport,
 };
 
 pub const CaptureFailure = struct {
@@ -234,6 +262,7 @@ pub const CaptureFailure = struct {
 
 pub const CaptureEnd = union(enum) {
     completed,
+    automatic_stop,
     stopped,
     cancelled,
     failed: CaptureFailure,
@@ -313,13 +342,14 @@ pub const main = workerMain;
 /// plus publication eventfd in one launch message. The worker returns the same
 /// structured final report already proven by the standalone audio process.
 pub const PipeWireWorker = struct {
-    pub const protocol_version: u16 = 2;
+    pub const protocol_version: u16 = 3;
 
     pub const LaunchOptions = struct {
         session_id: u64,
         source: Source,
         recording_samples_target: u32,
         slot_samples_boundary: u32,
+        automatic_stop: AutomaticStop,
         process_realtime: bool,
     };
 
@@ -329,8 +359,10 @@ pub const PipeWireWorker = struct {
         session_id: u64,
         recording_samples_target: u32,
         slot_samples_boundary: u32,
+        automatic_stop: u8,
         process_realtime: u8,
         source_kind: u8,
+        reserved_2: u8,
         source_size: u16,
         source: [target_name_capacity]u8,
     };
@@ -349,7 +381,8 @@ pub const PipeWireWorker = struct {
         assert(publication_event_fd >= 0);
         assert(options.session_id > 0);
         assert(options.recording_samples_target > 0);
-        assert(options.recording_samples_target <= 90 * audio_exchange.sample_rate_hz);
+        assert(options.recording_samples_target <=
+            std.math.maxInt(u32) - audio_exchange.callback_samples_count_max);
         assert(options.slot_samples_boundary >= audio_exchange.callback_samples_count_max);
         assert(options.slot_samples_boundary <= audio_exchange.slot_samples_capacity);
         switch (options.source) {
@@ -399,6 +432,7 @@ pub const PipeWireWorker = struct {
         const outcome: Outcome = @enumFromInt(report.outcome);
         const end: CaptureEnd = switch (outcome) {
             .completed => .completed,
+            .automatic_stop => .automatic_stop,
             .stopped => .stopped,
             .cancelled => .cancelled,
             else => .{ .failed = .{
@@ -467,6 +501,20 @@ pub const PipeWireWorker = struct {
                     },
                 .duration_ns_max = report.callback_duration_ns_max,
                 .gap_ns_max = report.callback_gap_ns_max,
+                .activity = .{
+                    .activity = @enumFromInt(report.activity.activity),
+                    .activity_samples_count = report.activity.activity_samples_count,
+                    .observed_samples_count = report.activity.observed_samples_count,
+                    .unknown_samples_count = report.activity.unknown_samples_count,
+                    .quiet_samples_count = report.activity.quiet_samples_count,
+                    .active_samples_count = report.activity.active_samples_count,
+                    .activity_changes_count = report.activity.changes_count,
+                    .active_run_samples_count_max = report.activity.active_run_samples_count_max,
+                    .quiet_run_samples_count_max = report.activity.quiet_run_samples_count_max,
+                    .noise_floor_rms = report.activity.noise_floor_rms,
+                    .quiet_threshold_rms = report.activity.quiet_threshold_rms,
+                    .active_threshold_rms = report.activity.active_threshold_rms,
+                },
             };
         const memory_lock: MemoryLockResult = if (report.shared_memory_is_locked == 1)
             .{ .locked = report.shared_memory_lock_limit_bytes }
@@ -569,6 +617,7 @@ pub const PipeWireWorker = struct {
         launch_packet.session_id = options.session_id;
         launch_packet.recording_samples_target = options.recording_samples_target;
         launch_packet.slot_samples_boundary = options.slot_samples_boundary;
+        launch_packet.automatic_stop = @intFromEnum(options.automatic_stop);
         launch_packet.process_realtime = @intFromBool(options.process_realtime);
         launch_packet.source_kind = @intFromEnum(std.meta.activeTag(options.source));
         switch (options.source) {
@@ -586,10 +635,13 @@ pub const PipeWireWorker = struct {
         assert(wire.reserved == 0);
         assert(wire.session_id > 0);
         assert(wire.recording_samples_target > 0);
-        assert(wire.recording_samples_target <= 90 * audio_exchange.sample_rate_hz);
+        assert(wire.recording_samples_target <=
+            std.math.maxInt(u32) - audio_exchange.callback_samples_count_max);
         assert(wire.slot_samples_boundary >= audio_exchange.callback_samples_count_max);
         assert(wire.slot_samples_boundary <= audio_exchange.slot_samples_capacity);
+        assert(wire.automatic_stop <= @intFromEnum(AutomaticStop.after_quiet));
         assert(wire.process_realtime <= 1);
+        assert(wire.reserved_2 == 0);
         assert(wire.source_size < wire.source.len);
         assert(std.mem.indexOfScalar(u8, wire.source[0..wire.source_size], 0) == null);
         assert(wire.source[wire.source_size] == 0);
@@ -614,6 +666,7 @@ pub const PipeWireWorker = struct {
             .source = source,
             .recording_samples_target = wire.recording_samples_target,
             .slot_samples_boundary = wire.slot_samples_boundary,
+            .automatic_stop = @enumFromInt(wire.automatic_stop),
             .process_realtime = wire.process_realtime == 1,
         };
     }
@@ -748,9 +801,12 @@ pub const FakeWorker = struct {
 
             const fake_samples_count: u32 = audio_exchange.sample_rate_hz;
             for (writer.slot.samples[0..fake_samples_count], 0..) |*sample, sample_index| {
-                sample.* = @as(f32, @floatFromInt(sample_index % 100)) / 100.0;
+                sample.* = @intCast(sample_index % 100);
             }
-            audio_exchange.publishWrittenSlot(writer, fake_samples_count);
+            audio_exchange.publishWrittenSlot(writer, .{
+                .samples_count = fake_samples_count,
+                .contains_activity = true,
+            });
             writeFakePublicationEvent(shared_descriptors.values[1]);
 
             for (0..launch_packet.publication_interval_ms) |_| {
@@ -824,7 +880,7 @@ const PendingPublishedSlot = struct {
 };
 
 const PublishedAudioConsumer = struct {
-    samples: []f32,
+    samples: []i16,
     samples_count: usize,
     next_publication_ordinal: u32,
     pending: ?PendingPublishedSlot,
@@ -873,7 +929,8 @@ pub fn start(
 ) !*AudioProcess {
     assert(options.session_id > 0);
     assert(options.recording_samples_target > 0);
-    assert(options.recording_samples_target <= 90 * audio_exchange.sample_rate_hz);
+    assert(options.recording_samples_target <=
+        std.math.maxInt(u32) - audio_exchange.callback_samples_count_max);
     assert(options.slot_samples_boundary >= audio_exchange.callback_samples_count_max);
     assert(options.slot_samples_boundary <= audio_exchange.slot_samples_capacity);
     assert(options.consumer_delay_ms <= 10_000);
@@ -1020,6 +1077,7 @@ pub fn start(
         .source = options.source,
         .recording_samples_target = options.recording_samples_target,
         .slot_samples_boundary = options.slot_samples_boundary,
+        .automatic_stop = options.automatic_stop,
         .process_realtime = options.process_realtime,
     });
 
@@ -1027,6 +1085,7 @@ pub fn start(
     assert(launch_packet.recording_samples_target > 0);
     assert(launch_packet.slot_samples_boundary >= audio_exchange.callback_samples_count_max);
     assert(launch_packet.slot_samples_boundary <= audio_exchange.slot_samples_capacity);
+    assert(launch_packet.automatic_stop <= @intFromEnum(AutomaticStop.after_quiet));
     assert(launch_packet.process_realtime <= 1);
     assert(launch_packet.source_size < launch_packet.source.len);
     assert(launch_packet.source[launch_packet.source_size] == 0);
@@ -1034,7 +1093,7 @@ pub fn start(
 
     const samples_capacity = options.recording_samples_target +
         audio_exchange.callback_samples_count_max;
-    const samples = try init.gpa.alloc(f32, samples_capacity);
+    const samples = try init.gpa.alloc(i16, samples_capacity);
     errdefer init.gpa.free(samples);
 
     const supervision_started_ns = monotonicNanoseconds();
@@ -1451,6 +1510,10 @@ fn validateReportPacket(
     inline for (@typeInfo(pipewire.Outcome).@"enum".fields) |field| {
         if (report.outcome == field.value) outcome_is_valid = true;
     }
+    var activity_is_valid = false;
+    inline for (@typeInfo(pipewire.Activity).@"enum".fields) |field| {
+        if (report.activity.activity == field.value) activity_is_valid = true;
+    }
     var runtime_stage_is_valid = false;
     inline for (@typeInfo(pipewire.RuntimeErrorStage).@"enum".fields) |field| {
         if (report.runtime_error_stage == field.value) runtime_stage_is_valid = true;
@@ -1470,6 +1533,7 @@ fn validateReportPacket(
 
     assert(timeline_validation_is_valid);
     assert(outcome_is_valid);
+    assert(activity_is_valid);
     assert(runtime_stage_is_valid);
     assert(runtime_domain_is_valid);
     assert(teardown_stage_is_valid);
@@ -1493,7 +1557,7 @@ fn validateReportPacket(
     const runtime_domain: pipewire.ErrorDomain =
         @enumFromInt(report.runtime_error_domain);
     switch (outcome) {
-        .completed, .stopped, .cancelled => {
+        .completed, .automatic_stop, .stopped, .cancelled => {
             assert(runtime_stage == .none);
             assert(runtime_domain == .none);
             assert(report.runtime_error_code == 0);
@@ -1529,6 +1593,23 @@ fn validateReportPacket(
     assert(report.header_metadata_buffers_count <= report.callbacks_count);
     assert(report.header_gap_buffers_count <= report.header_metadata_buffers_count);
     assert(report.header_gap_samples_count <= report.samples_count);
+    assert(report.activity.observed_samples_count == report.samples_count);
+    assert(report.activity.observed_samples_count ==
+        report.activity.unknown_samples_count +
+            report.activity.quiet_samples_count +
+            report.activity.active_samples_count);
+    assert(report.activity.active_run_samples_count_max <=
+        report.activity.active_samples_count);
+    assert(report.activity.quiet_run_samples_count_max <=
+        report.activity.quiet_samples_count);
+    assert(std.math.isFinite(report.activity.noise_floor_rms));
+    assert(std.math.isFinite(report.activity.quiet_threshold_rms));
+    assert(std.math.isFinite(report.activity.active_threshold_rms));
+    assert(report.activity.noise_floor_rms >= 0);
+    assert(report.activity.quiet_threshold_rms >= 0.003);
+    assert(report.activity.active_threshold_rms >= 0.008);
+    assert(report.activity.quiet_threshold_rms <=
+        report.activity.active_threshold_rms);
     assert(report.callbacks_count == audio_exchange.acquireAudioCallbacksCount(exchange));
     assert(report.samples_count == audio_exchange.acquireAudioSamplesCount(exchange));
     if (report.callbacks_count == 0) {
@@ -1537,11 +1618,25 @@ fn validateReportPacket(
         assert(report.callback_thread_id > 0);
     }
     if (report.samples_count == 0) {
+        assert(report.activity.activity == @intFromEnum(pipewire.Activity.unknown));
+        assert(report.activity.activity_samples_count == 0);
         assert(report.published_samples_count == 0);
         assert(report.slot_publications_count == 0);
         assert(report.block_samples_count_min == 0);
         assert(report.block_samples_count_max == 0);
     } else {
+        assert(report.activity.activity_samples_count > 0);
+        if (report.activity.activity == @intFromEnum(pipewire.Activity.unknown)) {
+            assert(report.activity.activity_samples_count ==
+                report.activity.unknown_samples_count);
+        } else if (report.activity.activity == @intFromEnum(pipewire.Activity.quiet)) {
+            assert(report.activity.activity_samples_count <=
+                report.activity.quiet_samples_count);
+        } else {
+            assert(report.activity.activity == @intFromEnum(pipewire.Activity.active));
+            assert(report.activity.activity_samples_count <=
+                report.activity.active_samples_count);
+        }
         assert(report.source_is_resolved == 1);
         assert(report.callbacks_count > 0);
         assert(report.negotiated_sample_rate_hz == audio_exchange.sample_rate_hz);
@@ -1556,6 +1651,17 @@ fn validateReportPacket(
         .completed => {
             assert(report.samples_count >= launch.recording_samples_target);
             assert(report.published_samples_count == report.samples_count);
+        },
+        .automatic_stop => {
+            assert(launch.automatic_stop == @intFromEnum(AutomaticStop.after_quiet));
+            assert(report.samples_count < launch.recording_samples_target);
+            assert(report.activity.active_samples_count > 0);
+            assert(report.activity.activity == @intFromEnum(pipewire.Activity.quiet));
+            assert(report.activity.activity_samples_count >=
+                audio_policy.automatic_stop_quiet_samples_count);
+            assert(report.samples_count - report.published_samples_count <=
+                audio_policy.automatic_stop_quiet_samples_count +
+                    audio_exchange.callback_samples_count_max);
         },
         .stopped => assert(report.published_samples_count == report.samples_count),
         .cancelled => assert(report.samples_count - report.published_samples_count <=
@@ -1680,7 +1786,7 @@ fn runAudioWorkerSession(
     // initializes this trusted memfd. Repeat them here so the worker's launch
     // assumptions are visible without following an assertion helper.
     assert(mapped_exchange.exchange.version == audio_exchange.format_version);
-    assert(mapped_exchange.exchange.reserved == 0);
+    assert(mapped_exchange.exchange.timeline_validation_atomic == 0);
     assert(mapped_exchange.exchange.session_id == launch.session_id);
     assert(mapped_exchange.exchange.audio_callbacks_count_atomic == 0);
     assert(mapped_exchange.exchange.audio_samples_count_atomic == 0);
@@ -1701,6 +1807,7 @@ fn runAudioWorkerSession(
         .source = launch.source,
         .recording_samples_target = launch.recording_samples_target,
         .slot_samples_boundary = launch.slot_samples_boundary,
+        .automatic_stop = launch.automatic_stop,
         .process_realtime = launch.process_realtime,
     });
 
@@ -1708,11 +1815,12 @@ fn runAudioWorkerSession(
     switch (worker_result) {
         .captured => |capture| {
             const capture_failure: ?pipewire.RuntimeFailure = switch (capture.end) {
-                .completed, .stopped, .cancelled => null,
+                .completed, .automatic_stop, .stopped, .cancelled => null,
                 .failed => |failure| failure.detail,
             };
             const outcome: pipewire.Outcome = switch (capture.end) {
                 .completed => .completed,
+                .automatic_stop => .automatic_stop,
                 .stopped => .stopped,
                 .cancelled => .cancelled,
                 .failed => |failure| @enumFromInt(@intFromEnum(failure.outcome)),
@@ -1826,6 +1934,20 @@ fn runAudioWorkerSession(
                     0,
                 .callback_duration_ns_max = if (callback) |value| value.duration_ns_max else 0,
                 .callback_gap_ns_max = if (callback) |value| value.gap_ns_max else 0,
+                .activity = if (callback) |value| value.activity else ActivityReport{
+                    .activity = .unknown,
+                    .activity_samples_count = 0,
+                    .observed_samples_count = 0,
+                    .unknown_samples_count = 0,
+                    .quiet_samples_count = 0,
+                    .active_samples_count = 0,
+                    .activity_changes_count = 0,
+                    .active_run_samples_count_max = 0,
+                    .quiet_run_samples_count_max = 0,
+                    .noise_floor_rms = 0,
+                    .quiet_threshold_rms = 0.003,
+                    .active_threshold_rms = 0.008,
+                },
             };
             assert(worker_succeeded.error_message_size <= worker_succeeded.error_message.len);
             assert(worker_succeeded.teardown_error_message_size <=
@@ -1850,7 +1972,7 @@ fn runAudioWorkerSession(
                 assert(worker_succeeded.source_identity.is_resolved);
             }
             switch (worker_succeeded.outcome) {
-                .completed, .stopped, .cancelled => {
+                .completed, .automatic_stop, .stopped, .cancelled => {
                     assert(worker_succeeded.runtime_error.stage == .none);
                     assert(worker_succeeded.runtime_error.domain == .none);
                     assert(worker_succeeded.runtime_error.code == 0);
@@ -1992,6 +2114,20 @@ fn runAudioWorkerSession(
             report_packet.block_samples_count_max = worker_succeeded.block_samples_count_max;
             report_packet.callback_duration_ns_max = worker_succeeded.callback_duration_ns_max;
             report_packet.callback_gap_ns_max = worker_succeeded.callback_gap_ns_max;
+            report_packet.activity = .{
+                .activity = @intFromEnum(worker_succeeded.activity.activity),
+                .activity_samples_count = worker_succeeded.activity.activity_samples_count,
+                .observed_samples_count = worker_succeeded.activity.observed_samples_count,
+                .unknown_samples_count = worker_succeeded.activity.unknown_samples_count,
+                .quiet_samples_count = worker_succeeded.activity.quiet_samples_count,
+                .active_samples_count = worker_succeeded.activity.active_samples_count,
+                .changes_count = worker_succeeded.activity.activity_changes_count,
+                .active_run_samples_count_max = worker_succeeded.activity.active_run_samples_count_max,
+                .quiet_run_samples_count_max = worker_succeeded.activity.quiet_run_samples_count_max,
+                .noise_floor_rms = worker_succeeded.activity.noise_floor_rms,
+                .quiet_threshold_rms = worker_succeeded.activity.quiet_threshold_rms,
+                .active_threshold_rms = worker_succeeded.activity.active_threshold_rms,
+            };
         },
         .setup_failed => |setup_error| {
             assert(setup_error.message_size > 0);

@@ -7,12 +7,13 @@ Here is the merged, current master list. It supersedes the older status list.
 - CTranslate2 4.6.2 selected.
 - CTranslate2, cpu_features, and spdlog compiled through Zig.
 - Verified oneMKL/OpenMP downloads.
-- Verified and atomic `small.en` model installation.
+- Verified and atomic installation of named Systran `base.en` and `small.en` models.
 - Model source revision and file digests pinned.
 - Model fixture quality and performance measured.
 - Build produces binaries without running fixtures.
 
-The model **backend** is proven; the resident model worker is not yet implemented.
+The model backend and one-session resident worker are proven. Retaining that
+worker across multiple supervisor sessions remains open.
 
 ---
 
@@ -89,7 +90,12 @@ Full validation is implemented using:
 - received sample duration;
 - integer duration comparison with bounded rounding tolerance.
 
-It detected dropped cycles under worker pauses and CPU pressure while retaining the valid prefix.
+It detects graph time that advances farther than the received samples can
+cover, retaining the valid prefix. PipeWire may legitimately combine multiple
+ready graph quanta into one dequeued block; because `pw_buffer.time` identifies
+the cycle that queued the combined buffer rather than its first sample, a block
+whose sample duration exceeds its timestamp delta is accepted rather than
+misclassified as duplicated audio.
 
 ### PipeWire 0.3.48
 
@@ -318,8 +324,7 @@ graph interval.
 
 The one-binary process and event-loop boundary is implemented under
 `voiced supervisor-spike`. It supports deterministic roles for repeatable fault
-scenarios and the real PipeWire role with deterministic transcription. It now
-proves:
+scenarios and a real PipeWire-to-CTranslate2 path. It now proves:
 
 - one executable dispatching supervisor, audio, and transcription roles;
 - one epoll loop over role seqpackets, pidfds, timerfd, signalfd, and audio
@@ -346,7 +351,13 @@ proves:
 - pidfd-authoritative signaling and reaping without a second stored PID;
 - one tagged source choice instead of mutually exclusive target optionals;
 - four-byte transcription commands, transcription notifications, and fake-audio
-  notifications whose payload state remains authoritative in shared memory.
+  notifications whose payload state remains authoritative in shared memory;
+- one CTranslate2 model load and warm-up followed by repeated direct
+  shared-slot inference without a WAV intermediary;
+- bounded startup and inference diagnostics, including model load, log-Mel,
+  inference, no-speech, and average-log-probability observations;
+- ReleaseSafe repository code around upstream CTranslate2 and cpu_features
+  compiled with their supported native release assumptions.
 
 The reduced-state process suite completed fifty runs of each normal, burst,
 slow-consumer, crash-before-result, crash-after-result, repeated-crash, and hang
@@ -357,7 +368,6 @@ same count-based audio exchange and publication eventfd were installed.
 
 Still needed before this milestone is complete:
 
-- replace deterministic transcription with the resident CTranslate2 role;
 - retain the transcription process across more than one session;
 - add the public control socket and long-running idle/session loop;
 - implement normal-stop drain through final persistence/output rather than
@@ -386,46 +396,187 @@ These policies cannot be completed correctly inside the standalone audio spike.
 
 ---
 
-## 17. Resident eager Whisper worker — **open**
+## 17. Resident eager Whisper worker — **in progress**
+
+Implemented and measured:
+
+- one model load and warm-up per worker;
+- direct sealed-slot log-Mel extraction and CTranslate2 inference;
+- concurrent capture and sequential inference;
+- ordered fixed-mailbox publication;
+- cancellation publication race and forced process containment;
+- exact-slot retry after worker failure;
+- no WAV intermediary;
+- no-speech and average-log-probability observations;
+- explicit `session` and `service` residency policy at the session boundary;
+- structured startup, load, warm-up, feature, inference, audio, drain, and
+  complete-command timings.
 
 Still needed:
 
-- load and warm the model once;
-- consume sealed shared audio slots;
-- transcribe while recording continues;
-- preserve chunk order;
-- previous-text conditioning;
-- cooperative cancellation word;
-- inference deadline and forced worker kill;
-- bounded model restart/retry;
-- fixed transcript exchange;
-- no WAV intermediary.
+- retain one warmed worker across supervisor sessions;
+- separate end-session from service shutdown;
+- keep independent chunks unless timestamp-aware reconciliation makes forced overlap safe;
+- replace provisional startup and inference deadlines with measured policy.
 
-The current `model-spike` proves inference but reads a complete WAV and exits.
+A four-thread `small.en` worker loaded in about 430–650 ms, warmed in about
+0.9–1.5 seconds, and transcribed production-shaped chunks in about 0.9 seconds
+on the target machine. Seven fresh `base.en` production workers loaded in
+151–236 ms and completed their silent warm-up in 327–548 ms; evicting their
+model files from Linux's page cache moved load to 222–300 ms. A separate
+first-call probe measured roughly 456 ms for the first real inference versus
+405 ms once warm, with about 289 MiB peak RSS. Session warm-up is therefore
+usually hidden after roughly 0.6–0.8 seconds of base-model speech, while service
+residency removes it before capture.
+
+The `small.en` worker retained roughly 403 MiB proportional set size when idle
+after inference and peaked near 675 MiB. Full equal-priority CPU saturation raised
+four-thread inference to 11.8–15.2 seconds and made the current 10-second
+inference deadline too short.
+
+A subsequent native bridge sweep compared `base.en` and `small.en`, beam sizes
+one and five, and one through sixteen CPU threads. On the six quality fixtures,
+`small.en` beam one retained every normalized word produced by beam five while
+reducing four-thread inference by roughly 8–17%. `base.en` beam one finished in
+0.30–0.47 seconds instead of `small.en`'s 0.90–1.45 seconds and reduced peak RSS
+from about 660 MiB to 290 MiB, but changed `letters` to `data` in the original
+paragraph and changed six of 27 normalized words in the numbers fixture even
+though it retained the required numeric values.
+
+On a representative ten-second final chunk, idle beam-one timings were:
+
+```text
+threads          1       2       4       8      16
+base.en        933     515     348     268     370 ms
+small.en      3122    1751    1128     856    1089 ms
+```
+
+Eight threads won only on an idle host. Under equal-priority saturation of every
+logical CPU, `base.en` medians were 1.63, 1.72, 1.77, and 8.69 seconds for one,
+two, four, and eight threads respectively. Four remains the balanced default;
+beam one is now the selected production decoding policy, while choosing
+`base.en` instead of `small.en` remains an explicit
+latency-versus-dictation-quality decision.
 
 ---
 
-## 18. Chunking and capacity measurements — **open**
+## 18. Chunking and capacity measurements — **in progress**
 
-Provisional policy:
+Selected policy, defined as named constants in `audio_policy.zig`:
 
 ```text
-before 20 seconds   keep filling
-20–28 seconds       prefer silence
-at 30 seconds       force boundary
+physical slot capacity       30 seconds
+minimum internal chunk       20 seconds
+natural boundary candidate   300 ms quiet
+forced boundary              30 seconds
+automatic stop               800 ms quiet
 ```
+
+Measured findings:
+
+- three slots have large headroom at a 20-second boundary: one 20-second chunk
+  took about 0.86 seconds to transcribe;
+- artificial one-second chunks took about 0.9 seconds each, and a model restart
+  filled all three slots before recovery;
+- a silence boundary at 20.03 seconds preserved every word in the paragraph
+  fixture, while a hard 20.30-second split removed the divided word;
+- a forced experimental split at 20.30 seconds dropped `Echo`, and 250–500 ms
+  overlap restored it. Broader probes rejected overlap: both durations added
+  more word errors than they removed, and on dense speech a zero-overlap
+  30-second split retained every reference word while 250 ms lost one and
+  500 ms changed three;
+- a final 43 ms silent slot produced the hallucination `you`;
+- no-speech scores separated the current speech fixtures (0.005–0.656) from
+  silence and generated noise (0.828–0.944), but a steady tone scored 0.781 and
+  faster-whisper's combined default confidence rule did not reject several
+  high-confidence silence hallucinations;
+- four threads balanced steady-state speed and contention behavior; eight were
+  faster on an idle host but substantially slower under full CPU contention;
+- an adaptive volume detector runs inside the realtime callback. It calibrates
+  300 ms of background, applies separate active and quiet RMS thresholds,
+  reports bounded session measurements, publishes 20-second-minimum chunks
+  after 300 ms of quiet, and optionally stops after activity followed by 800 ms
+  of quiet;
+- the first purely relative detector was rejected because quiet startup noise
+  falsely started activity and repeatedly reset silence. Absolute RMS floors
+  removed those failures on the MV7 ambient recording while still detecting a
+  replay attenuated to roughly ten percent of the speech fixture. A replay
+  attenuated to roughly two percent fell below the floor, and sustained sound
+  remains indistinguishable from speech by volume alone;
+- ReleaseSafe observation left the measured callback maximum at 15–17 µs on
+  ambient and replayed audio, within the pre-detector measurements;
+- a tempo-preserving stretch expanded the 24.3-second paragraph fixture to 30
+  seconds without changing its whole-window transcript. The exact native bridge
+  measured 1.56 seconds for that whole window, 2.52 seconds of total work with a
+  fixed 20-second split, and 3.30 seconds with fixed 10-second splits. Because
+  earlier chunks complete during capture, simulated stop latency fell only from
+  1.56 to 1.19 and 1.17 seconds respectively;
+- fixed 10-second cuts changed about 5.2% of the stretched paragraph's words and
+  7.5% of a 30-second composite dictation's words. Fixed 20-second cuts retained
+  every paragraph word but changed 3.8% of the composite words. Aligning a
+  20-second-minimum boundary to 300 ms of observed quiet retained every word in
+  both recordings, with only capitalization or punctuation changes;
+- 200, 300, and 500 ms quiet windows all retained every word with a 20-second
+  minimum in the broader same-model sweep. An 800 ms window found no useful
+  internal pause in the dense paragraph until 29.7 seconds and therefore hid
+  almost none of the final inference;
+- previous-text prompting did not rescue hard 10-second cuts and made one result
+  substantially worse. Chunks therefore remain independent unless a future
+  timestamp-aware design proves that it can reconcile overlap safely;
+- acceptance metadata now commits activity, no-speech probability, average log
+  probability, and text under the mailbox's one atomic publication. Inactive
+  chunks at or above 0.60 become normal `no_speech`; activity/model disagreement
+  and empty output after activity are structured failures. Silence, generated
+  noise, continuous and post-calibration tones, both named models, reportless
+  result recovery, and ordinary fake-worker scenarios exercised the policy.
+  Isolated PipeWire WAV replay accepted `Hello world, hello my agent` with both
+  named models, accepted the two-percent-volume replay, produced normal
+  `no_speech` for quiet non-speech, and produced a structured conflict for a
+  tone introduced after calibration;
+- the shared exchange now stores only signed 16-bit PCM, reducing its three
+  slots from 5.49 MiB to 2.75 MiB. Across twenty `small.en` float/int16 pairs
+  down to 0.5% fixture gain, eighteen produced identical normalized words; the
+  two differences restored `12th` from the full-volume result instead of `12`.
+  `base.en` matched nine of ten pairs at 2% and 0.5% gain, but changed several
+  words in the 0.5%-gain paragraph whose RMS was about -74 dBFS. Six noise/tone
+  pairs retained the same rejected text and stayed well above the no-speech
+  threshold. A complete PipeWire-to-Whisper int16 exchange returned the same
+  fixture transcript; ten live captures moved median/maximum callback time from
+  10/12 µs to 12/17 µs. Capture validates and quantizes PipeWire's F32 bytes
+  directly into the slot, and the log-Mel extractor converts int16 samples into
+  its reusable centered DFT workspace instead of allocating a separate float
+  waveform;
+- the three signed 16-bit PCM slots occupy about 2.75 MiB independent of
+  recording duration. Session transcript storage is allocated once on the heap
+  at 64 UTF-8 bytes per configured second plus one full 4 KiB mailbox result. The
+  one-hour default reserves about 229 KiB; with the 4 KiB mailbox, total fixed
+  recording/session storage is about 2.98 MiB before process and library
+  overhead. The `u16` duration ceiling of 65,535 seconds reserves about 4 MiB
+  for the transcript alone. A pitch-preserving synthetic speech sweep found
+  7.5–14.7 bytes/second on normal fixtures and 62.9 bytes/second only after a
+  4× speed-up had already caused repeated hallucinated text. The extra 4 KiB is
+  one complete result of headroom, not another sustained-rate allowance.
+  Exceeding the fixed aggregate capacity is a structured failure rather than an
+  assertion, allocation, or truncation.
+
+The selected timing policy is implemented. A natural publication starts model
+work at 300 ms of quiet; if automatic listening confirms the same pause at 800
+ms, capture discards the private confirmation tail instead of publishing a
+second silence-only chunk. Explicit experimental slot boundaries below 20
+seconds remain fixed for pressure testing.
 
 Still to determine:
 
-- silence detector and window;
-- forced-boundary overlap;
-- text deduplication;
-- whether three slots survive real inference load;
-- transcript capacity;
-- total-session capacity;
-- fifteen-minute stop behavior;
-- inference and cancellation deadlines;
-- actual stop-to-output latency.
+- whether the adaptive activity observations remain reliable across real quiet
+  speech, background noise, and other microphones;
+- whether a speech-specific VAD can replace explicit activity/model conflicts
+  without reintroducing silent hallucinations or dropping quiet speech;
+- whether timestamp-aware forced-boundary reconciliation ever beats independent
+  chunks on broader quality fixtures;
+- verification that the 4 KiB per-chunk mailbox covers maximum decoder output;
+- integration of the configurable one-hour default into the future service configuration;
+- inference, startup, and cancellation deadlines;
+- actual stop-to-output latency with a worker retained across sessions.
 
 ---
 
@@ -459,10 +610,11 @@ Still needed:
 
 # Recommended order from here
 
-1. Attach the resident Whisper worker and measure eager chunking against real
-   PipeWire publications.
-2. Retain that model worker across sessions and add the long-running control
-   loop.
+1. Validate the implemented activity policy across microphones and noisy rooms,
+   then choose the remaining resident-memory and deadline policies from the
+   measured worker results.
+2. Retain the model worker across sessions in
+   the long-running control loop.
 3. Add persistence, clipboard, CLI, and systemd operation.
 4. Perform final integration hardening.
 

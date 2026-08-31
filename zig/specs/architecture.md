@@ -116,8 +116,8 @@ phase. It does not invent a second lifecycle owner.
 
 ## Shared representation
 
-The initial eager design uses three audio slots with at most thirty seconds of
-float32 mono PCM per slot. Each slot carries a chunk ordinal and one atomic
+The eager design uses three audio slots with at most thirty seconds of signed
+16-bit mono PCM per slot. Each slot carries a chunk ordinal and one atomic
 published sample count. Zero exposes no complete payload; a positive count
 release-publishes the immutable prefix. Private audio and supervisor state name
 the filling and in-flight slots, so those states are not duplicated in shared

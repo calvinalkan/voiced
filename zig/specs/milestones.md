@@ -9,17 +9,15 @@ API.
 The ASR backend decision is complete. CTranslate2 4.6.2, compiled from source
 through `build.zig` and linked with static oneMKL and OpenMP, retained the
 current faster-whisper `small.en` fixture quality with the best measured latency
-and acceptable resident memory. Whisper.cpp and the other measured native
-backends remain rejected prototype evidence rather than configurable engines.
+and acceptable resident memory. The named Systran `base.en` variant remains an
+explicit lower-memory, lower-latency alternative to the default `small.en`.
+Whisper.cpp and the other measured native backends remain rejected prototype
+evidence rather than configurable engines.
 
-The remaining milestone work is:
-
-- select the converted `small.en` model source and digests for a separate,
-  atomic setup download; the daemon itself performs no implicit network access;
-- bind enough of PipeWire to select the configured MV7 source and capture 16 kHz
-  mono float32 PCM; and
-- confirm whether application-allocated PipeWire buffers help the callback path
-  without coupling retained recordings to PipeWire's cyclic pool.
+This milestone is complete. The setup command installs the pinned converted
+model atomically, PipeWire resolves and verifies the configured physical Device,
+and the callback copies bounded blocks into Voiced-owned shared slots rather
+than retaining PipeWire's cyclic buffers.
 
 ## 2. Supervisor and fake workers
 
@@ -35,10 +33,11 @@ The deterministic supervisor now establishes:
 - deferred process replacement without worker-incarnation tags; and
 - one session identity at the exchange boundary rather than in every slot.
 
-The remaining milestone work is the resident CTranslate2 role, long-running
-public service loop, and normal stop through persistence/output. Real PipeWire
-already replaces deterministic audio without changing this ownership model;
-the deterministic role remains for repeatable process failures.
+The real CTranslate2 role now replaces deterministic transcription without
+changing this ownership model. The remaining milestone work is retaining that
+warmed process across sessions, adding the long-running public service loop, and
+carrying normal stop through persistence and output. Deterministic roles remain
+for repeatable process failures.
 
 ## 3. Recoverable audio process
 
@@ -50,12 +49,22 @@ the deterministic role remains for repeatable process failures.
 
 ## 4. Resident eager Whisper process
 
-- Load and warm the model once.
-- Transcribe sealed chunks while audio fills another slot.
-- Measure and tune silence-preferred chunk boundaries.
-- Preserve previous-text context across chunks.
-- Implement cooperative cancellation and hard process deadlines.
-- Demonstrate bounded behavior when inference falls behind capture.
+One worker now loads and warms the model, transcribes sealed slots while capture
+continues, publishes fixed-mailbox text in order, and remains killable during a
+blocked native call. Measurements establish ample three-slot headroom at a
+20-second boundary and pipeline exhaustion under deliberately unsuitable
+one-second chunks plus model restart.
+
+The implemented production policy uses 30-second physical slots, waits at least
+20 seconds before publishing on 300 ms of quiet, forces publication at 30
+seconds, and ends automatic listening after observed activity followed by 800
+ms of quiet. If the natural boundary already published the utterance, the worker
+discards the remaining quiet confirmation tail. Activity and model confidence
+now suppress ordinary no-speech chunks and turn disagreement into a structured
+failure. Broader probes rejected both previous-text prompting and PCM overlap
+because they increased word errors. The remaining work is measured deadlines,
+cross-microphone validation, a possible speech-specific VAD, and retaining the
+warmed process across sessions.
 
 ## 5. Output and daily operation
 
@@ -79,18 +88,16 @@ the deterministic role remains for repeatable process failures.
 
 The implementation should answer these through prototypes or measurements:
 
-- Which exact converted CTranslate2 `small.en` artifact and digests should the
-  setup command install?
-- What chunk target, silence window, and hard maximum produce the best balance
-  of boundary quality and stop latency?
-- Do forced chunk boundaries require overlap and deduplication in real
-  dictation?
-- How many audio slots provide sufficient inference headroom on the target
-  machine? Three is the provisional starting point.
-- What transcript and total-session capacities are generous without hiding an
-  accidental runaway recording?
-- Can PipeWire reliably negotiate the desired 16 kHz mono float32 format on the
-  target desktop, or should the audio process own bounded conversion?
+- Can a speech-specific VAD reduce explicit activity/model conflicts without
+  publishing non-speech hallucinations or silently dropping quiet speech?
+- Can timestamp-aware boundary reconciliation outperform independent chunks on
+  broad quality fixtures? Text-only overlap and deduplication did not.
+- Should the roughly 403 MiB warmed model remain resident for the service's
+  whole lifetime, or unload after an idle interval?
+- Does the 4 KiB chunk mailbox cover the decoder's maximum output before the
+  duration-derived session allocation is treated as final?
+- What startup, inference, cancellation, and total-session deadlines preserve
+  useful work under CPU contention while containing a blocked worker?
 - Which output key sequence works consistently across the target applications?
 - Which exact public commands should remain from the Python CLI?
 - Which PipeWire revision or system version should be treated as the supported

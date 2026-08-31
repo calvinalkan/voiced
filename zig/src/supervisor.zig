@@ -12,6 +12,7 @@
 const std = @import("std");
 const audio_exchange = @import("audio_exchange.zig");
 const audio_process = @import("audio_process.zig");
+const models = @import("models");
 const transcription_process = @import("transcription_process.zig");
 const assert = std.debug.assert;
 const linux = std.os.linux;
@@ -19,7 +20,6 @@ const linux = std.os.linux;
 const AudioExchange = audio_exchange.AudioExchange;
 const TranscriptExchange = transcription_process.TranscriptExchange;
 
-const session_transcript_bytes_capacity: u32 = 4096;
 const epoll_events_count_max: u32 = 16;
 const session_id: u64 = 1;
 
@@ -33,11 +33,70 @@ pub const FakeScenario = enum {
     transcription_hang,
 };
 
+pub const ModelResidency = enum {
+    session,
+    service,
+};
+
+pub const ModelOptions = struct {
+    model: models.Model = models.default,
+    inference_threads_count: u32 = 4,
+    residency: ModelResidency = .session,
+};
+
+pub const ModelTimingReport = struct {
+    residency: ModelResidency,
+    workers_started_count: u32,
+    workers_ready_count: u32,
+    worker_start_to_ready_elapsed_ns_total: u64,
+    worker_start_to_ready_elapsed_ns_max: u64,
+    model_load_elapsed_ns_total: u64,
+    model_load_elapsed_ns_max: u64,
+    warmup_elapsed_ns_total: u64,
+    warmup_elapsed_ns_max: u64,
+    feature_extraction_elapsed_ns_total: u64,
+    feature_extraction_elapsed_ns_max: u64,
+    inference_elapsed_ns_total: u64,
+    inference_elapsed_ns_max: u64,
+    transcriptions_count: u32,
+};
+
+pub const AudioTimingReport = struct {
+    start_to_finish_elapsed_ns: u64,
+    finish_to_complete_elapsed_ns: u64,
+    callbacks_count: u64,
+    callback_duration_ns_max: u64,
+    callback_gap_ns_max: u64,
+};
+
+pub const SessionTimingReport = struct {
+    command_elapsed_ns: u64,
+    audio: ?AudioTimingReport,
+    model: ?ModelTimingReport,
+};
+
+pub const TranscriptionBackend = union(enum) {
+    fake,
+    model: ModelOptions,
+};
+
+pub const recording_duration_seconds_default: u16 = 60 * 60;
+pub const recording_duration_seconds_limit: u16 = std.math.maxInt(u16);
+
+comptime {
+    // The configured duration remains a u16, while the audio launch protocol
+    // carries its corresponding 16 kHz sample target in a u32.
+    assert(@as(u64, recording_duration_seconds_limit) *
+        audio_process.sample_rate_hz <= std.math.maxInt(u32));
+}
+
 pub const PipeWireOptions = struct {
     source: audio_process.Source = .default,
-    recording_seconds: u8 = 5,
-    slot_seconds: u8 = 1,
+    recording_seconds: u16 = recording_duration_seconds_default,
+    slot_seconds: u8 = audio_process.slot_duration_seconds_max,
+    automatic_stop: audio_process.AutomaticStop = .disabled,
     process_realtime: bool = true,
+    transcription: TranscriptionBackend = .fake,
 };
 
 const SessionConfiguration = union(enum) {
@@ -57,16 +116,36 @@ const EventSource = enum(u64) {
 
 const FinishReason = enum {
     audio_completed,
+    audio_automatic_stop,
     audio_stopped,
     pipeline_full,
     audio_failed_with_valid_prefix,
 };
 
-const DiscardReason = enum {
+const TranscriptionRejection = struct {
+    model: models.Model,
+    publication_ordinal: u32,
+    samples_count: u32,
+    contains_activity: bool,
+    no_speech_probability: f32,
+    average_log_probability: f32,
+};
+
+const TranscriptCapacityExceeded = struct {
+    publication_ordinal: u32,
+    bytes_capacity: u32,
+    bytes_committed: u32,
+    result_bytes_count: u32,
+};
+
+const DiscardReason = union(enum) {
     service_signal,
     audio_failed,
     transcription_failed,
     deadline,
+    transcript_capacity_exceeded: TranscriptCapacityExceeded,
+    speech_detection_conflict: TranscriptionRejection,
+    speech_unrecognized: TranscriptionRejection,
 };
 
 const SessionPhase = union(enum) {
@@ -156,6 +235,7 @@ const WorkAttempt = union(enum) {
 };
 
 const StartingTranscription = struct {
+    started_monotonic_ns: u64,
     deadline_monotonic_ns: u64,
     retry_work: ?TranscriptionWork,
 };
@@ -200,8 +280,20 @@ const TranscriptionState = union(enum) {
 
 const TranscriptProgress = struct {
     next_publication_ordinal: u32,
-    bytes: [session_transcript_bytes_capacity]u8,
+    accepted_chunks_count: u32,
+    no_speech_chunks_count: u32,
+    bytes: []u8,
     bytes_count: u32,
+};
+
+const TimingProgress = struct {
+    command_started_monotonic_ns: u64,
+    audio_started_monotonic_ns: ?u64,
+    audio_finished_monotonic_ns: ?u64,
+    audio_callbacks_count: u64,
+    audio_callback_duration_ns_max: u64,
+    audio_callback_gap_ns_max: u64,
+    model: ?ModelTimingReport,
 };
 
 const SharedMapping = struct {
@@ -233,18 +325,27 @@ const Supervisor = struct {
     session_deadline_monotonic_ns: u64,
 
     transcript: TranscriptProgress,
+    timing: TimingProgress,
 };
 
 /// `runFakeSession` drives deterministic workers through the same process,
 /// descriptor, exchange, deadline, and recovery boundaries used by real roles.
-pub fn runFakeSession(init: std.process.Init, scenario: FakeScenario) !void {
-    try runSession(init, .{ .fake = scenario });
+pub fn runFakeSession(
+    init: std.process.Init,
+    scenario: FakeScenario,
+) !SessionTimingReport {
+    return runSession(init, .{ .fake = scenario });
 }
 
-/// `runPipeWireSession` replaces only deterministic audio with the proven real
-/// PipeWire role. Fake transcription remains intentional here: this slice tests
-/// live capture under the new supervisor before CTranslate2 is attached.
-pub fn runPipeWireSession(init: std.process.Init, options: PipeWireOptions) !void {
+/// `runPipeWireSession` runs one real capture with deterministic or model
+/// transcription and returns the timing observations collected across workers.
+/// Service residency waits for model readiness before opening the microphone.
+/// Retaining that worker between calls still belongs to the long-running
+/// supervisor, which this one-session entry point does not yet implement.
+pub fn runPipeWireSession(
+    init: std.process.Init,
+    options: PipeWireOptions,
+) !SessionTimingReport {
     switch (options.source) {
         .default => {},
         .node_name, .device_serial => |source| {
@@ -253,16 +354,30 @@ pub fn runPipeWireSession(init: std.process.Init, options: PipeWireOptions) !voi
         },
     }
     assert(options.recording_seconds > 0);
-    assert(options.recording_seconds <= 90);
+    assert(options.recording_seconds <= recording_duration_seconds_limit);
     assert(options.slot_seconds > 0);
     assert(options.slot_seconds <= audio_process.slot_duration_seconds_max);
-    try runSession(init, .{ .pipewire = options });
+    switch (options.transcription) {
+        .fake => {},
+        .model => |model| {
+            assert(model.inference_threads_count > 0);
+            assert(model.inference_threads_count <=
+                transcription_process.inference_threads_count_max);
+        },
+    }
+    return runSession(init, .{ .pipewire = options });
 }
 
 /// `runSession` owns one bounded recording from worker launch through complete
 /// process reaping. It prints text only after the audio prefix has been drained
-/// in publication order and the transcription process has stopped.
-fn runSession(init: std.process.Init, configuration: SessionConfiguration) !void {
+/// in publication order and the transcription process has stopped, then returns
+/// the same pipeline timings as structured data.
+fn runSession(
+    init: std.process.Init,
+    configuration: SessionConfiguration,
+) !SessionTimingReport {
+    const command_started_monotonic_ns = monotonicNanoseconds();
+
     var signal_mask = std.posix.sigemptyset();
     std.posix.sigaddset(&signal_mask, .TERM);
     std.posix.sigaddset(&signal_mask, .INT);
@@ -311,6 +426,18 @@ fn runSession(init: std.process.Init, configuration: SessionConfiguration) !void
         session_id,
     );
 
+    // The exchange retains only three PCM slots regardless of session length.
+    // Text is the one session-sized value: reserve 64 UTF-8 bytes per configured
+    // audio second plus one complete 4 KiB mailbox result. The rate budget keeps
+    // the one-hour default near 229 KiB without depending on chunk frequency;
+    // the result reserve lets any one valid mailbox publication fit.
+    // Accepted text that exceeds the fixed budget ends the session explicitly
+    // instead of growing memory or silently truncating output.
+    const transcript_bytes_capacity = sessionTranscriptBytesCapacity(configuration);
+    const transcript_bytes = try init.gpa.alloc(u8, transcript_bytes_capacity);
+    defer init.gpa.free(transcript_bytes);
+    @memset(transcript_bytes, 0);
+
     var supervisor: Supervisor = .{
         .io = init.io,
         .audio = switch (configuration) {
@@ -333,18 +460,69 @@ fn runSession(init: std.process.Init, configuration: SessionConfiguration) !void
         .session_deadline_monotonic_ns = sessionDeadline(configuration),
         .transcript = .{
             .next_publication_ordinal = 0,
-            .bytes = @splat(0),
+            .accepted_chunks_count = 0,
+            .no_speech_chunks_count = 0,
+            .bytes = transcript_bytes,
             .bytes_count = 0,
+        },
+        .timing = .{
+            .command_started_monotonic_ns = command_started_monotonic_ns,
+            .audio_started_monotonic_ns = null,
+            .audio_finished_monotonic_ns = null,
+            .audio_callbacks_count = 0,
+            .audio_callback_duration_ns_max = 0,
+            .audio_callback_gap_ns_max = 0,
+            .model = switch (configuration) {
+                .fake => null,
+                .pipewire => |options| switch (options.transcription) {
+                    .fake => null,
+                    .model => |model| .{
+                        .residency = model.residency,
+                        .workers_started_count = 0,
+                        .workers_ready_count = 0,
+                        .worker_start_to_ready_elapsed_ns_total = 0,
+                        .worker_start_to_ready_elapsed_ns_max = 0,
+                        .model_load_elapsed_ns_total = 0,
+                        .model_load_elapsed_ns_max = 0,
+                        .warmup_elapsed_ns_total = 0,
+                        .warmup_elapsed_ns_max = 0,
+                        .feature_extraction_elapsed_ns_total = 0,
+                        .feature_extraction_elapsed_ns_max = 0,
+                        .inference_elapsed_ns_total = 0,
+                        .inference_elapsed_ns_max = 0,
+                        .transcriptions_count = 0,
+                    },
+                },
+            },
         },
     };
 
     try register(epoll_fd, publication_event_fd, .audio_publication);
     try register(epoll_fd, timer_fd, .deadline);
     try register(epoll_fd, signal_fd, .service_signal);
-    try startAudio(&supervisor, publication_event_fd);
+
+    const model_is_service_resident = switch (configuration) {
+        .fake => false,
+        .pipewire => |options| switch (options.transcription) {
+            .fake => false,
+            .model => |model| model.residency == .service,
+        },
+    };
     supervisor.transcription = .{
         .running = try startTranscription(&supervisor, null),
     };
+    if (model_is_service_resident) {
+        // A production service performs this work before accepting a recording.
+        // The one-session spike waits here to reproduce that ready-at-capture
+        // boundary without pretending its process survives command exit.
+        try awaitServiceModelReadiness(&supervisor, timer_fd, signal_fd);
+        if (supervisor.phase == .active) {
+            supervisor.session_deadline_monotonic_ns = sessionDeadline(configuration);
+            try startAudio(&supervisor, publication_event_fd);
+        }
+    } else {
+        try startAudio(&supervisor, publication_event_fd);
+    }
     armNearestDeadline(&supervisor, timer_fd);
 
     // Every iteration consumes one complete readiness snapshot. Worker
@@ -403,7 +581,80 @@ fn runSession(init: std.process.Init, configuration: SessionConfiguration) !void
         armNearestDeadline(&supervisor, timer_fd);
     }
 
-    finishSession(&supervisor);
+    return finishSession(&supervisor);
+}
+
+/// Service residency requires the model to finish loading and warming before
+/// capture can begin. This bounded wait uses the same packet, pidfd, signal, and
+/// deadline handling as the session event loop; it opens no second lifecycle.
+fn awaitServiceModelReadiness(
+    supervisor: *Supervisor,
+    timer_fd: std.posix.fd_t,
+    signal_fd: std.posix.fd_t,
+) !void {
+    assert(!audioProcessExists(supervisor));
+    assert(supervisor.transcription == .running);
+    assert(supervisor.transcription.running.operation == .starting);
+
+    armNearestDeadline(supervisor, timer_fd);
+    while (supervisor.phase == .active and
+        supervisor.transcription == .running and
+        supervisor.transcription.running.operation == .starting)
+    {
+        var events: [epoll_events_count_max]linux.epoll_event = undefined;
+        const events_count = waitForEvents(supervisor.epoll_fd, &events, -1);
+        assert(events_count > 0);
+
+        for (events[0..events_count]) |event| {
+            if (eventSource(event) == .transcription_packet and
+                supervisor.transcription == .running)
+            {
+                try drainTranscriptionPackets(supervisor);
+            }
+        }
+        for (events[0..events_count]) |event| {
+            switch (eventSource(event)) {
+                .transcription_exit => if (supervisor.transcription == .running)
+                    try reapTranscription(supervisor),
+                .deadline => {
+                    _ = readEventCounter(timer_fd);
+                    try applyExpiredDeadlines(supervisor);
+                },
+                .service_signal => {
+                    _ = readSignal(signal_fd);
+                    try beginDiscard(supervisor, .service_signal);
+                },
+                else => {},
+            }
+        }
+
+        try maintainWorkersAndSession(supervisor);
+        armNearestDeadline(supervisor, timer_fd);
+    }
+
+    if (supervisor.phase == .active) {
+        assert(supervisor.transcription == .running);
+        assert(supervisor.transcription.running.operation == .idle);
+    }
+}
+
+fn sessionTranscriptBytesCapacity(configuration: SessionConfiguration) usize {
+    const bytes_per_recording_second_max: u64 = 64;
+    const result_bytes_reserve: u64 =
+        transcription_process.result_bytes_capacity;
+
+    const bytes_capacity: u64 = switch (configuration) {
+        // Deterministic scenarios intentionally stress publication counts rather
+        // than recording duration. Preserve one complete result per fake chunk
+        // so these protocol tests cannot fail on the production text-rate policy.
+        .fake => |scenario| @as(u64, scenarioBehavior(scenario).chunks_count) *
+            transcription_process.result_bytes_capacity,
+        .pipewire => |options| @as(u64, options.recording_seconds) *
+            bytes_per_recording_second_max + result_bytes_reserve,
+    };
+    assert(bytes_capacity > 0);
+    assert(bytes_capacity <= std.math.maxInt(u32));
+    return @intCast(bytes_capacity);
 }
 
 fn startAudio(
@@ -421,6 +672,8 @@ fn startAudio(
         internal_role,
     );
     errdefer forceStopAndReap(&process) catch {};
+
+    assert(supervisor.timing.audio_started_monotonic_ns == null);
 
     switch (supervisor.audio) {
         .fake => |*audio| {
@@ -457,6 +710,7 @@ fn startAudio(
                         audio_process.sample_rate_hz,
                     .slot_samples_boundary = @as(u32, options.slot_seconds) *
                         audio_process.sample_rate_hz,
+                    .automatic_stop = options.automatic_stop,
                     .process_realtime = options.process_realtime,
                 },
             );
@@ -468,45 +722,86 @@ fn startAudio(
             };
         },
     }
+
+    supervisor.timing.audio_started_monotonic_ns = monotonicNanoseconds();
 }
 
 fn startTranscription(
     supervisor: *Supervisor,
     retry_work: ?TranscriptionWork,
 ) !TranscriptionProcess {
+    const backend: TranscriptionBackend = switch (supervisor.audio) {
+        .fake => .fake,
+        .pipewire => |audio| audio.options.transcription,
+    };
+    const internal_role = switch (backend) {
+        .fake => "transcription-fake",
+        .model => "transcription-model",
+    };
     var process = try startChild(
         supervisor,
         .transcription_packet,
         .transcription_exit,
-        "transcription-fake",
+        internal_role,
     );
     errdefer forceStopAndReap(&process) catch {};
 
-    const behavior = transcriptionBehavior(supervisor.audio);
-    const repeats_crash = switch (supervisor.audio) {
-        .fake => |audio| audio.scenario == .repeated_transcription_crash,
-        .pipewire => false,
-    };
-    const is_replacement = retry_work != null;
-    const fake_behavior = if (!is_replacement or repeats_crash)
-        behavior.behavior
-    else
-        transcription_process.FakeBehavior.normal;
-    try transcription_process.sendLaunch(
-        process.socket.?,
-        supervisor.audio_exchange_fd,
-        supervisor.transcript_exchange_fd,
-        .{
-            .session_id = session_id,
-            .fake_behavior = fake_behavior,
-            .fake_inference_duration_ms = behavior.duration_ms,
+    // A replacement receives the same model configuration and exact retained
+    // slot. Deterministic fault scenarios alone alter behavior on replacement:
+    // one-shot crash cases recover, while the repeated-crash case proves the
+    // retry bound by failing the same work twice.
+    switch (backend) {
+        .fake => {
+            const behavior = transcriptionBehavior(supervisor.audio);
+            const repeats_crash = switch (supervisor.audio) {
+                .fake => |audio| audio.scenario == .repeated_transcription_crash,
+                .pipewire => false,
+            };
+            const is_replacement = retry_work != null;
+            const fake_behavior = if (!is_replacement or repeats_crash)
+                behavior.behavior
+            else
+                transcription_process.FakeBehavior.normal;
+            try transcription_process.sendFakeLaunch(
+                process.socket.?,
+                supervisor.audio_exchange_fd,
+                supervisor.transcript_exchange_fd,
+                .{
+                    .session_id = session_id,
+                    .behavior = fake_behavior,
+                    .inference_duration_ms = behavior.duration_ms,
+                },
+            );
         },
-    );
+        .model => |model| try transcription_process.sendModelLaunch(
+            process.socket.?,
+            supervisor.audio_exchange_fd,
+            supervisor.transcript_exchange_fd,
+            .{
+                .session_id = session_id,
+                .model = model.model,
+                .inference_threads_count = model.inference_threads_count,
+            },
+        ),
+    }
 
+    const startup_duration_ns: u64 = switch (backend) {
+        .fake => std.time.ns_per_s,
+        .model => 15 * std.time.ns_per_s,
+    };
+    const started_monotonic_ns = monotonicNanoseconds();
+    switch (backend) {
+        .fake => {},
+        .model => {
+            const timing = &supervisor.timing.model.?;
+            timing.workers_started_count += 1;
+        },
+    }
     return .{
         .process = process,
         .operation = .{ .starting = .{
-            .deadline_monotonic_ns = monotonicNanoseconds() + std.time.ns_per_s,
+            .started_monotonic_ns = started_monotonic_ns,
+            .deadline_monotonic_ns = started_monotonic_ns + startup_duration_ns,
             .retry_work = retry_work,
         } },
     };
@@ -676,6 +971,10 @@ fn drainFakeAudioPackets(supervisor: *Supervisor) !void {
             },
             .completed, .pipeline_full => switch (audio.operation) {
                 .capturing, .canceling => {
+                    if (supervisor.timing.audio_finished_monotonic_ns == null) {
+                        supervisor.timing.audio_finished_monotonic_ns =
+                            monotonicNanoseconds();
+                    }
                     audio.operation = .{
                         .exiting = monotonicNanoseconds() + std.time.ns_per_s,
                     };
@@ -692,8 +991,14 @@ fn drainFakeAudioPackets(supervisor: *Supervisor) !void {
                 .starting, .exiting => unreachable,
             },
             .cancelled => switch (audio.operation) {
-                .canceling => audio.operation = .{
-                    .exiting = monotonicNanoseconds() + std.time.ns_per_s,
+                .canceling => {
+                    if (supervisor.timing.audio_finished_monotonic_ns == null) {
+                        supervisor.timing.audio_finished_monotonic_ns =
+                            monotonicNanoseconds();
+                    }
+                    audio.operation = .{
+                        .exiting = monotonicNanoseconds() + std.time.ns_per_s,
+                    };
                 },
                 .terminating => {},
                 .starting, .capturing, .exiting => unreachable,
@@ -713,6 +1018,7 @@ fn drainPipeWireAudioPackets(supervisor: *Supervisor) !void {
             audio_process.sample_rate_hz,
         .slot_samples_boundary = @as(u32, options.slot_seconds) *
             audio_process.sample_rate_hz,
+        .automatic_stop = options.automatic_stop,
         .process_realtime = options.process_realtime,
     };
     while (audio_process.PipeWireWorker.receiveReportNonblocking(
@@ -727,6 +1033,9 @@ fn drainPipeWireAudioPackets(supervisor: *Supervisor) !void {
         audio.operation = .{
             .exiting = monotonicNanoseconds() + std.time.ns_per_s,
         };
+        if (supervisor.timing.audio_finished_monotonic_ns == null) {
+            supervisor.timing.audio_finished_monotonic_ns = monotonicNanoseconds();
+        }
 
         switch (worker_report) {
             .setup_failed => |setup_failure| {
@@ -734,10 +1043,26 @@ fn drainPipeWireAudioPackets(supervisor: *Supervisor) !void {
                 try beginDiscard(supervisor, .audio_failed);
             },
             .captured => |capture| {
+                const timeline_validation = audio_exchange.acquireTimelineValidation(
+                    supervisor.audio_exchange,
+                ).?;
+                assert(switch (capture.timeline_validation) {
+                    .header_only => timeline_validation == .header_only,
+                    .full => timeline_validation == .full,
+                });
+                if (capture.callback) |callback| {
+                    supervisor.timing.audio_callbacks_count = callback.callbacks_count;
+                    supervisor.timing.audio_callback_duration_ns_max =
+                        callback.duration_ns_max;
+                    supervisor.timing.audio_callback_gap_ns_max = callback.gap_ns_max;
+                }
                 printPipeWireCapture(&capture);
                 switch (capture.end) {
                     .completed => if (supervisor.phase == .active) {
                         supervisor.phase = .{ .finishing = .audio_completed };
+                    },
+                    .automatic_stop => if (supervisor.phase == .active) {
+                        supervisor.phase = .{ .finishing = .audio_automatic_stop };
                     },
                     .stopped => if (supervisor.phase == .active) {
                         supervisor.phase = .{ .finishing = .audio_stopped };
@@ -767,6 +1092,7 @@ fn drainPipeWireAudioPackets(supervisor: *Supervisor) !void {
 fn observePipeWireProgress(supervisor: *Supervisor) void {
     if (supervisor.audio != .pipewire) return;
     const audio = if (supervisor.audio.pipewire.process) |*value| value else return;
+    const capture_is_starting = audio.operation == .starting;
     const callbacks_count_previous = switch (audio.operation) {
         .starting => 0,
         .capturing => |progress| progress.callbacks_count,
@@ -779,6 +1105,19 @@ fn observePipeWireProgress(supervisor: *Supervisor) void {
     assert(callbacks_count >= callbacks_count_previous);
     if (callbacks_count == callbacks_count_previous) return;
 
+    if (capture_is_starting) {
+        const timeline_validation = audio_exchange.acquireTimelineValidation(
+            supervisor.audio_exchange,
+        ).?;
+        if (timeline_validation == .header_only) {
+            std.debug.print(
+                "Warning: this PipeWire build supplies Header-only timeline " ++
+                    "validation; some dropped audio intervals cannot be detected\n",
+                .{},
+            );
+        }
+    }
+
     audio.operation = .{ .capturing = .{
         .callbacks_count = callbacks_count,
         .deadline_monotonic_ns = monotonicNanoseconds() +
@@ -788,24 +1127,55 @@ fn observePipeWireProgress(supervisor: *Supervisor) void {
 
 fn drainTranscriptionPackets(supervisor: *Supervisor) !void {
     const transcription = &supervisor.transcription.running;
-    while (receiveRecordNonblocking(
+    while (transcription_process.receiveReportNonblocking(
         transcription.process.socket.?,
-        transcription_process.WireReport,
     )) |received| {
         const report = received orelse {
             unregisterSocket(supervisor.epoll_fd, &transcription.process);
             return;
         };
-        const report_kind = transcription_process.decodeTrustedReport(report);
-        switch (report_kind) {
-            .ready => switch (transcription.operation) {
-                .starting => |starting| transcription.operation = .{
-                    .idle = starting.retry_work,
+        switch (report) {
+            .ready => |ready| switch (transcription.operation) {
+                .starting => |starting| {
+                    if (supervisor.timing.model) |*timing| {
+                        const start_to_ready_elapsed_ns =
+                            monotonicNanoseconds() - starting.started_monotonic_ns;
+                        timing.workers_ready_count += 1;
+                        timing.worker_start_to_ready_elapsed_ns_total +=
+                            start_to_ready_elapsed_ns;
+                        timing.worker_start_to_ready_elapsed_ns_max = @max(
+                            timing.worker_start_to_ready_elapsed_ns_max,
+                            start_to_ready_elapsed_ns,
+                        );
+                        timing.model_load_elapsed_ns_total +=
+                            ready.model_load_elapsed_ns;
+                        timing.model_load_elapsed_ns_max = @max(
+                            timing.model_load_elapsed_ns_max,
+                            ready.model_load_elapsed_ns,
+                        );
+                        timing.warmup_elapsed_ns_total += ready.warmup_elapsed_ns;
+                        timing.warmup_elapsed_ns_max = @max(
+                            timing.warmup_elapsed_ns_max,
+                            ready.warmup_elapsed_ns,
+                        );
+                    }
+                    if (ready.model_load_elapsed_ns > 0 or ready.warmup_elapsed_ns > 0) {
+                        std.debug.print(
+                            "Whisper ready\n" ++
+                                "Model load: {d} ms\n" ++
+                                "Warm-up: {d} ms\n",
+                            .{
+                                ready.model_load_elapsed_ns / std.time.ns_per_ms,
+                                ready.warmup_elapsed_ns / std.time.ns_per_ms,
+                            },
+                        );
+                    }
+                    transcription.operation = .{ .idle = starting.retry_work };
                 },
                 .terminating => {},
                 .idle, .busy, .shutdown_sent, .exiting => unreachable,
             },
-            .result => {
+            .result => |result| {
                 if (supervisor.phase == .discarding or
                     transcription.operation == .terminating)
                 {
@@ -814,8 +1184,46 @@ fn drainTranscriptionPackets(supervisor: *Supervisor) !void {
                     continue;
                 }
                 assert(transcription.operation == .busy);
-                try acceptTranscript(supervisor);
-                transcription.operation = .{ .idle = null };
+                const work = transcription.operation.busy.work.work();
+                assert(result.publication_ordinal == work.publication_ordinal);
+                const committed = transcription_process.acquireResult(
+                    supervisor.transcript_exchange,
+                ).?;
+                assert(committed.publication_ordinal == result.publication_ordinal);
+                assert(committed.samples_count == result.samples_count);
+                assert(committed.no_speech_probability == result.no_speech_probability);
+                assert(committed.average_log_probability == result.average_log_probability);
+                std.debug.print(
+                    "Whisper chunk {d}: {d} samples, features {d} ms, " ++
+                        "inference {d} ms, no-speech {d:.6}, " ++
+                        "average-log-probability {d:.6}\n",
+                    .{
+                        result.publication_ordinal,
+                        result.samples_count,
+                        result.feature_extraction_elapsed_ns / std.time.ns_per_ms,
+                        result.inference_elapsed_ns / std.time.ns_per_ms,
+                        result.no_speech_probability,
+                        result.average_log_probability,
+                    },
+                );
+                if (supervisor.timing.model) |*timing| {
+                    timing.feature_extraction_elapsed_ns_total +=
+                        result.feature_extraction_elapsed_ns;
+                    timing.feature_extraction_elapsed_ns_max = @max(
+                        timing.feature_extraction_elapsed_ns_max,
+                        result.feature_extraction_elapsed_ns,
+                    );
+                    timing.inference_elapsed_ns_total += result.inference_elapsed_ns;
+                    timing.inference_elapsed_ns_max = @max(
+                        timing.inference_elapsed_ns_max,
+                        result.inference_elapsed_ns,
+                    );
+                    timing.transcriptions_count += 1;
+                }
+                try consumeTranscript(supervisor);
+                if (supervisor.phase != .discarding) {
+                    transcription.operation = .{ .idle = null };
+                }
             },
             .stopped => {
                 assert(transcription.operation == .shutdown_sent or
@@ -823,6 +1231,15 @@ fn drainTranscriptionPackets(supervisor: *Supervisor) !void {
                 transcription.operation = .{
                     .exiting = monotonicNanoseconds() + std.time.ns_per_s,
                 };
+            },
+            .failed => |failure| {
+                std.debug.print(
+                    "Whisper failure\nStage: {s}\nDetail: {s}\n",
+                    .{ @tagName(failure.stage), failure.messageBytes() },
+                );
+                // The worker exits after reporting. pidfd reaping below decides
+                // whether exact in-flight work receives its one bounded retry;
+                // this diagnostic packet does not create a second failure owner.
             },
         }
     }
@@ -848,8 +1265,15 @@ fn dispatchTranscription(supervisor: *Supervisor) !void {
         } };
     };
     const work = work_attempt.work();
+    const inference_duration_ns: u64 = switch (supervisor.audio) {
+        .fake => 80 * std.time.ns_per_ms,
+        .pipewire => |audio| switch (audio.options.transcription) {
+            .fake => 80 * std.time.ns_per_ms,
+            .model => 10 * std.time.ns_per_s,
+        },
+    };
     transcription.operation = .{ .busy = .{
-        .deadline_monotonic_ns = monotonicNanoseconds() + 80 * std.time.ns_per_ms,
+        .deadline_monotonic_ns = monotonicNanoseconds() + inference_duration_ns,
         .work = work_attempt,
     } };
     transcription_process.sendCommand(
@@ -864,7 +1288,7 @@ fn dispatchTranscription(supervisor: *Supervisor) !void {
     };
 }
 
-fn acceptTranscript(supervisor: *Supervisor) !void {
+fn consumeTranscript(supervisor: *Supervisor) !void {
     assert(supervisor.transcription == .running);
     assert(supervisor.transcription.running.operation == .busy);
     const work = supervisor.transcription.running.operation.busy.work.work();
@@ -878,13 +1302,97 @@ fn acceptTranscript(supervisor: *Supervisor) !void {
     assert(result.publication_ordinal == work.publication_ordinal);
     assert(result.publication_ordinal ==
         supervisor.transcript.next_publication_ordinal);
-    assert(supervisor.transcript.bytes_count + result.bytes.len <=
-        supervisor.transcript.bytes.len);
-    @memcpy(
-        supervisor.transcript.bytes[supervisor.transcript.bytes_count..][0..result.bytes.len],
-        result.bytes,
-    );
-    supervisor.transcript.bytes_count += @intCast(result.bytes.len);
+    assert(result.samples_count == publication.samples_count);
+    assert(result.contains_activity == publication.contains_activity);
+
+    // The deterministic fake worker produces protocol text, not Whisper
+    // confidence scores. Only model results can be accepted or rejected by
+    // comparing Whisper's score with the audio activity detector.
+    const disposition: transcription_process.ResultDisposition = switch (supervisor.audio) {
+        .fake => .accepted,
+        .pipewire => |audio| switch (audio.options.transcription) {
+            .fake => .accepted,
+            .model => transcription_process.classifyResult(result),
+        },
+    };
+    switch (disposition) {
+        .accepted => {
+            assert(supervisor.transcript.bytes_count <= supervisor.transcript.bytes.len);
+            const bytes_remaining = supervisor.transcript.bytes.len -
+                supervisor.transcript.bytes_count;
+            if (result.bytes.len > bytes_remaining) {
+                const capacity_exceeded: TranscriptCapacityExceeded = .{
+                    .publication_ordinal = result.publication_ordinal,
+                    .bytes_capacity = @intCast(supervisor.transcript.bytes.len),
+                    .bytes_committed = supervisor.transcript.bytes_count,
+                    .result_bytes_count = @intCast(result.bytes.len),
+                };
+                transcription_process.releaseResult(supervisor.transcript_exchange);
+                try beginDiscard(supervisor, .{
+                    .transcript_capacity_exceeded = capacity_exceeded,
+                });
+                return;
+            }
+
+            @memcpy(
+                supervisor.transcript.bytes[supervisor.transcript.bytes_count..][0..result.bytes.len],
+                result.bytes,
+            );
+            supervisor.transcript.bytes_count += @intCast(result.bytes.len);
+            supervisor.transcript.accepted_chunks_count += 1;
+        },
+        .no_speech => {
+            supervisor.transcript.no_speech_chunks_count += 1;
+            if (std.mem.trim(u8, result.bytes, " \t\r\n").len == 0) {
+                std.debug.print(
+                    "Whisper chunk {d} rejected as no speech: model output is empty, " ++
+                        "activity={s}, no-speech={d:.6}\n",
+                    .{
+                        result.publication_ordinal,
+                        if (result.contains_activity) "active" else "not observed",
+                        result.no_speech_probability,
+                    },
+                );
+            } else {
+                std.debug.print(
+                    "Whisper chunk {d} rejected as no speech: activity={s}, " ++
+                        "no-speech={d:.6}, inactive threshold={d:.2}\n",
+                    .{
+                        result.publication_ordinal,
+                        if (result.contains_activity) "active" else "not observed",
+                        result.no_speech_probability,
+                        transcription_process.no_activity_no_speech_probability_reject_min,
+                    },
+                );
+            }
+        },
+        .speech_detection_conflict, .speech_unrecognized => {
+            const selected_model = switch (supervisor.audio) {
+                .fake => unreachable,
+                .pipewire => |audio| switch (audio.options.transcription) {
+                    .fake => unreachable,
+                    .model => |model| model.model,
+                },
+            };
+            const rejection: TranscriptionRejection = .{
+                .model = selected_model,
+                .publication_ordinal = result.publication_ordinal,
+                .samples_count = result.samples_count,
+                .contains_activity = result.contains_activity,
+                .no_speech_probability = result.no_speech_probability,
+                .average_log_probability = result.average_log_probability,
+            };
+            transcription_process.releaseResult(supervisor.transcript_exchange);
+            try beginDiscard(supervisor, switch (disposition) {
+                .speech_detection_conflict => .{
+                    .speech_detection_conflict = rejection,
+                },
+                .speech_unrecognized => .{ .speech_unrecognized = rejection },
+                .accepted, .no_speech => unreachable,
+            });
+            return;
+        },
+    }
     supervisor.transcript.next_publication_ordinal += 1;
 
     transcription_process.releaseResult(supervisor.transcript_exchange);
@@ -906,6 +1414,10 @@ fn nextPublishedAudio(supervisor: *Supervisor) ?audio_exchange.PublishedSlotRef 
 }
 
 fn reapAudio(supervisor: *Supervisor) !void {
+    if (supervisor.timing.audio_finished_monotonic_ns == null) {
+        supervisor.timing.audio_finished_monotonic_ns = monotonicNanoseconds();
+    }
+
     switch (supervisor.audio) {
         inline else => |*session_audio| {
             if (session_audio.process.?.process.socket != null) {
@@ -949,7 +1461,7 @@ fn reapTranscription(supervisor: *Supervisor) !void {
     }
     const failed_work = transcription.operation.busy.work;
     if (transcription_process.acquireResult(supervisor.transcript_exchange) != null) {
-        try acceptTranscript(supervisor);
+        try consumeTranscript(supervisor);
         supervisor.transcription = .absent;
     } else switch (failed_work) {
         .retry => {
@@ -1189,23 +1701,52 @@ fn sessionIsComplete(supervisor: *Supervisor) bool {
         supervisor.transcription == .absent;
 }
 
-fn finishSession(supervisor: *Supervisor) void {
+fn finishSession(supervisor: *Supervisor) SessionTimingReport {
     assert(!audioProcessExists(supervisor));
     assert(supervisor.transcription == .absent);
+
+    const completed_monotonic_ns = monotonicNanoseconds();
+    const timing_report: SessionTimingReport = .{
+        .command_elapsed_ns = completed_monotonic_ns -
+            supervisor.timing.command_started_monotonic_ns,
+        .audio = if (supervisor.timing.audio_started_monotonic_ns) |started| audio: {
+            const finished = supervisor.timing.audio_finished_monotonic_ns.?;
+            break :audio .{
+                .start_to_finish_elapsed_ns = finished - started,
+                .finish_to_complete_elapsed_ns = completed_monotonic_ns - finished,
+                .callbacks_count = supervisor.timing.audio_callbacks_count,
+                .callback_duration_ns_max = supervisor.timing.audio_callback_duration_ns_max,
+                .callback_gap_ns_max = supervisor.timing.audio_callback_gap_ns_max,
+            };
+        } else null,
+        .model = supervisor.timing.model,
+    };
 
     switch (supervisor.phase) {
         .active => unreachable,
         .finishing => |reason| {
             assert(countPublishedSlots(supervisor) == 0);
+            const transcript = std.mem.trim(
+                u8,
+                supervisor.transcript.bytes[0..supervisor.transcript.bytes_count],
+                " \t\r\n",
+            );
+            const outcome_name = if (supervisor.transcript.accepted_chunks_count == 0 and
+                supervisor.transcript.no_speech_chunks_count > 0)
+                "no_speech"
+            else
+                @tagName(reason);
             std.debug.print(
                 "Supervisor session complete\n" ++
                     "Outcome: {s}\n" ++
-                    "Chunks: {d}\n" ++
+                    "Chunks accepted/no-speech/total: {d}/{d}/{d}\n" ++
                     "Transcript: {s}\n",
                 .{
-                    @tagName(reason),
+                    outcome_name,
+                    supervisor.transcript.accepted_chunks_count,
+                    supervisor.transcript.no_speech_chunks_count,
                     supervisor.transcript.next_publication_ordinal,
-                    supervisor.transcript.bytes[0..supervisor.transcript.bytes_count],
+                    transcript,
                 },
             );
         },
@@ -1217,10 +1758,102 @@ fn finishSession(supervisor: *Supervisor) void {
                 "Supervisor session discarded\n" ++
                     "Reason: {s}\n" ++
                     "Transcript: not committed\n",
-                .{@tagName(reason)},
+                .{@tagName(std.meta.activeTag(reason))},
             );
+            switch (reason) {
+                .speech_detection_conflict, .speech_unrecognized => |rejection| {
+                    std.debug.print(
+                        "Transcription evidence: model={s}, chunk={d}, samples={d}, " ++
+                            "activity={s}, no-speech={d:.6}, " ++
+                            "thresholds inactive/active={d:.2}/{d:.2}, " ++
+                            "average-log-probability={d:.6}\n",
+                        .{
+                            rejection.model.name(),
+                            rejection.publication_ordinal,
+                            rejection.samples_count,
+                            if (rejection.contains_activity) "active" else "not observed",
+                            rejection.no_speech_probability,
+                            transcription_process.no_activity_no_speech_probability_reject_min,
+                            transcription_process.active_no_speech_probability_conflict_min,
+                            rejection.average_log_probability,
+                        },
+                    );
+                },
+                .transcript_capacity_exceeded => |capacity| {
+                    std.debug.print(
+                        "Transcript capacity exceeded: chunk={d}, capacity={d}, " ++
+                            "committed={d}, result={d}\n",
+                        .{
+                            capacity.publication_ordinal,
+                            capacity.bytes_capacity,
+                            capacity.bytes_committed,
+                            capacity.result_bytes_count,
+                        },
+                    );
+                },
+                .service_signal,
+                .audio_failed,
+                .transcription_failed,
+                .deadline,
+                => {},
+            }
         },
     }
+
+    std.debug.print(
+        "Pipeline timing\nCommand: {d} ms\n",
+        .{timing_report.command_elapsed_ns / std.time.ns_per_ms},
+    );
+    if (timing_report.audio) |audio| {
+        std.debug.print(
+            "Audio start to finish: {d} ms\n" ++
+                "Audio finish to session completion: {d} ms\n" ++
+                "Audio callbacks: {d}\n" ++
+                "Audio callback duration max: {d} us\n" ++
+                "Audio callback gap max: {d} ms\n",
+            .{
+                audio.start_to_finish_elapsed_ns / std.time.ns_per_ms,
+                audio.finish_to_complete_elapsed_ns / std.time.ns_per_ms,
+                audio.callbacks_count,
+                audio.callback_duration_ns_max / std.time.ns_per_us,
+                audio.callback_gap_ns_max / std.time.ns_per_ms,
+            },
+        );
+    }
+    if (timing_report.model) |model| {
+        assert(model.workers_ready_count <= model.workers_started_count);
+        assert(model.feature_extraction_elapsed_ns_max <=
+            model.feature_extraction_elapsed_ns_total);
+        assert(model.inference_elapsed_ns_max <= model.inference_elapsed_ns_total);
+        std.debug.print(
+            "Model residency: {s}\n" ++
+                "Model workers started/ready: {d}/{d}\n" ++
+                "Model startup total/max: {d}/{d} ms\n" ++
+                "Model load total/max: {d}/{d} ms\n" ++
+                "Model warm-up total/max: {d}/{d} ms\n" ++
+                "Feature extraction total/max: {d}/{d} ms\n" ++
+                "Inference total/max: {d}/{d} ms\n" ++
+                "Timed transcriptions: {d}\n",
+            .{
+                @tagName(model.residency),
+                model.workers_started_count,
+                model.workers_ready_count,
+                model.worker_start_to_ready_elapsed_ns_total / std.time.ns_per_ms,
+                model.worker_start_to_ready_elapsed_ns_max / std.time.ns_per_ms,
+                model.model_load_elapsed_ns_total / std.time.ns_per_ms,
+                model.model_load_elapsed_ns_max / std.time.ns_per_ms,
+                model.warmup_elapsed_ns_total / std.time.ns_per_ms,
+                model.warmup_elapsed_ns_max / std.time.ns_per_ms,
+                model.feature_extraction_elapsed_ns_total / std.time.ns_per_ms,
+                model.feature_extraction_elapsed_ns_max / std.time.ns_per_ms,
+                model.inference_elapsed_ns_total / std.time.ns_per_ms,
+                model.inference_elapsed_ns_max / std.time.ns_per_ms,
+                model.transcriptions_count,
+            },
+        );
+    }
+
+    return timing_report;
 }
 
 fn printPipeWireSetupFailure(failure: *const audio_process.SetupFailure) void {
@@ -1228,11 +1861,13 @@ fn printPipeWireSetupFailure(failure: *const audio_process.SetupFailure) void {
         "PipeWire setup failed\n" ++
             "Stage: {s}\n" ++
             "Error: {s}/{d}\n" ++
+            "PipeWire library: {s}\n" ++
             "Detail: {s}\n",
         .{
             @tagName(failure.stage),
             @tagName(failure.domain),
             failure.code,
+            failure.pipewire_version[0..failure.pipewire_version_size],
             failure.message[0..failure.message_size],
         },
     );
@@ -1241,6 +1876,7 @@ fn printPipeWireSetupFailure(failure: *const audio_process.SetupFailure) void {
 fn printPipeWireCapture(report: *const audio_process.CaptureReport) void {
     const outcome_name = switch (report.end) {
         .completed => "completed",
+        .automatic_stop => "automatic_stop",
         .stopped => "stopped",
         .cancelled => "cancelled",
         .failed => |failure| @tagName(failure.outcome),
@@ -1262,12 +1898,18 @@ fn printPipeWireCapture(report: *const audio_process.CaptureReport) void {
             "Outcome: {s}\n" ++
             "Samples published/captured: {d}/{d}\n" ++
             "Source: {s}\n" ++
+            "PipeWire headers/library/server: {s}/{s}/{s}\n" ++
+            "Timeline validation: {s}\n" ++
             "Scheduler: {s}, priority {d}\n",
         .{
             outcome_name,
             report.published_samples_count,
             report.samples_count,
             source_description,
+            report.pipewire_headers_version[0..report.pipewire_headers_version_size],
+            report.pipewire_library_version[0..report.pipewire_library_version_size],
+            report.pipewire_server_version[0..report.pipewire_server_version_size],
+            @tagName(report.timeline_validation),
             audio_process.schedulerPolicyName(scheduler_policy),
             scheduler_priority,
         },
@@ -1517,8 +2159,14 @@ fn reapChild(process: *const ChildProcess) !linux.siginfo_t {
 fn sessionDeadline(configuration: SessionConfiguration) u64 {
     const duration_ns: u64 = switch (configuration) {
         .fake => 5 * std.time.ns_per_s,
-        .pipewire => |options| (@as(u64, options.recording_seconds) + 10) *
-            std.time.ns_per_s,
+        .pipewire => |options| (@as(u64, options.recording_seconds) +
+            @as(u64, switch (options.transcription) {
+                .fake => 10,
+                // The model starts concurrently with capture. After audio
+                // stops, at most three sealed slots can remain, each with its
+                // own ten-second inference deadline plus bounded shutdown.
+                .model => 35,
+            })) * std.time.ns_per_s,
     };
     return monotonicNanoseconds() + duration_ns;
 }
