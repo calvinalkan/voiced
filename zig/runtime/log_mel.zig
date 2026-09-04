@@ -1,24 +1,33 @@
-//! Whisper audio preparation owns immutable DFT/Mel coefficient tables and a
+//! Whisper log-Mel extraction owns immutable DFT/Mel coefficient tables and a
 //! fixed working set supplied by `Runtime`. Extraction accepts normalized 16 kHz
-//! mono samples and returns the model's fixed `[80, 3000]` feature matrix.
+//! mono samples and returns a row-major `[80, frames_count]` feature matrix
+//! whose logical length includes the per-transcription trailing-silence policy.
 
 const std = @import("std");
+const memory_layout = @import("memory_layout.zig");
 const assert = std.debug.assert;
 
-const sample_rate_hz: usize = 16_000;
 const fft_samples_count: usize = 400;
+
+pub const sample_rate_hz: usize = 16_000;
+pub const mel_bins_count: usize = 80;
+pub const encoder_frames_count_max: usize = 3000;
+pub const samples_count_min: usize = fft_samples_count / 2 + 1;
+pub const samples_count_max: usize = 30 * sample_rate_hz;
+
 const fft_bins_count: usize = fft_samples_count / 2 + 1;
 const hop_samples_count: usize = 160;
-const mel_bins_count: usize = 80;
-const encoder_frames_count: usize = 3000;
+const frames_per_second: usize = sample_rate_hz / hop_samples_count;
 const center_padding_samples_count: usize = fft_samples_count / 2;
-const tail_padding_samples_count: usize = hop_samples_count;
+const fft_tail_padding_samples_count: usize = hop_samples_count;
 const simd_lanes_count: usize = 8;
-const memory_alignment: usize = 64;
 
 const F32x8 = @Vector(simd_lanes_count, f32);
 
 comptime {
+    assert(sample_rate_hz % hop_samples_count == 0);
+    assert(encoder_frames_count_max == 30 * frames_per_second);
+    assert(encoder_frames_count_max % simd_lanes_count == 0);
     assert(fft_samples_count % simd_lanes_count == 0);
     assert((fft_bins_count - 1) % simd_lanes_count == 0);
 }
@@ -29,9 +38,37 @@ pub const Error = error{
     MemoryTooSmall,
 };
 
+/// `EncoderTrailingPadding` selects the normalized silence appended after the
+/// recorded content. The complete encoder input remains capped at Whisper's
+/// 30-second context. A 30-second tail therefore produces the standard fixed
+/// 3,000-frame input for every accepted recording.
+pub const EncoderTrailingPadding = enum {
+    seconds_5,
+    seconds_10,
+    seconds_30,
+
+    fn framesCount(padding: EncoderTrailingPadding) usize {
+        return switch (padding) {
+            .seconds_5 => 5 * frames_per_second,
+            .seconds_10 => 10 * frames_per_second,
+            .seconds_30 => 30 * frames_per_second,
+        };
+    }
+};
+
+/// `Features.values` is row-major `[mel_bins_count, frames_count]`; every Mel
+/// row uses the returned logical frame count as its stride. The slice borrows
+/// extractor storage and remains valid only until the next calculation.
 pub const Features = struct {
     values: []const f32,
     frames_count: usize,
+
+    pub fn encoderPositionsCount(features: Features) usize {
+        assert(features.frames_count > 0);
+        assert(features.frames_count % 2 == 0);
+
+        return @divExact(features.frames_count, 2);
+    }
 };
 
 /// `Extractor` borrows one caller-owned memory region for its complete
@@ -47,39 +84,24 @@ pub const Extractor = struct {
     content_features: []f32,
     encoder_features: []f32,
 
-    pub fn requiredMemorySize(samples_count_max: usize) usize {
-        assert(samples_count_max >= fft_samples_count / 2 + 1);
-        assert(samples_count_max <= 30 * sample_rate_hz);
-
-        var size: usize = memory_alignment - 1;
-        size = addValuesSize(size, fft_samples_count);
-        size = addValuesSize(size, fft_bins_count * fft_samples_count);
-        size = addValuesSize(size, fft_bins_count * fft_samples_count);
-        size = addValuesSize(size, mel_bins_count * fft_bins_count);
-        size = addValuesSize(size, samples_count_max + 2 * center_padding_samples_count + tail_padding_samples_count);
-        size = addValuesSize(size, encoder_frames_count * fft_bins_count);
-        size = addValuesSize(size, mel_bins_count * encoder_frames_count);
-        size = addValuesSize(size, mel_bins_count * encoder_frames_count);
-
-        return size;
+    pub fn requiredMemorySize(configured_samples_count_max: usize) usize {
+        return MemoryLayout.init(configured_samples_count_max).size;
     }
 
-    pub fn init(extractor: *Extractor, memory: []u8, samples_count_max: usize) Error!void {
-        const required_memory_size = requiredMemorySize(samples_count_max);
-        if (memory.len < required_memory_size) {
+    pub fn init(extractor: *Extractor, memory: []align(memory_layout.alignment) u8, configured_samples_count_max: usize) Error!void {
+        const layout = MemoryLayout.init(configured_samples_count_max);
+        if (memory.len < layout.size) {
             return error.MemoryTooSmall;
         }
 
-        var cursor: MemoryCursor = .{ .memory = memory };
-        const hann_window = cursor.takeF32(fft_samples_count);
-        const dft_cosines = cursor.takeF32(fft_bins_count * fft_samples_count);
-        const dft_sines = cursor.takeF32(fft_bins_count * fft_samples_count);
-        const mel_filters = cursor.takeF32(mel_bins_count * fft_bins_count);
-        const centered_samples = cursor.takeF32(samples_count_max + 2 * center_padding_samples_count + tail_padding_samples_count);
-        const power_spectra = cursor.takeF32(encoder_frames_count * fft_bins_count);
-        const content_features = cursor.takeF32(mel_bins_count * encoder_frames_count);
-        const encoder_features = cursor.takeF32(mel_bins_count * encoder_frames_count);
-        assert(cursor.offset <= memory.len);
+        const hann_window = layout.hann_window.bind(memory);
+        const dft_cosines = layout.dft_cosines.bind(memory);
+        const dft_sines = layout.dft_sines.bind(memory);
+        const mel_filters = layout.mel_filters.bind(memory);
+        const centered_samples = layout.centered_samples.bind(memory);
+        const power_spectra = layout.power_spectra.bind(memory);
+        const content_features = layout.content_features.bind(memory);
+        const encoder_features = layout.encoder_features.bind(memory);
 
         for (hann_window, 0..) |*coefficient, sample_index| {
             const angle = 2.0 * std.math.pi * @as(f64, @floatFromInt(sample_index)) / fft_samples_count;
@@ -98,7 +120,7 @@ pub const Extractor = struct {
         calculateMelFilters(mel_filters);
 
         extractor.* = .{
-            .samples_count_max = samples_count_max,
+            .samples_count_max = configured_samples_count_max,
             .hann_window = hann_window,
             .dft_cosines = dft_cosines,
             .dft_sines = dft_sines,
@@ -110,10 +132,11 @@ pub const Extractor = struct {
         };
     }
 
-    /// `calculate` returns features borrowed from the extractor. The next call
-    /// overwrites the returned values.
-    pub fn calculate(extractor: *Extractor, samples: []const f32) Error!Features {
-        if (samples.len < fft_samples_count / 2 + 1) {
+    /// `calculate` normalizes the recorded content before appending zero-valued
+    /// Mel frames selected by `trailing_padding`. Padding is capped at the model's
+    /// 30-second context and does not change this extractor's allocation.
+    pub fn calculate(extractor: *Extractor, samples: []const f32, trailing_padding: EncoderTrailingPadding) Error!Features {
+        if (samples.len < samples_count_min) {
             return error.AudioTooShort;
         }
         if (samples.len > extractor.samples_count_max) {
@@ -122,11 +145,11 @@ pub const Extractor = struct {
 
         const content_frames_count = samples.len / hop_samples_count;
         assert(content_frames_count > 0);
-        assert(content_frames_count <= encoder_frames_count);
+        assert(content_frames_count <= encoder_frames_count_max);
 
         // ── Center And Pad ──
 
-        const centered_samples_count = samples.len + 2 * center_padding_samples_count + tail_padding_samples_count;
+        const centered_samples_count = samples.len + 2 * center_padding_samples_count + fft_tail_padding_samples_count;
         const centered_samples = extractor.centered_samples[0..centered_samples_count];
         const content_samples = centered_samples[center_padding_samples_count..][0..samples.len];
         @memcpy(content_samples, samples);
@@ -135,12 +158,14 @@ pub const Extractor = struct {
             centered_samples[padding_index] = content_samples[center_padding_samples_count - padding_index];
         }
 
-        const tail_padding_offset = center_padding_samples_count + samples.len;
-        @memset(centered_samples[tail_padding_offset..][0..tail_padding_samples_count], 0.0);
+        // This single-hop FFT boundary padding is independent of the configurable
+        // encoder tail, which is appended only after logarithmic normalization.
+        const fft_tail_padding_offset = center_padding_samples_count + samples.len;
+        @memset(centered_samples[fft_tail_padding_offset..][0..fft_tail_padding_samples_count], 0.0);
 
         for (0..center_padding_samples_count) |padding_index| {
-            const source_index = samples.len + tail_padding_samples_count - 2 - padding_index;
-            const target_index = center_padding_samples_count + samples.len + tail_padding_samples_count + padding_index;
+            const source_index = samples.len + fft_tail_padding_samples_count - 2 - padding_index;
+            const target_index = center_padding_samples_count + samples.len + fft_tail_padding_samples_count + padding_index;
             centered_samples[target_index] = if (source_index < samples.len) content_samples[source_index] else 0.0;
         }
 
@@ -165,16 +190,34 @@ pub const Extractor = struct {
         // Padding waveform samples would change the maximum used by Whisper's
         // logarithmic normalization. Pad the completed Mel rows instead.
 
-        @memset(extractor.encoder_features, 0.0);
+        const encoder_frames_count = paddedEncoderFramesCount(content_frames_count, trailing_padding);
+        const encoder_features = extractor.encoder_features[0 .. mel_bins_count * encoder_frames_count];
+        @memset(encoder_features, 0.0);
+
         for (0..mel_bins_count) |mel_bin_index| {
             const content_row = content_features[mel_bin_index * content_frames_count ..][0..content_frames_count];
-            const encoder_row = extractor.encoder_features[mel_bin_index * encoder_frames_count ..][0..content_frames_count];
+            const encoder_row = encoder_features[mel_bin_index * encoder_frames_count ..][0..content_frames_count];
             @memcpy(encoder_row, content_row);
         }
 
-        return .{ .values = extractor.encoder_features, .frames_count = encoder_frames_count };
+        return .{ .values = encoder_features, .frames_count = encoder_frames_count };
     }
 };
+
+fn paddedEncoderFramesCount(content_frames_count: usize, trailing_padding: EncoderTrailingPadding) usize {
+    assert(content_frames_count > 0);
+    assert(content_frames_count <= encoder_frames_count_max);
+
+    const requested_frames_count = content_frames_count + trailing_padding.framesCount();
+    const capped_frames_count = @min(requested_frames_count, encoder_frames_count_max);
+    const aligned_frames_count = std.mem.alignForward(usize, capped_frames_count, simd_lanes_count);
+
+    assert(aligned_frames_count >= content_frames_count);
+    assert(aligned_frames_count <= encoder_frames_count_max);
+    assert(aligned_frames_count % simd_lanes_count == 0);
+
+    return aligned_frames_count;
+}
 
 fn calculatePowerSpectra(power_spectra: []f32, centered_samples: []const f32, frames_count: usize, hann_window: []const f32, dft_cosines: []const f32, dft_sines: []const f32) void {
     assert(power_spectra.len == frames_count * fft_bins_count);
@@ -280,23 +323,41 @@ fn calculateMelFilters(filters: []f32) void {
     }
 }
 
-fn addValuesSize(size: usize, values_count: usize) usize {
-    const aligned_size = std.mem.alignForward(usize, size, memory_alignment);
+const MemoryLayout = struct {
+    hann_window: memory_layout.Region(f32),
+    dft_cosines: memory_layout.Region(f32),
+    dft_sines: memory_layout.Region(f32),
+    mel_filters: memory_layout.Region(f32),
+    centered_samples: memory_layout.Region(f32),
+    power_spectra: memory_layout.Region(f32),
+    content_features: memory_layout.Region(f32),
+    encoder_features: memory_layout.Region(f32),
+    size: usize,
 
-    return aligned_size + values_count * @sizeOf(f32);
-}
+    fn init(configured_samples_count_max: usize) MemoryLayout {
+        assert(configured_samples_count_max >= samples_count_min);
+        assert(configured_samples_count_max <= samples_count_max);
 
-const MemoryCursor = struct {
-    memory: []u8,
-    offset: usize = 0,
+        var builder: memory_layout.Builder = .{};
+        const hann_window = builder.add(f32, fft_samples_count);
+        const dft_cosines = builder.add(f32, fft_bins_count * fft_samples_count);
+        const dft_sines = builder.add(f32, fft_bins_count * fft_samples_count);
+        const mel_filters = builder.add(f32, mel_bins_count * fft_bins_count);
+        const centered_samples = builder.add(f32, configured_samples_count_max + 2 * center_padding_samples_count + fft_tail_padding_samples_count);
+        const power_spectra = builder.add(f32, encoder_frames_count_max * fft_bins_count);
+        const content_features = builder.add(f32, mel_bins_count * encoder_frames_count_max);
+        const encoder_features = builder.add(f32, mel_bins_count * encoder_frames_count_max);
 
-    fn takeF32(cursor: *MemoryCursor, values_count: usize) []f32 {
-        cursor.offset = std.mem.alignForward(usize, cursor.offset, memory_alignment);
-        assert(cursor.offset + values_count * @sizeOf(f32) <= cursor.memory.len);
-
-        const values: [*]f32 = @ptrCast(@alignCast(cursor.memory.ptr + cursor.offset));
-        cursor.offset += values_count * @sizeOf(f32);
-
-        return values[0..values_count];
+        return .{
+            .hann_window = hann_window,
+            .dft_cosines = dft_cosines,
+            .dft_sines = dft_sines,
+            .mel_filters = mel_filters,
+            .centered_samples = centered_samples,
+            .power_spectra = power_spectra,
+            .content_features = content_features,
+            .encoder_features = encoder_features,
+            .size = builder.size,
+        };
     }
 };

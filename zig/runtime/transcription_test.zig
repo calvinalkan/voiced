@@ -79,6 +79,8 @@ test "transcribes audio fixtures" {
     defer audio_fixtures.close(std.testing.io);
 
     const selected_fixture = std.testing.environ.getPosix("VOICED_RUNTIME_AUDIO_FIXTURE");
+    const encoder_trailing_padding = try selectedEncoderTrailingPadding();
+    const transcribe_options: voiced_runtime_module.TranscribeOptions = .{ .encoder_trailing_padding = encoder_trailing_padding };
     var transcript_output: [transcript_size_max]u8 = undefined;
 
     // ── Accumulate Suite Results ──
@@ -149,7 +151,7 @@ test "transcribes audio fixtures" {
 
         const transcription_start = std.Io.Clock.awake.now(std.testing.io);
 
-        const transcription = try runtime.transcribe(samples, &transcript_output);
+        const transcription = try runtime.transcribe(samples, &transcript_output, transcribe_options);
 
         const transcription_elapsed = transcription_start.durationTo(std.Io.Clock.awake.now(std.testing.io));
         assert(transcription_elapsed.nanoseconds >= 0);
@@ -176,7 +178,7 @@ test "transcribes audio fixtures" {
 
         // ── Report Fixture ──
 
-        std.debug.print("\n{s}\n  expected: {s}\n  actual:   {s}\n  word errors: {d}/{d}\n  latency: {d:.1} ms\n", .{ id, std.mem.trim(u8, expected_transcript, " \t\r\n"), transcription.text, errors_count, expected_words.len, transcription_elapsed_ms });
+        std.debug.print("\n{s}\n  expected: {s}\n  actual:   {s}\n  word errors: {d}/{d}\n  encoder positions: {d}\n  no-speech probability: {d:.6}\n  average log probability: {d:.6}\n  latency: {d:.1} ms\n", .{ id, std.mem.trim(u8, expected_transcript, " \t\r\n"), transcription.text, errors_count, expected_words.len, transcription.encoder_positions_count, transcription.no_speech_probability, transcription.average_log_probability, transcription_elapsed_ms });
     }
 
     // ── Report Suite ──
@@ -188,13 +190,17 @@ test "transcribes audio fixtures" {
 
     const word_error_rate = @as(f64, @floatFromInt(word_errors_count)) / @as(f64, @floatFromInt(reference_words_count));
 
-    std.debug.print("\nPure Zig {s} transcription: {d} fixtures, {d}/{d} word errors ({d:.2}%)\n", .{ test_model.name, fixtures_count, word_errors_count, reference_words_count, 100.0 * word_error_rate });
+    std.debug.print("\nPure Zig {s} transcription with {s} trailing padding: {d} fixtures, {d}/{d} word errors ({d:.2}%)\n", .{ test_model.name, @tagName(encoder_trailing_padding), fixtures_count, word_errors_count, reference_words_count, 100.0 * word_error_rate });
 
     try std.testing.expect(word_error_rate <= 0.06);
 }
 
 fn openAudioFixturesDirectory() !std.Io.Dir {
     const cwd = std.Io.Dir.cwd();
+    if (std.testing.environ.getPosix("VOICED_RUNTIME_AUDIO_FIXTURES_DIRECTORY")) |path| {
+        return cwd.openDir(std.testing.io, path, .{ .iterate = true });
+    }
+
     const directory = cwd.openDir(std.testing.io, "zig/audio-fixtures/audio", .{ .iterate = true }) catch |err| {
         if (err != error.FileNotFound) {
             return err;
@@ -208,7 +214,23 @@ fn openAudioFixturesDirectory() !std.Io.Dir {
     return directory;
 }
 
-// ─── Test Model Selection ──────────────────────────────────────────────────
+// ─── Test Configuration ───────────────────────────────────────────────────
+
+fn selectedEncoderTrailingPadding() !voiced_runtime_module.EncoderTrailingPadding {
+    const seconds = std.testing.environ.getPosix("VOICED_RUNTIME_TRAILING_PADDING_SECONDS") orelse "30";
+
+    if (std.mem.eql(u8, seconds, "5")) {
+        return .seconds_5;
+    }
+    if (std.mem.eql(u8, seconds, "10")) {
+        return .seconds_10;
+    }
+    if (std.mem.eql(u8, seconds, "30")) {
+        return .seconds_30;
+    }
+
+    return error.UnsupportedEncoderTrailingPadding;
+}
 
 fn selectedTestModel() !TestModel {
     const name = std.testing.environ.getPosix("VOICED_RUNTIME_MODEL") orelse "base.en";

@@ -5,7 +5,8 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Operation = *const fn (*anyopaque, Lane) void;
-const workers_count_max: usize = 32;
+
+pub const workers_count_max: usize = 32;
 
 pub const ExecutorError = error{
     InvalidWorkersCount,
@@ -146,12 +147,6 @@ pub const Executor = struct {
         executor.operation = null;
         executor.operation_context = null;
         executor.is_running_operation = false;
-    }
-
-    pub fn workersCount(executor: *const Executor) usize {
-        assert(executor.workers_count > 0);
-
-        return executor.workers_count;
     }
 };
 

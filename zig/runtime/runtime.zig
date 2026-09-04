@@ -1,40 +1,34 @@
-//! `Runtime` executes one complete English Whisper transcription from normalized 16 kHz samples. Initialization allocates one address-stable control object and partitions caller-owned memory into all tensors; transcription performs no allocation.
+//! `Runtime` executes one complete English Whisper transcription from normalized 16 kHz samples. Initialization allocates one address-stable control object and binds caller-owned memory into all tensors; transcription performs no allocation.
 
 const std = @import("std");
-const audio = @import("audio.zig");
-const dense_kernel = @import("dense.zig");
-const encoder_attention_kernel = @import("attention.zig");
+const attention = @import("attention.zig");
+const decoder_module = @import("decoder.zig");
+const encoder_module = @import("encoder.zig");
 const executor_module = @import("executor.zig");
+const log_mel = @import("log_mel.zig");
+const memory_layout = @import("memory_layout.zig");
 const model_module = @import("model.zig");
 const assert = std.debug.assert;
 
+const Decoder = decoder_module.Decoder;
+const Encoder = encoder_module.Encoder;
 const Executor = executor_module.Executor;
 const Lane = executor_module.Lane;
 const Model = model_module.Model;
 const ModelKind = model_module.ModelKind;
 const ModelSpecification = model_module.ModelSpecification;
 const InferenceWeights = model_module.InferenceWeights;
-const QuantizedWeight = model_module.QuantizedWeight;
 
-const sample_rate_hz: usize = 16_000;
-const mel_frames_count: usize = 3000;
-const convolution_kernel_width: usize = 3;
-const attention_head_width: usize = encoder_attention_kernel.head_width;
-pub const runtime_memory_alignment: usize = 64;
-const memory_alignment = runtime_memory_alignment;
-const simd_lanes_count: usize = 8;
-const packed_output_rows_count: usize = 8;
-const packed_depth_values_count: usize = 4;
-const packed_group_bytes_count: usize = packed_output_rows_count * packed_depth_values_count;
+pub const runtime_memory_alignment: usize = memory_layout.alignment;
+
 const decoder_prompt_tokens_count: usize = 2;
 const end_of_text_token: Token = 50_256;
 const start_of_transcript_token: Token = 50_257;
 const no_speech_token: Token = 50_361;
 const no_timestamps_token: Token = 50_362;
 
-const F32x8 = @Vector(simd_lanes_count, f32);
-
-pub const Token = u32;
+pub const EncoderTrailingPadding = log_mel.EncoderTrailingPadding;
+pub const Token = decoder_module.Token;
 
 pub const RuntimeError = error{
     AudioTooShort,
@@ -49,217 +43,127 @@ pub const RuntimeError = error{
 
 pub const RuntimeInitError = RuntimeError || std.mem.Allocator.Error;
 
+/// `Policy` fixes capacities and worker ownership for one runtime. These values
+/// determine caller-owned memory size and cannot change until the runtime is
+/// recreated; they do not select a transcription's logical encoder length.
 pub const Policy = struct {
-    samples_count_max: usize = 30 * sample_rate_hz,
+    /// Maximum 16 kHz samples accepted by one transcription.
+    samples_count_max: usize = log_mel.samples_count_max,
+
+    /// Maximum text tokens retained in caller-owned runtime memory.
     generated_tokens_count_max: usize = 224,
+
+    /// Persistent executor threads cooperating on one transcription.
     workers_count: usize = 4,
+};
+
+/// `TranscribeOptions` selects behavior that does not alter runtime capacity.
+/// Different calls on one runtime may use different trailing-padding values.
+pub const TranscribeOptions = struct {
+    /// Normalized silence appended after content before encoder execution.
+    encoder_trailing_padding: EncoderTrailingPadding = .seconds_30,
 };
 
 pub const Transcription = struct {
     text: []const u8,
     generated_tokens_count: usize,
+
+    /// Logical encoder sequence length used for this transcription. Standard
+    /// 30-second Whisper input contains 1,500 positions.
+    encoder_positions_count: usize,
+
     no_speech_probability: f32,
     average_log_probability: f32,
 };
 
 /// `Runtime` is allocated once so its persistent workers can retain the executor's address. It borrows one immutable model, vocabulary text, and caller-owned memory until `deinit` returns.
 pub const Runtime = struct {
-    model: *const Model,
     specification: ModelSpecification,
     weights: InferenceWeights,
-    policy: Policy,
-    memory: []align(memory_alignment) u8,
+    generated_tokens_count_max: usize,
     executor: Executor,
-    extractor: audio.Extractor,
+    extractor: log_mel.Extractor,
     vocabulary: Vocabulary,
-    convolution_1_weight: QuantizedWeight,
-    convolution_2_weight: QuantizedWeight,
-    convolution_1_packed_values: []i8,
-    convolution_2_packed_values: []i8,
-    convolution_1_output: []f32,
-    encoder_activation_0: []f32,
-    encoder_activation_1: []f32,
-    encoder_normalized: []f32,
-    encoder_query_key_value: []f32,
-    encoder_attention: []f32,
-    encoder_attention_scratch: []f32,
-    encoded_audio: []f32,
-    decoder_cross_key_values: []f32,
-    decoder_self_keys: []f32,
-    decoder_self_values: []f32,
-    decoder_input: []f32,
-    decoder_normalized: []f32,
-    decoder_query_key_value: []f32,
-    decoder_attention: []f32,
-    decoder_projection: []f32,
-    decoder_ffn: []f32,
-    logits: []f32,
+    encoder: Encoder,
+    decoder: Decoder,
     generated_tokens: []Token,
-    lane_float_rows: []f32,
-    lane_quantized_rows: []u8,
-    lane_attention_scores: []f32,
 
     /// `requiredMemorySize` returns the bytes required by `init` for `kind` and
     /// `policy`. The result excludes the packed model image and OS thread stacks.
     pub fn requiredMemorySize(kind: ModelKind, policy: Policy) RuntimeError!usize {
-        try validatePolicy(kind.specification(), policy);
-
         const specification = kind.specification();
-        const width = specification.encoder_width;
-        const positions_count = specification.encoder_positions_count_max;
-        const decoder_width = specification.decoder_width;
-        const decoder_positions_count = specification.decoder_positions_count_max;
-        const layers_count = specification.decoder_layers_count;
-        const convolution_1_depth = specification.mel_bins_count * convolution_kernel_width;
-        const convolution_2_depth = width * convolution_kernel_width;
-        const lane_row_values_count = @max(specification.encoder_ffn_width, convolution_2_depth);
-        const lane_float_scratch_values_count = @max(lane_row_values_count, dense_kernel.ffn_rows_per_tile * specification.encoder_ffn_width);
-        const lane_quantized_scratch_values_count = dense_kernel.rows_per_tile * lane_row_values_count;
-        const encoder_normalized_values_count = positions_count * width;
-        const encoder_attention_scratch_values_count = encoder_attention_kernel.scratchValuesCount(positions_count, specification.encoder_attention_heads_count, policy.workers_count);
-        const encoder_shared_scratch_values_count = @max(encoder_normalized_values_count, encoder_attention_scratch_values_count);
+        try validatePolicy(specification, policy);
 
-        var size: usize = 0;
-        size = addMemoryRegion(size, u8, audio.Extractor.requiredMemorySize(policy.samples_count_max));
-        size = addMemoryRegion(size, u8, width * convolution_1_depth);
-        size = addMemoryRegion(size, u8, width * convolution_2_depth);
-        size = addMemoryRegion(size, u32, specification.vocabulary_tokens_count + 1);
-        size = addMemoryRegion(size, f32, mel_frames_count * width);
-        size = addMemoryRegion(size, f32, positions_count * width);
-        size = addMemoryRegion(size, f32, positions_count * width);
-        size = addMemoryRegion(size, f32, encoder_shared_scratch_values_count);
-        size = addMemoryRegion(size, f32, positions_count * 3 * width);
-        size = addMemoryRegion(size, f32, positions_count * width);
-        size = addMemoryRegion(size, f32, positions_count * width);
-        size = addMemoryRegion(size, f32, layers_count * positions_count * 2 * decoder_width);
-        size = addMemoryRegion(size, f32, layers_count * decoder_positions_count * decoder_width);
-        size = addMemoryRegion(size, f32, layers_count * decoder_positions_count * decoder_width);
-        size = addMemoryRegion(size, f32, decoder_width);
-        size = addMemoryRegion(size, f32, decoder_width);
-        size = addMemoryRegion(size, f32, 3 * decoder_width);
-        size = addMemoryRegion(size, f32, decoder_width);
-        size = addMemoryRegion(size, f32, decoder_width);
-        size = addMemoryRegion(size, f32, specification.decoder_ffn_width);
-        size = addMemoryRegion(size, f32, specification.vocabulary_tokens_count);
-        size = addMemoryRegion(size, Token, policy.generated_tokens_count_max);
-        size = addMemoryRegion(size, f32, policy.workers_count * lane_float_scratch_values_count);
-        size = addMemoryRegion(size, u8, policy.workers_count * lane_quantized_scratch_values_count);
-        size = addMemoryRegion(size, f32, policy.workers_count * positions_count);
-
-        return size;
+        return RuntimeMemoryLayout.init(specification, policy).size;
     }
 
     /// `init` allocates the address-stable runtime, constructs every tensor view, and starts the persistent worker group. Pass the same allocator to `deinit`. `io`, `model`, `vocabulary_text`, and `memory` must remain valid until then. The vocabulary must contain exactly one UTF-8 token per model vocabulary row in token-ID order.
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, model: *const Model, vocabulary_text: []const u8, memory: []align(memory_alignment) u8, policy: Policy) RuntimeInitError!*Runtime {
-        try validatePolicy(model.specification, policy);
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, model: *const Model, vocabulary_text: []const u8, memory: []align(runtime_memory_alignment) u8, policy: Policy) RuntimeInitError!*Runtime {
+        const specification = model.specification;
+        try validatePolicy(specification, policy);
 
-        const required_memory_size = try requiredMemorySize(model.kind, policy);
-        if (memory.len < required_memory_size) {
+        const layout = RuntimeMemoryLayout.init(specification, policy);
+        if (memory.len < layout.size) {
             return error.MemoryTooSmall;
         }
 
-        const specification = model.specification;
-        const weights = model.inferenceWeights();
-        const width = specification.encoder_width;
-        const positions_count = specification.encoder_positions_count_max;
-        const decoder_width = specification.decoder_width;
-        const decoder_positions_count = specification.decoder_positions_count_max;
-        const layers_count = specification.decoder_layers_count;
-        const convolution_1_depth = specification.mel_bins_count * convolution_kernel_width;
-        const convolution_2_depth = width * convolution_kernel_width;
-        const lane_row_values_count = @max(specification.encoder_ffn_width, convolution_2_depth);
-        const lane_float_scratch_values_count = @max(lane_row_values_count, dense_kernel.ffn_rows_per_tile * specification.encoder_ffn_width);
-        const lane_quantized_scratch_values_count = dense_kernel.rows_per_tile * lane_row_values_count;
-        const encoder_normalized_values_count = positions_count * width;
-        const encoder_attention_scratch_values_count = encoder_attention_kernel.scratchValuesCount(positions_count, specification.encoder_attention_heads_count, policy.workers_count);
-        const encoder_shared_scratch_values_count = @max(encoder_normalized_values_count, encoder_attention_scratch_values_count);
+        // ── Bind Caller Memory ──
 
-        // ── Partition Caller Memory ──
+        var extractor: log_mel.Extractor = undefined;
+        try extractor.init(layout.extractor_memory.bind(memory), policy.samples_count_max);
 
-        var cursor: MemoryCursor = .{ .memory = memory };
-        const extractor_memory = cursor.takeBytes(audio.Extractor.requiredMemorySize(policy.samples_count_max));
-        const convolution_1_packed_values = cursor.take(i8, width * convolution_1_depth);
-        const convolution_2_packed_values = cursor.take(i8, width * convolution_2_depth);
-        const vocabulary_offsets = cursor.take(u32, specification.vocabulary_tokens_count + 1);
-        const convolution_1_output = cursor.take(f32, mel_frames_count * width);
-        const encoder_activation_0 = cursor.take(f32, positions_count * width);
-        const encoder_activation_1 = cursor.take(f32, positions_count * width);
+        const vocabulary = try Vocabulary.init(vocabulary_text, layout.vocabulary_offsets.bind(memory));
+        const encoder_decoder_projection_scratch = layout.encoder_decoder_projection_scratch.bind(memory);
+        const lane_quantized_rows = layout.lane_quantized_rows.bind(memory);
 
-        // LayerNorm output dies after QKV projection. Blocked attention reuses
-        // the same physical region instead of adding another persistent arena.
-        const encoder_shared_scratch = cursor.take(f32, encoder_shared_scratch_values_count);
-        const encoder_normalized = encoder_shared_scratch[0..encoder_normalized_values_count];
-        const encoder_attention_scratch = encoder_shared_scratch[0..encoder_attention_scratch_values_count];
-        const encoder_query_key_value = cursor.take(f32, positions_count * 3 * width);
-        const encoder_attention = cursor.take(f32, positions_count * width);
-        const encoded_audio = cursor.take(f32, positions_count * width);
-        const decoder_cross_key_values = cursor.take(f32, layers_count * positions_count * 2 * decoder_width);
-        const decoder_self_keys = cursor.take(f32, layers_count * decoder_positions_count * decoder_width);
-        const decoder_self_values = cursor.take(f32, layers_count * decoder_positions_count * decoder_width);
-        const decoder_input = cursor.take(f32, decoder_width);
-        const decoder_normalized = cursor.take(f32, decoder_width);
-        const decoder_query_key_value = cursor.take(f32, 3 * decoder_width);
-        const decoder_attention = cursor.take(f32, decoder_width);
-        const decoder_projection = cursor.take(f32, decoder_width);
-        const decoder_ffn = cursor.take(f32, specification.decoder_ffn_width);
-        const logits = cursor.take(f32, specification.vocabulary_tokens_count);
-        const generated_tokens = cursor.take(Token, policy.generated_tokens_count_max);
-        const lane_float_rows = cursor.take(f32, policy.workers_count * lane_float_scratch_values_count);
-        const lane_quantized_rows = cursor.take(u8, policy.workers_count * lane_quantized_scratch_values_count);
-        const lane_attention_scores = cursor.take(f32, policy.workers_count * positions_count);
-        assert(cursor.offset <= memory.len);
+        const encoder = Encoder.init(.{
+            .convolution_1_output = layout.encoder_convolution_1_output.bind(memory),
+            .activation_0 = layout.encoder_activation_0.bind(memory),
+            .activation_1 = layout.encoder_activation_1.bind(memory),
+            .shared_scratch = layout.encoder_shared_scratch.bind(memory),
+            .query_key_value = encoder_decoder_projection_scratch,
+            .attention_output = layout.encoder_attention.bind(memory),
+            .encoded_audio = layout.encoded_audio.bind(memory),
+            .lane_float_rows = layout.lane_float_rows.bind(memory),
+            .lane_quantized_rows = lane_quantized_rows,
+        }, specification, policy.workers_count);
 
-        // ── Initialize Immutable Runtime State ──
-
-        var extractor: audio.Extractor = undefined;
-        try extractor.init(extractor_memory, policy.samples_count_max);
-
-        const vocabulary = try Vocabulary.init(vocabulary_text, vocabulary_offsets);
-        packRowMajorWeight(weights.encoder_convolution_1_weight, convolution_1_packed_values);
-        packRowMajorWeight(weights.encoder_convolution_2_weight, convolution_2_packed_values);
+        // Encoding completes before decoder cache preparation. Those phases
+        // reuse projection and quantization scratch but never overlap.
+        const decoder = Decoder.init(.{
+            .cross_projection_scratch = encoder_decoder_projection_scratch,
+            .cross_key_values = layout.decoder_cross_key_values.bind(memory),
+            .self_keys = layout.decoder_self_keys.bind(memory),
+            .self_values = layout.decoder_self_values.bind(memory),
+            .input = layout.decoder_input.bind(memory),
+            .normalized = layout.decoder_normalized.bind(memory),
+            .query_key_value = layout.decoder_query_key_value.bind(memory),
+            .attention_output = layout.decoder_attention.bind(memory),
+            .projection = layout.decoder_projection.bind(memory),
+            .ffn = layout.decoder_ffn.bind(memory),
+            .logits = layout.logits.bind(memory),
+            .lane_quantized_rows = lane_quantized_rows,
+            .lane_attention_scores = layout.lane_attention_scores.bind(memory),
+        }, specification, policy.workers_count);
 
         const runtime = try allocator.create(Runtime);
         errdefer allocator.destroy(runtime);
 
         runtime.* = .{
-            .model = model,
             .specification = specification,
-            .weights = weights,
-            .policy = policy,
-            .memory = memory,
+            .weights = model.inferenceWeights(),
+            .generated_tokens_count_max = policy.generated_tokens_count_max,
             .executor = undefined,
             .extractor = extractor,
             .vocabulary = vocabulary,
-            .convolution_1_weight = repackedWeight(weights.encoder_convolution_1_weight, convolution_1_packed_values),
-            .convolution_2_weight = repackedWeight(weights.encoder_convolution_2_weight, convolution_2_packed_values),
-            .convolution_1_packed_values = convolution_1_packed_values,
-            .convolution_2_packed_values = convolution_2_packed_values,
-            .convolution_1_output = convolution_1_output,
-            .encoder_activation_0 = encoder_activation_0,
-            .encoder_activation_1 = encoder_activation_1,
-            .encoder_normalized = encoder_normalized,
-            .encoder_query_key_value = encoder_query_key_value,
-            .encoder_attention = encoder_attention,
-            .encoder_attention_scratch = encoder_attention_scratch,
-            .encoded_audio = encoded_audio,
-            .decoder_cross_key_values = decoder_cross_key_values,
-            .decoder_self_keys = decoder_self_keys,
-            .decoder_self_values = decoder_self_values,
-            .decoder_input = decoder_input,
-            .decoder_normalized = decoder_normalized,
-            .decoder_query_key_value = decoder_query_key_value,
-            .decoder_attention = decoder_attention,
-            .decoder_projection = decoder_projection,
-            .decoder_ffn = decoder_ffn,
-            .logits = logits,
-            .generated_tokens = generated_tokens,
-            .lane_float_rows = lane_float_rows,
-            .lane_quantized_rows = lane_quantized_rows,
-            .lane_attention_scores = lane_attention_scores,
+            .encoder = encoder,
+            .decoder = decoder,
+            .generated_tokens = layout.generated_tokens.bind(memory),
         };
 
-        runtime.executor.init(io, policy.workers_count) catch {
-            return error.ThreadSpawnFailed;
+        runtime.executor.init(io, policy.workers_count) catch |err| switch (err) {
+            error.InvalidWorkersCount => unreachable,
+            error.ThreadSpawnFailed => return error.ThreadSpawnFailed,
         };
 
         return runtime;
@@ -272,29 +176,30 @@ pub const Runtime = struct {
 
     /// `transcribe` accepts finite mono samples in `[-1, 1]` at 16 kHz, writes
     /// one greedy English transcript into `text_output`, and returns a slice
-    /// that aliases it. The operation reuses the runtime's sole inference slot
-    /// and is not reentrant.
-    pub fn transcribe(runtime: *Runtime, samples: []const f32, text_output: []u8) RuntimeError!Transcription {
+    /// that aliases it. `options.encoder_trailing_padding` appends normalized
+    /// silence after the content and caps the logical input at Whisper's
+    /// 30-second context. The operation allocates nothing, reuses the runtime's
+    /// sole inference slot, and is not reentrant.
+    pub fn transcribe(runtime: *Runtime, samples: []const f32, text_output: []u8, options: TranscribeOptions) RuntimeError!Transcription {
         for (samples) |sample| {
             if (!std.math.isFinite(sample) or sample < -1.0 or sample > 1.0) {
                 return error.InvalidSamples;
             }
         }
 
-        const features = runtime.extractor.calculate(samples) catch |err| switch (err) {
+        const features = runtime.extractor.calculate(samples, options.encoder_trailing_padding) catch |err| switch (err) {
             error.AudioTooShort => return error.AudioTooShort,
             error.AudioDurationExceedsLimit => return error.AudioDurationExceedsLimit,
             error.MemoryTooSmall => unreachable,
         };
-        assert(features.frames_count == mel_frames_count);
 
         var context: TranscriptionContext = .{
             .runtime = runtime,
-            .features = features.values,
+            .features = features,
         };
         runtime.executor.run(@ptrCast(&context), transcribeWide);
 
-        assert(context.generated_tokens_count <= runtime.policy.generated_tokens_count_max);
+        assert(context.generated_tokens_count <= runtime.generated_tokens_count_max);
         assert(std.math.isFinite(context.no_speech_probability));
         assert(context.no_speech_probability >= 0 and context.no_speech_probability <= 1);
         assert(std.math.isFinite(context.average_log_probability));
@@ -305,6 +210,7 @@ pub const Runtime = struct {
         return .{
             .text = std.mem.trim(u8, text, " \t\r\n"),
             .generated_tokens_count = context.generated_tokens_count,
+            .encoder_positions_count = features.encoderPositionsCount(),
             .no_speech_probability = context.no_speech_probability,
             .average_log_probability = context.average_log_probability,
         };
@@ -313,7 +219,7 @@ pub const Runtime = struct {
 
 const TranscriptionContext = struct {
     runtime: *Runtime,
-    features: []const f32,
+    features: log_mel.Features,
     generated_tokens_count: usize = 0,
     next_token: Token = 0,
     no_speech_probability: f32 = 0,
@@ -326,21 +232,22 @@ fn transcribeWide(raw_context: *anyopaque, lane: Lane) void {
     const context: *TranscriptionContext = @ptrCast(@alignCast(raw_context));
     const runtime = context.runtime;
     const specification = runtime.specification;
+    const weights = &runtime.weights;
 
     // ── Encode Audio ──
 
-    encodeAudio(runtime, context.features, lane);
-    precomputeDecoderCrossKeyValues(runtime, lane);
+    const encoded_audio = runtime.encoder.encode(specification, weights, context.features, lane);
+    runtime.decoder.precomputeCrossKeyValues(specification, weights, encoded_audio.values, encoded_audio.positions_count, lane);
 
     // ── Seed Decoder ──
 
-    decodeToken(runtime, start_of_transcript_token, 0, lane);
+    runtime.decoder.decodeToken(specification, weights, encoded_audio.positions_count, start_of_transcript_token, 0, lane);
     if (lane.isLeader()) {
-        context.no_speech_probability = probabilityOfToken(runtime.logits, no_speech_token);
+        context.no_speech_probability = probabilityOfToken(runtime.decoder.logits(), no_speech_token);
     }
     lane.sync();
 
-    decodeToken(runtime, no_timestamps_token, 1, lane);
+    runtime.decoder.decodeToken(specification, weights, encoded_audio.positions_count, no_timestamps_token, 1, lane);
 
     // ── Generate Greedy Tokens ──
     //
@@ -349,9 +256,9 @@ fn transcribeWide(raw_context: *anyopaque, lane: Lane) void {
 
     var decoder_position = decoder_prompt_tokens_count;
 
-    while (decoder_position < specification.decoder_positions_count_max and context.generated_tokens_count < runtime.policy.generated_tokens_count_max) : (decoder_position += 1) {
+    while (decoder_position < specification.decoder_positions_count_max and context.generated_tokens_count < runtime.generated_tokens_count_max) : (decoder_position += 1) {
         if (lane.isLeader()) {
-            const selection = selectGreedyToken(runtime.logits, context.generated_tokens_count == 0);
+            const selection = selectGreedyToken(runtime.decoder.logits(), context.generated_tokens_count == 0);
             context.next_token = selection.token;
             context.selected_log_probabilities_sum += selection.log_probability;
             context.decoding_is_complete = selection.token == end_of_text_token;
@@ -367,7 +274,7 @@ fn transcribeWide(raw_context: *anyopaque, lane: Lane) void {
             break;
         }
 
-        decodeToken(runtime, context.next_token, decoder_position, lane);
+        runtime.decoder.decodeToken(specification, weights, encoded_audio.positions_count, context.next_token, decoder_position, lane);
     }
 
     if (lane.isLeader()) {
@@ -375,346 +282,6 @@ fn transcribeWide(raw_context: *anyopaque, lane: Lane) void {
         context.average_log_probability = if (scored_tokens_count == 0) 0 else context.selected_log_probabilities_sum / @as(f32, @floatFromInt(scored_tokens_count));
     }
     lane.sync();
-}
-
-// ─── Encoder ───────────────────────────────────────────────────────────────
-
-fn encodeAudio(runtime: *Runtime, features: []const f32, lane: Lane) void {
-    const specification = runtime.specification;
-    const width = specification.encoder_width;
-    const positions_count = specification.encoder_positions_count_max;
-
-    convolution(runtime, features, mel_frames_count, specification.mel_bins_count, runtime.convolution_1_weight, runtime.weights.encoder_convolution_1_bias, 1, true, runtime.convolution_1_output, lane);
-    lane.sync();
-
-    convolution(runtime, runtime.convolution_1_output, mel_frames_count, width, runtime.convolution_2_weight, runtime.weights.encoder_convolution_2_bias, 2, false, runtime.encoder_activation_0, lane);
-    lane.sync();
-
-    const position_values_range = lane.range(positions_count * width);
-    for (position_values_range.start_index..position_values_range.end_index) |value_index| {
-        runtime.encoder_activation_0[value_index] += runtime.weights.encoder_position_encodings[value_index];
-    }
-    lane.sync();
-
-    var layer_input = runtime.encoder_activation_0;
-    var layer_output = runtime.encoder_activation_1;
-    for (runtime.weights.encoder_layers[0..specification.encoder_layers_count]) |layer_weights| {
-        dense_kernel.forwardNormalizedRows(layer_input, layer_weights.self_attention_layer_norm_gamma, layer_weights.self_attention_layer_norm_beta, positions_count, layer_weights.self_attention_query_key_value_weight, layer_weights.self_attention_query_key_value_bias, runtime.encoder_query_key_value, laneQuantizedRow(runtime, lane), lane);
-        lane.sync();
-
-        encoderAttention(runtime, runtime.encoder_query_key_value, runtime.encoder_attention, lane);
-        lane.sync();
-
-        dense(runtime, runtime.encoder_attention, positions_count, layer_weights.self_attention_output_weight, layer_weights.self_attention_output_bias, .none, layer_output, lane);
-        lane.sync();
-
-        addInto(layer_input, layer_output, lane);
-        lane.sync();
-
-        layerNorm(layer_output, layer_weights.ffn_layer_norm_gamma, layer_weights.ffn_layer_norm_beta, positions_count, width, runtime.encoder_normalized, lane);
-        lane.sync();
-
-        dense_kernel.forwardFeedForwardRows(runtime.encoder_normalized, positions_count, layer_weights.ffn_expansion_weight, layer_weights.ffn_expansion_bias, layer_weights.ffn_contraction_weight, layer_weights.ffn_contraction_bias, runtime.encoder_attention, laneFloatRow(runtime, lane), laneQuantizedRow(runtime, lane), lane);
-        lane.sync();
-
-        addInto(runtime.encoder_attention, layer_output, lane);
-        lane.sync();
-
-        const previous_input = layer_input;
-        layer_input = layer_output;
-        layer_output = previous_input;
-    }
-
-    layerNorm(layer_input, runtime.weights.encoder_layer_norm_gamma, runtime.weights.encoder_layer_norm_beta, positions_count, width, runtime.encoded_audio, lane);
-    lane.sync();
-}
-
-fn convolution(runtime: *Runtime, input: []const f32, input_positions_count: usize, input_channels_count: usize, weight: QuantizedWeight, bias: []const f32, stride: usize, input_is_channel_major: bool, output: []f32, lane: Lane) void {
-    const output_positions_count = @divFloor(input_positions_count + 2 - convolution_kernel_width, stride) + 1;
-    const output_channels_count = weight.output_rows_count;
-    const input_depth = input_channels_count * convolution_kernel_width;
-    assert(weight.input_values_count == input_depth);
-    assert(output.len == output_positions_count * output_channels_count);
-
-    const output_positions_range = lane.range(output_positions_count);
-    const float_row = laneFloatRow(runtime, lane)[0..input_depth];
-    const quantized_row = laneQuantizedRow(runtime, lane)[0..input_depth];
-
-    for (output_positions_range.start_index..output_positions_range.end_index) |output_position| {
-        const input_origin = @as(isize, @intCast(output_position * stride)) - 1;
-        for (0..input_channels_count) |channel_index| {
-            for (0..convolution_kernel_width) |kernel_index| {
-                const input_position = input_origin + @as(isize, @intCast(kernel_index));
-                const row_index = channel_index * convolution_kernel_width + kernel_index;
-                if (input_position < 0 or input_position >= input_positions_count) {
-                    float_row[row_index] = 0;
-                } else {
-                    const position_index: usize = @intCast(input_position);
-                    const input_index = if (input_is_channel_major) channel_index * input_positions_count + position_index else position_index * input_channels_count + channel_index;
-                    float_row[row_index] = input[input_index];
-                }
-            }
-        }
-
-        const input_scale = dense_kernel.quantizeRow(float_row, quantized_row);
-        const output_row = output[output_position * output_channels_count ..][0..output_channels_count];
-        dense_kernel.forwardQuantizedOne(quantized_row, input_scale, weight, bias, .gelu, output_row);
-    }
-}
-
-fn encoderAttention(runtime: *Runtime, query_key_value: []const f32, output: []f32, lane: Lane) void {
-    const specification = runtime.specification;
-    encoder_attention_kernel.forward(query_key_value, specification.encoder_positions_count_max, specification.encoder_width, specification.encoder_attention_heads_count, output, runtime.encoder_attention_scratch, lane);
-}
-
-fn precomputeDecoderCrossKeyValues(runtime: *Runtime, lane: Lane) void {
-    const specification = runtime.specification;
-    const positions_count = specification.encoder_positions_count_max;
-    const width = specification.decoder_width;
-    const heads_count = specification.decoder_attention_heads_count;
-    const projection_values_count = positions_count * 2 * width;
-    const head_values_count = positions_count * attention_head_width;
-    const projected_key_values = runtime.encoder_query_key_value[0..projection_values_count];
-
-    for (runtime.weights.decoder_layers[0..specification.decoder_layers_count], 0..) |layer_weights, layer_index| {
-        dense(runtime, runtime.encoded_audio, positions_count, layer_weights.cross_attention_key_value_weight, layer_weights.cross_attention_key_value_bias, .none, projected_key_values, lane);
-        lane.sync();
-
-        // Decoder attention revisits these values for every generated token.
-        // Store K and V head-major once so each head reads contiguous rows.
-        const head_major_key_values = runtime.decoder_cross_key_values[layer_index * projection_values_count ..][0..projection_values_count];
-        const projection_heads_range = lane.range(2 * heads_count);
-        for (projection_heads_range.start_index..projection_heads_range.end_index) |projection_head_index| {
-            const projection_index = projection_head_index / heads_count;
-            const head_index = projection_head_index % heads_count;
-            const destination_head_offset = projection_index * positions_count * width + head_index * head_values_count;
-            const source_column = projection_index * width + head_index * attention_head_width;
-            for (0..positions_count) |position_index| {
-                const source_offset = position_index * 2 * width + source_column;
-                const destination_offset = destination_head_offset + position_index * attention_head_width;
-                var depth: usize = 0;
-                while (depth < attention_head_width) : (depth += simd_lanes_count) {
-                    head_major_key_values[destination_offset + depth ..][0..simd_lanes_count].* = projected_key_values[source_offset + depth ..][0..simd_lanes_count].*;
-                }
-            }
-        }
-        lane.sync();
-    }
-}
-
-// ─── Decoder ───────────────────────────────────────────────────────────────
-
-fn decodeToken(runtime: *Runtime, token: Token, decoder_position: usize, lane: Lane) void {
-    const specification = runtime.specification;
-    const width = specification.decoder_width;
-    assert(token < specification.vocabulary_tokens_count);
-    assert(decoder_position < specification.decoder_positions_count_max);
-
-    const input_range = lane.range(width);
-    for (input_range.start_index..input_range.end_index) |column| {
-        runtime.decoder_input[column] = embeddingValue(runtime.weights.decoder_embeddings_weight, token, column) + runtime.weights.decoder_position_encodings[decoder_position * width + column];
-    }
-    lane.sync();
-
-    for (runtime.weights.decoder_layers[0..specification.decoder_layers_count], 0..) |layer_weights, layer_index| {
-        // ── Self-Attention ──
-
-        layerNorm(runtime.decoder_input, layer_weights.self_attention_layer_norm_gamma, layer_weights.self_attention_layer_norm_beta, 1, width, runtime.decoder_normalized, lane);
-        lane.sync();
-
-        dense(runtime, runtime.decoder_normalized, 1, layer_weights.self_attention_query_key_value_weight, layer_weights.self_attention_query_key_value_bias, .none, runtime.decoder_query_key_value, lane);
-        lane.sync();
-
-        storeDecoderSelfKeyValues(runtime, layer_index, decoder_position, lane);
-        lane.sync();
-
-        decoderSelfAttention(runtime, layer_index, decoder_position, lane);
-        lane.sync();
-
-        dense(runtime, runtime.decoder_attention, 1, layer_weights.self_attention_output_weight, layer_weights.self_attention_output_bias, .none, runtime.decoder_projection, lane);
-        lane.sync();
-
-        addInto(runtime.decoder_projection, runtime.decoder_input, lane);
-        lane.sync();
-
-        // ── Cross-Attention ──
-
-        layerNorm(runtime.decoder_input, layer_weights.cross_attention_layer_norm_gamma, layer_weights.cross_attention_layer_norm_beta, 1, width, runtime.decoder_normalized, lane);
-        lane.sync();
-
-        dense(runtime, runtime.decoder_normalized, 1, layer_weights.cross_attention_query_weight, layer_weights.cross_attention_query_bias, .none, runtime.decoder_query_key_value[0..width], lane);
-        lane.sync();
-
-        decoderCrossAttention(runtime, layer_index, lane);
-        lane.sync();
-
-        dense(runtime, runtime.decoder_attention, 1, layer_weights.cross_attention_output_weight, layer_weights.cross_attention_output_bias, .none, runtime.decoder_projection, lane);
-        lane.sync();
-
-        addInto(runtime.decoder_projection, runtime.decoder_input, lane);
-        lane.sync();
-
-        // ── Feed-Forward Network ──
-
-        layerNorm(runtime.decoder_input, layer_weights.ffn_layer_norm_gamma, layer_weights.ffn_layer_norm_beta, 1, width, runtime.decoder_normalized, lane);
-        lane.sync();
-
-        dense(runtime, runtime.decoder_normalized, 1, layer_weights.ffn_expansion_weight, layer_weights.ffn_expansion_bias, .gelu, runtime.decoder_ffn, lane);
-        lane.sync();
-
-        dense(runtime, runtime.decoder_ffn, 1, layer_weights.ffn_contraction_weight, layer_weights.ffn_contraction_bias, .none, runtime.decoder_projection, lane);
-        lane.sync();
-
-        addInto(runtime.decoder_projection, runtime.decoder_input, lane);
-        lane.sync();
-    }
-
-    layerNorm(runtime.decoder_input, runtime.weights.decoder_layer_norm_gamma, runtime.weights.decoder_layer_norm_beta, 1, width, runtime.decoder_normalized, lane);
-    lane.sync();
-
-    dense(runtime, runtime.decoder_normalized, 1, runtime.weights.decoder_embeddings_weight, &.{}, .none, runtime.logits, lane);
-    lane.sync();
-}
-
-fn storeDecoderSelfKeyValues(runtime: *Runtime, layer_index: usize, decoder_position: usize, lane: Lane) void {
-    const specification = runtime.specification;
-    const width = specification.decoder_width;
-    const positions_capacity = specification.decoder_positions_count_max;
-    const layer_offset = layer_index * positions_capacity * width;
-    const columns_range = lane.range(width);
-
-    for (columns_range.start_index..columns_range.end_index) |column| {
-        const head_index = column / attention_head_width;
-        const head_depth = column % attention_head_width;
-        const cache_offset = layer_offset + head_index * positions_capacity * attention_head_width + decoder_position * attention_head_width + head_depth;
-        runtime.decoder_self_keys[cache_offset] = runtime.decoder_query_key_value[width + column];
-        runtime.decoder_self_values[cache_offset] = runtime.decoder_query_key_value[2 * width + column];
-    }
-}
-
-fn decoderSelfAttention(runtime: *Runtime, layer_index: usize, decoder_position: usize, lane: Lane) void {
-    const specification = runtime.specification;
-    const width = specification.decoder_width;
-    const positions_capacity = specification.decoder_positions_count_max;
-    const layer_offset = layer_index * positions_capacity * width;
-    const keys = runtime.decoder_self_keys[layer_offset..][0 .. positions_capacity * width];
-    const values = runtime.decoder_self_values[layer_offset..][0 .. positions_capacity * width];
-    encoder_attention_kernel.decoderForward(runtime.decoder_query_key_value[0..width], keys, values, decoder_position + 1, positions_capacity, width, specification.decoder_attention_heads_count, runtime.decoder_attention, runtime.lane_attention_scores, lane);
-}
-
-fn decoderCrossAttention(runtime: *Runtime, layer_index: usize, lane: Lane) void {
-    const specification = runtime.specification;
-    const width = specification.decoder_width;
-    const positions_count = specification.encoder_positions_count_max;
-    const tensor_values_count = positions_count * width;
-    const layer_values_count = 2 * tensor_values_count;
-    const key_values = runtime.decoder_cross_key_values[layer_index * layer_values_count ..][0..layer_values_count];
-    const keys = key_values[0..tensor_values_count];
-    const values = key_values[tensor_values_count..][0..tensor_values_count];
-    encoder_attention_kernel.decoderForward(runtime.decoder_query_key_value[0..width], keys, values, positions_count, positions_count, width, specification.decoder_attention_heads_count, runtime.decoder_attention, runtime.lane_attention_scores, lane);
-}
-
-// ─── Numerical Operations ──────────────────────────────────────────────────
-
-fn dense(runtime: *Runtime, input: []const f32, rows_count: usize, weight: QuantizedWeight, bias: []const f32, activation: dense_kernel.Activation, output: []f32, lane: Lane) void {
-    const quantized_scratch = laneQuantizedRow(runtime, lane);
-    if (rows_count == 1) {
-        dense_kernel.forwardOne(input, weight, bias, activation, output, quantized_scratch, lane);
-        return;
-    }
-
-    dense_kernel.forwardRows(input, rows_count, weight, bias, activation, output, quantized_scratch, lane);
-}
-
-fn layerNorm(input: []const f32, gamma: []const f32, beta: []const f32, rows_count: usize, width: usize, output: []f32, lane: Lane) void {
-    assert(input.len == rows_count * width);
-    assert(output.len == input.len);
-    assert(gamma.len == width);
-    assert(beta.len == width);
-    assert(width % (4 * simd_lanes_count) == 0);
-
-    const rows_range = lane.range(rows_count);
-    for (rows_range.start_index..rows_range.end_index) |row_index| {
-        const input_row = input[row_index * width ..][0..width];
-        const output_row = output[row_index * width ..][0..width];
-
-        var sums_0: F32x8 = @splat(0);
-        var sums_1: F32x8 = @splat(0);
-        var sums_2: F32x8 = @splat(0);
-        var sums_3: F32x8 = @splat(0);
-
-        var square_sums_0: F32x8 = @splat(0);
-        var square_sums_1: F32x8 = @splat(0);
-        var square_sums_2: F32x8 = @splat(0);
-        var square_sums_3: F32x8 = @splat(0);
-
-        var column: usize = 0;
-
-        while (column < width) : (column += 4 * simd_lanes_count) {
-            const values_0: F32x8 = input_row[column + 0 * simd_lanes_count ..][0..simd_lanes_count].*;
-            const values_1: F32x8 = input_row[column + 1 * simd_lanes_count ..][0..simd_lanes_count].*;
-            const values_2: F32x8 = input_row[column + 2 * simd_lanes_count ..][0..simd_lanes_count].*;
-            const values_3: F32x8 = input_row[column + 3 * simd_lanes_count ..][0..simd_lanes_count].*;
-            sums_0 += values_0;
-            sums_1 += values_1;
-            sums_2 += values_2;
-            sums_3 += values_3;
-            square_sums_0 = @mulAdd(F32x8, values_0, values_0, square_sums_0);
-            square_sums_1 = @mulAdd(F32x8, values_1, values_1, square_sums_1);
-            square_sums_2 = @mulAdd(F32x8, values_2, values_2, square_sums_2);
-            square_sums_3 = @mulAdd(F32x8, values_3, values_3, square_sums_3);
-        }
-
-        const reciprocal_width = 1.0 / @as(f32, @floatFromInt(width));
-        const mean = reduceAdd(((sums_0 + sums_1) + sums_2) + sums_3) * reciprocal_width;
-        const mean_square = reduceAdd((square_sums_0 + square_sums_1) + (square_sums_2 + square_sums_3)) * reciprocal_width;
-        const variance = @max(@mulAdd(f32, -mean, mean, mean_square), 0.0);
-        const reciprocal_standard_deviation = 1.0 / @sqrt(variance + 1.0e-5);
-        const means: F32x8 = @splat(mean);
-        const reciprocal_standard_deviations: F32x8 = @splat(reciprocal_standard_deviation);
-
-        column = 0;
-        while (column < width) : (column += simd_lanes_count) {
-            const values: F32x8 = input_row[column..][0..simd_lanes_count].*;
-            const gammas: F32x8 = gamma[column..][0..simd_lanes_count].*;
-            const betas: F32x8 = beta[column..][0..simd_lanes_count].*;
-            output_row[column..][0..simd_lanes_count].* = @mulAdd(F32x8, (values - means) * gammas, reciprocal_standard_deviations, betas);
-        }
-    }
-}
-
-fn addInto(addend: []const f32, output: []f32, lane: Lane) void {
-    assert(addend.len == output.len);
-
-    const values_range = lane.range(output.len);
-    var value_index = values_range.start_index;
-
-    while (value_index + simd_lanes_count <= values_range.end_index) : (value_index += simd_lanes_count) {
-        const left: F32x8 = output[value_index..][0..simd_lanes_count].*;
-        const right: F32x8 = addend[value_index..][0..simd_lanes_count].*;
-        output[value_index..][0..simd_lanes_count].* = left + right;
-    }
-
-    while (value_index < values_range.end_index) : (value_index += 1) {
-        output[value_index] += addend[value_index];
-    }
-}
-
-inline fn reduceAdd(values: F32x8) f32 {
-    var reduced = values;
-    var shuffled: F32x8 = undefined;
-
-    asm volatile (
-        \\ vperm2f128 $0x1, %[reduced], %[reduced], %[shuffled]
-        \\ vaddps %[shuffled], %[reduced], %[reduced]
-        \\ vshufps $0x4e, %[reduced], %[reduced], %[shuffled]
-        \\ vaddps %[shuffled], %[reduced], %[reduced]
-        \\ vshufps $0xb1, %[reduced], %[reduced], %[shuffled]
-        \\ vaddps %[shuffled], %[reduced], %[reduced]
-        : [reduced] "+x" (reduced),
-          [shuffled] "=&x" (shuffled),
-    );
-    return reduced[0];
 }
 
 // ─── Greedy Decoding And Vocabulary ────────────────────────────────────────
@@ -868,110 +435,111 @@ const suppressed_tokens = [_]Token{
     1, 2, 7, 8, 9, 10, 14, 25, 26, 27, 28, 29, 31, 58, 59, 60, 61, 62, 63, 90, 91, 92, 93, 357, 366, 438, 532, 685, 705, 796, 930, 1058, 1220, 1267, 1279, 1303, 1343, 1377, 1391, 1635, 1782, 1875, 2162, 2361, 2488, 3467, 4008, 4211, 4600, 4808, 5299, 5855, 6329, 7203, 9609, 9959, 10563, 10786, 11420, 11709, 11907, 13163, 13697, 13700, 14808, 15306, 16410, 16791, 17992, 19203, 19510, 20724, 22305, 22935, 27007, 30109, 30420, 33409, 34949, 40283, 40493, 40549, 47282, 49146, 50257, 50357, 50358, 50359, 50360, 50361,
 };
 
-// ─── Packed Weight And Memory Support ──────────────────────────────────────
+// ─── Runtime Memory Layout ─────────────────────────────────────────────────
 
-fn embeddingValue(weight: QuantizedWeight, token: Token, column: usize) f32 {
-    assert(weight.encoding == .vnni_o8_k4);
-    assert(token < weight.output_rows_count);
-    assert(column < weight.input_values_count);
+const RuntimeMemoryLayout = struct {
+    extractor_memory: memory_layout.Region(u8),
+    vocabulary_offsets: memory_layout.Region(u32),
+    encoder_convolution_1_output: memory_layout.Region(f32),
+    encoder_activation_0: memory_layout.Region(f32),
+    encoder_activation_1: memory_layout.Region(f32),
+    encoder_shared_scratch: memory_layout.Region(f32),
+    encoder_decoder_projection_scratch: memory_layout.Region(f32),
+    encoder_attention: memory_layout.Region(f32),
+    encoded_audio: memory_layout.Region(f32),
+    decoder_cross_key_values: memory_layout.Region(f32),
+    decoder_self_keys: memory_layout.Region(f32),
+    decoder_self_values: memory_layout.Region(f32),
+    decoder_input: memory_layout.Region(f32),
+    decoder_normalized: memory_layout.Region(f32),
+    decoder_query_key_value: memory_layout.Region(f32),
+    decoder_attention: memory_layout.Region(f32),
+    decoder_projection: memory_layout.Region(f32),
+    decoder_ffn: memory_layout.Region(f32),
+    logits: memory_layout.Region(f32),
+    generated_tokens: memory_layout.Region(Token),
+    lane_float_rows: memory_layout.Region(f32),
+    lane_quantized_rows: memory_layout.Region(u8),
+    lane_attention_scores: memory_layout.Region(f32),
+    size: usize,
 
-    const output_row: usize = @intCast(token);
-    const output_block_index = output_row / packed_output_rows_count;
-    const block_row_index = output_row % packed_output_rows_count;
-    const depth_group_index = column / packed_depth_values_count;
-    const depth_group_value_index = column % packed_depth_values_count;
-    const output_block_size = packed_output_rows_count * weight.input_values_count;
-    const packed_offset = output_block_index * output_block_size + depth_group_index * packed_group_bytes_count + block_row_index * packed_depth_values_count + depth_group_value_index;
+    fn init(specification: ModelSpecification, policy: Policy) RuntimeMemoryLayout {
+        const encoder_positions_count = specification.encoder_positions_count_max;
+        const encoder_width = specification.encoder_width;
+        const decoder_positions_count = specification.decoder_positions_count_max;
+        const decoder_width = specification.decoder_width;
+        const decoder_layers_count = specification.decoder_layers_count;
+        const encoder_projection_values_count = encoder_positions_count * 3 * encoder_width;
+        const decoder_cross_projection_values_count = encoder_positions_count * 2 * decoder_width;
 
-    return @as(f32, @floatFromInt(weight.values[packed_offset])) / weight.scales[output_row];
-}
+        var builder: memory_layout.Builder = .{};
+        const extractor_memory = builder.add(u8, log_mel.Extractor.requiredMemorySize(policy.samples_count_max));
+        const vocabulary_offsets = builder.add(u32, specification.vocabulary_tokens_count + 1);
+        const encoder_convolution_1_output = builder.add(f32, log_mel.encoder_frames_count_max * encoder_width);
+        const encoder_activation_0 = builder.add(f32, encoder_positions_count * encoder_width);
+        const encoder_activation_1 = builder.add(f32, encoder_positions_count * encoder_width);
+        const encoder_shared_scratch = builder.add(f32, encoder_module.sharedScratchValuesCount(specification, policy.workers_count));
+        const encoder_decoder_projection_scratch = builder.add(f32, @max(encoder_projection_values_count, decoder_cross_projection_values_count));
+        const encoder_attention = builder.add(f32, encoder_positions_count * encoder_width);
+        const encoded_audio = builder.add(f32, encoder_positions_count * encoder_width);
+        const decoder_cross_key_values = builder.add(f32, decoder_layers_count * encoder_positions_count * 2 * decoder_width);
+        const decoder_self_keys = builder.add(f32, decoder_layers_count * decoder_positions_count * decoder_width);
+        const decoder_self_values = builder.add(f32, decoder_layers_count * decoder_positions_count * decoder_width);
+        const decoder_input = builder.add(f32, decoder_width);
+        const decoder_normalized = builder.add(f32, decoder_width);
+        const decoder_query_key_value = builder.add(f32, 3 * decoder_width);
+        const decoder_attention = builder.add(f32, decoder_width);
+        const decoder_projection = builder.add(f32, decoder_width);
+        const decoder_ffn = builder.add(f32, specification.decoder_ffn_width);
+        const logits = builder.add(f32, specification.vocabulary_tokens_count);
+        const generated_tokens = builder.add(Token, policy.generated_tokens_count_max);
+        const lane_float_rows = builder.add(f32, policy.workers_count * encoder_module.laneFloatScratchValuesCount(specification));
+        const lane_quantized_rows = builder.add(u8, policy.workers_count * encoder_module.laneQuantizedScratchValuesCount(specification));
+        const lane_attention_scores = builder.add(f32, attention.decoderScratchValuesCount(encoder_positions_count, specification.decoder_attention_heads_count, policy.workers_count));
 
-fn packRowMajorWeight(weight: QuantizedWeight, destination: []i8) void {
-    assert(weight.encoding == .row_major);
-    assert(destination.len == weight.values.len);
-    assert(weight.output_rows_count % packed_output_rows_count == 0);
-    assert(weight.input_values_count % packed_depth_values_count == 0);
-
-    const output_block_size = packed_output_rows_count * weight.input_values_count;
-    var output_row_start: usize = 0;
-    while (output_row_start < weight.output_rows_count) : (output_row_start += packed_output_rows_count) {
-        const destination_block = destination[output_row_start / packed_output_rows_count * output_block_size ..][0..output_block_size];
-        var depth_start: usize = 0;
-        while (depth_start < weight.input_values_count) : (depth_start += packed_depth_values_count) {
-            const destination_group = destination_block[depth_start / packed_depth_values_count * packed_group_bytes_count ..][0..packed_group_bytes_count];
-            for (0..packed_output_rows_count) |block_row_index| {
-                const source_offset = (output_row_start + block_row_index) * weight.input_values_count + depth_start;
-                const destination_offset = block_row_index * packed_depth_values_count;
-                @memcpy(destination_group[destination_offset..][0..packed_depth_values_count], weight.values[source_offset..][0..packed_depth_values_count]);
-            }
-        }
+        return .{
+            .extractor_memory = extractor_memory,
+            .vocabulary_offsets = vocabulary_offsets,
+            .encoder_convolution_1_output = encoder_convolution_1_output,
+            .encoder_activation_0 = encoder_activation_0,
+            .encoder_activation_1 = encoder_activation_1,
+            .encoder_shared_scratch = encoder_shared_scratch,
+            .encoder_decoder_projection_scratch = encoder_decoder_projection_scratch,
+            .encoder_attention = encoder_attention,
+            .encoded_audio = encoded_audio,
+            .decoder_cross_key_values = decoder_cross_key_values,
+            .decoder_self_keys = decoder_self_keys,
+            .decoder_self_values = decoder_self_values,
+            .decoder_input = decoder_input,
+            .decoder_normalized = decoder_normalized,
+            .decoder_query_key_value = decoder_query_key_value,
+            .decoder_attention = decoder_attention,
+            .decoder_projection = decoder_projection,
+            .decoder_ffn = decoder_ffn,
+            .logits = logits,
+            .generated_tokens = generated_tokens,
+            .lane_float_rows = lane_float_rows,
+            .lane_quantized_rows = lane_quantized_rows,
+            .lane_attention_scores = lane_attention_scores,
+            .size = builder.size,
+        };
     }
-}
-
-fn repackedWeight(weight: QuantizedWeight, packed_values: []const i8) QuantizedWeight {
-    assert(weight.encoding == .row_major);
-    assert(weight.values.len == packed_values.len);
-
-    return .{
-        .values = packed_values,
-        .scales = weight.scales,
-        .compensation = weight.compensation,
-        .output_rows_count = weight.output_rows_count,
-        .input_values_count = weight.input_values_count,
-        .encoding = .vnni_o8_k4,
-    };
-}
-
-fn laneFloatRow(runtime: *Runtime, lane: Lane) []f32 {
-    const values_count = runtime.lane_float_rows.len / lane.count;
-    return runtime.lane_float_rows[lane.index * values_count ..][0..values_count];
-}
-
-fn laneQuantizedRow(runtime: *Runtime, lane: Lane) []u8 {
-    const values_count = runtime.lane_quantized_rows.len / lane.count;
-    return runtime.lane_quantized_rows[lane.index * values_count ..][0..values_count];
-}
+};
 
 fn validatePolicy(specification: ModelSpecification, policy: Policy) RuntimeError!void {
-    if (policy.samples_count_max < 400 / 2 + 1 or policy.samples_count_max > 30 * sample_rate_hz) {
+    if (policy.samples_count_max < log_mel.samples_count_min or policy.samples_count_max > log_mel.samples_count_max) {
         return error.InvalidPolicy;
     }
     if (policy.generated_tokens_count_max == 0 or policy.generated_tokens_count_max + decoder_prompt_tokens_count > specification.decoder_positions_count_max) {
         return error.InvalidPolicy;
     }
-    if (policy.workers_count == 0 or policy.workers_count > 32) {
+    if (policy.workers_count == 0 or policy.workers_count > executor_module.workers_count_max) {
         return error.InvalidPolicy;
     }
     if (specification.encoder_width != specification.decoder_width) {
         return error.InvalidPolicy;
     }
-    if (specification.encoder_width % attention_head_width != 0 or specification.decoder_width % attention_head_width != 0) {
+    if (specification.encoder_width % attention.head_width != 0 or specification.decoder_width % attention.head_width != 0) {
         return error.InvalidPolicy;
     }
 }
-
-fn addMemoryRegion(size: usize, comptime Element: type, elements_count: usize) usize {
-    const aligned_size = std.mem.alignForward(usize, size, memory_alignment);
-
-    return aligned_size + elements_count * @sizeOf(Element);
-}
-
-const MemoryCursor = struct {
-    memory: []align(memory_alignment) u8,
-    offset: usize = 0,
-
-    fn takeBytes(cursor: *MemoryCursor, bytes_count: usize) []u8 {
-        return cursor.take(u8, bytes_count);
-    }
-
-    fn take(cursor: *MemoryCursor, comptime Element: type, elements_count: usize) []Element {
-        cursor.offset = std.mem.alignForward(usize, cursor.offset, memory_alignment);
-        const region_size = elements_count * @sizeOf(Element);
-        assert(cursor.offset + region_size <= cursor.memory.len);
-
-        const values: [*]Element = @ptrCast(@alignCast(cursor.memory.ptr + cursor.offset));
-        cursor.offset += region_size;
-
-        return values[0..elements_count];
-    }
-};

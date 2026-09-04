@@ -1,9 +1,6 @@
-//! Cache-blocked online-softmax attention for Whisper encoder heads.
-//!
-//! Each executor lane owns one reusable head-sized scratch region. Keys are
-//! transposed once per head, values are made contiguous once per head, and an
-//! 8-query by 64-key tile flows directly from score calculation through
-//! softmax into the output accumulators without materializing an N-by-N tensor.
+//! Specialized Whisper attention for blocked encoder heads and token-serial
+//! decoder heads. Encoder attention uses online softmax without materializing
+//! an N-by-N tensor; decoder attention consumes persistent head-major K/V.
 
 const std = @import("std");
 const Lane = @import("executor.zig").Lane;
@@ -18,9 +15,9 @@ const score_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_width)));
 
 const F32x8 = @Vector(simd_lanes_count, f32);
 
-// ─── Public Operation ──────────────────────────────────────────────────────
+// ─── Encoder Attention ─────────────────────────────────────────────────────
 
-pub fn scratchValuesCount(positions_count: usize, heads_count: usize, lanes_count: usize) usize {
+pub fn encoderScratchValuesCount(positions_count: usize, heads_count: usize, lanes_count: usize) usize {
     assert(positions_count > 0);
     assert(heads_count > 0);
     assert(lanes_count > 0);
@@ -28,17 +25,17 @@ pub fn scratchValuesCount(positions_count: usize, heads_count: usize, lanes_coun
     return @min(heads_count, lanes_count) * laneScratchValuesCount(positions_count);
 }
 
-/// `forward` calculates unmasked encoder self-attention from one fused
+/// `forwardEncoder` calculates unmasked encoder self-attention from one fused
 /// row-major `[positions_count, 3 * model_width]` QKV projection. Every lane in
 /// one executor operation must call it with the same arguments and disjoint
 /// lane identity. The operation allocates nothing and does not synchronize.
-pub fn forward(query_key_value: []const f32, positions_count: usize, model_width: usize, heads_count: usize, output: []f32, scratch: []f32, lane: Lane) void {
+pub fn forwardEncoder(query_key_value: []const f32, positions_count: usize, model_width: usize, heads_count: usize, output: []f32, scratch: []f32, lane: Lane) void {
     assert(positions_count > 0);
     assert(heads_count > 0);
     assert(model_width == heads_count * head_width);
     assert(query_key_value.len == positions_count * 3 * model_width);
     assert(output.len == positions_count * model_width);
-    assert(scratch.len == scratchValuesCount(positions_count, heads_count, lane.count));
+    assert(scratch.len == encoderScratchValuesCount(positions_count, heads_count, lane.count));
 
     const heads_range = lane.range(heads_count);
     if (heads_range.start_index == heads_range.end_index) {
@@ -71,10 +68,20 @@ pub fn forward(query_key_value: []const f32, positions_count: usize, model_width
     }
 }
 
-/// `decoderForward` calculates one token's attention over head-major K/V
+// ─── Decoder Attention ─────────────────────────────────────────────────────
+
+pub fn decoderScratchValuesCount(positions_count: usize, heads_count: usize, lanes_count: usize) usize {
+    assert(positions_count > 0);
+    assert(heads_count > 0);
+    assert(lanes_count > 0);
+
+    return @min(heads_count, lanes_count) * positions_count;
+}
+
+/// `forwardDecoder` calculates one token's attention over head-major K/V
 /// storage. `head_positions_stride` is the physical capacity between heads;
 /// `positions_count` selects the initialized prefix for this invocation.
-pub fn decoderForward(query: []const f32, keys: []const f32, values: []const f32, positions_count: usize, head_positions_stride: usize, model_width: usize, heads_count: usize, output: []f32, scores_scratch: []f32, lane: Lane) void {
+pub fn forwardDecoder(query: []const f32, keys: []const f32, values: []const f32, positions_count: usize, head_positions_stride: usize, model_width: usize, heads_count: usize, output: []f32, scores_scratch: []f32, lane: Lane) void {
     assert(positions_count > 0);
     assert(positions_count <= head_positions_stride);
     assert(model_width == heads_count * head_width);
@@ -82,7 +89,7 @@ pub fn decoderForward(query: []const f32, keys: []const f32, values: []const f32
     assert(keys.len == heads_count * head_positions_stride * head_width);
     assert(values.len == keys.len);
     assert(output.len == model_width);
-    assert(scores_scratch.len >= @min(heads_count, lane.count) * positions_count);
+    assert(scores_scratch.len >= decoderScratchValuesCount(positions_count, heads_count, lane.count));
 
     const heads_range = lane.range(heads_count);
     if (heads_range.start_index == heads_range.end_index) {
@@ -102,7 +109,10 @@ pub fn decoderForward(query: []const f32, keys: []const f32, values: []const f32
         const probability_sum = exponentiateScores(scores, maximum);
         assert(probability_sum > 0);
         scaleScores(scores, 1.0 / probability_sum);
-        accumulateValueTileSingle(output[head_index * head_width ..][0..head_width], scores, value_head, 0, positions_count, false);
+
+        const output_rows = [1][]f32{output[head_index * head_width ..][0..head_width]};
+        const probability_rows = [1][]const f32{scores};
+        accumulateValueRows(1, 0, output_rows, probability_rows, .{0}, value_head, positions_count, false);
     }
 }
 
@@ -217,14 +227,25 @@ noinline fn calculateAttentionTile(queries: []const f32, packed_keys: []const f3
             row_maximums[query_offset] = next_maximums[query_offset];
         }
 
+        const value_rows = values[key_position_begin * head_width ..][0 .. key_positions_count * head_width];
         var query_offset: usize = 0;
         while (query_offset + 1 < query_positions_count) : (query_offset += 2) {
-            const output_0 = outputHead(output, model_width, head_index, query_position_begin + query_offset);
-            const output_1 = outputHead(output, model_width, head_index, query_position_begin + query_offset + 1);
-            accumulateValueTilePair(output_0, output_1, scores[(query_offset + 0) * key_positions_per_tile ..][0..key_positions_count], scores[(query_offset + 1) * key_positions_per_tile ..][0..key_positions_count], values[key_position_begin * head_width ..][0 .. key_positions_count * head_width], previous_scales[query_offset], previous_scales[query_offset + 1], key_positions_count, key_position_begin != 0);
+            const output_rows = [2][]f32{
+                outputHead(output, model_width, head_index, query_position_begin + query_offset),
+                outputHead(output, model_width, head_index, query_position_begin + query_offset + 1),
+            };
+            const probability_rows = [2][]const f32{
+                scores[(query_offset + 0) * key_positions_per_tile ..][0..key_positions_count],
+                scores[(query_offset + 1) * key_positions_per_tile ..][0..key_positions_count],
+            };
+            const previous_output_scales = [2]f32{ previous_scales[query_offset], previous_scales[query_offset + 1] };
+            accumulateValueRows(2, 0, output_rows, probability_rows, previous_output_scales, value_rows, key_positions_count, key_position_begin != 0);
+            accumulateValueRows(2, 32, output_rows, probability_rows, previous_output_scales, value_rows, key_positions_count, key_position_begin != 0);
         }
         if (query_offset < query_positions_count) {
-            accumulateValueTileSingle(outputHead(output, model_width, head_index, query_position_begin + query_offset), scores[query_offset * key_positions_per_tile ..][0..key_positions_count], values[key_position_begin * head_width ..][0 .. key_positions_count * head_width], previous_scales[query_offset], key_positions_count, key_position_begin != 0);
+            const output_rows = [1][]f32{outputHead(output, model_width, head_index, query_position_begin + query_offset)};
+            const probability_rows = [1][]const f32{scores[query_offset * key_positions_per_tile ..][0..key_positions_count]};
+            accumulateValueRows(1, 0, output_rows, probability_rows, .{previous_scales[query_offset]}, value_rows, key_positions_count, key_position_begin != 0);
         }
     }
 
@@ -250,69 +271,39 @@ inline fn calculateScoreTile(queries: []const f32, packed_keys: []const f32, sco
     const rounded_key_positions_count = std.mem.alignForward(usize, key_positions_count, simd_lanes_count);
     var query_offset: usize = 0;
     while (query_offset + 4 <= query_positions_count) : (query_offset += 4) {
-        calculateFourScoreRows(queries, packed_keys, scores[query_offset * key_positions_per_tile ..][0 .. 4 * key_positions_per_tile], query_offset, key_position_begin, rounded_key_positions_count, packed_positions_count);
+        calculatePackedScoreRows(4, queries, packed_keys, scores[query_offset * key_positions_per_tile ..][0 .. 4 * key_positions_per_tile], query_offset, key_position_begin, rounded_key_positions_count, packed_positions_count);
     }
     while (query_offset < query_positions_count) : (query_offset += 1) {
-        calculateOneScoreRow(queries[query_offset * head_width ..][0..head_width], packed_keys, scores[query_offset * key_positions_per_tile ..][0..key_positions_per_tile], key_position_begin, rounded_key_positions_count, packed_positions_count);
+        calculatePackedScoreRows(1, queries, packed_keys, scores[query_offset * key_positions_per_tile ..][0..key_positions_per_tile], query_offset, key_position_begin, rounded_key_positions_count, packed_positions_count);
     }
 }
 
-inline fn calculateFourScoreRows(queries: []const f32, packed_keys: []const f32, scores: []f32, query_offset: usize, key_position_begin: usize, rounded_key_positions_count: usize, packed_positions_count: usize) void {
-    const query_0 = queries[(query_offset + 0) * head_width ..][0..head_width];
-    const query_1 = queries[(query_offset + 1) * head_width ..][0..head_width];
-    const query_2 = queries[(query_offset + 2) * head_width ..][0..head_width];
-    const query_3 = queries[(query_offset + 3) * head_width ..][0..head_width];
-    const scores_0 = scores[0 * key_positions_per_tile ..][0..key_positions_per_tile];
-    const scores_1 = scores[1 * key_positions_per_tile ..][0..key_positions_per_tile];
-    const scores_2 = scores[2 * key_positions_per_tile ..][0..key_positions_per_tile];
-    const scores_3 = scores[3 * key_positions_per_tile ..][0..key_positions_per_tile];
+inline fn calculatePackedScoreRows(comptime rows_count: usize, queries: []const f32, packed_keys: []const f32, scores: []f32, query_offset: usize, key_position_begin: usize, rounded_key_positions_count: usize, packed_positions_count: usize) void {
+    assert(rows_count == 1 or rows_count == 4);
+    assert(query_offset + rows_count <= query_positions_per_tile);
+    assert(scores.len == rows_count * key_positions_per_tile);
 
     var key_offset: usize = 0;
     while (key_offset < rounded_key_positions_count) : (key_offset += simd_lanes_count) {
-        var sums_0a: F32x8 = @splat(0);
-        var sums_0b: F32x8 = @splat(0);
-        var sums_1a: F32x8 = @splat(0);
-        var sums_1b: F32x8 = @splat(0);
-        var sums_2a: F32x8 = @splat(0);
-        var sums_2b: F32x8 = @splat(0);
-        var sums_3a: F32x8 = @splat(0);
-        var sums_3b: F32x8 = @splat(0);
+        var sums_a: [rows_count]F32x8 = @splat(@as(F32x8, @splat(0)));
+        var sums_b: [rows_count]F32x8 = @splat(@as(F32x8, @splat(0)));
 
         var depth: usize = 0;
         while (depth < head_width) : (depth += 2) {
             const keys_a: F32x8 = packed_keys[(depth + 0) * packed_positions_count + key_position_begin + key_offset ..][0..simd_lanes_count].*;
             const keys_b: F32x8 = packed_keys[(depth + 1) * packed_positions_count + key_position_begin + key_offset ..][0..simd_lanes_count].*;
-            sums_0a = @mulAdd(F32x8, @as(F32x8, @splat(query_0[depth + 0])), keys_a, sums_0a);
-            sums_0b = @mulAdd(F32x8, @as(F32x8, @splat(query_0[depth + 1])), keys_b, sums_0b);
-            sums_1a = @mulAdd(F32x8, @as(F32x8, @splat(query_1[depth + 0])), keys_a, sums_1a);
-            sums_1b = @mulAdd(F32x8, @as(F32x8, @splat(query_1[depth + 1])), keys_b, sums_1b);
-            sums_2a = @mulAdd(F32x8, @as(F32x8, @splat(query_2[depth + 0])), keys_a, sums_2a);
-            sums_2b = @mulAdd(F32x8, @as(F32x8, @splat(query_2[depth + 1])), keys_b, sums_2b);
-            sums_3a = @mulAdd(F32x8, @as(F32x8, @splat(query_3[depth + 0])), keys_a, sums_3a);
-            sums_3b = @mulAdd(F32x8, @as(F32x8, @splat(query_3[depth + 1])), keys_b, sums_3b);
+            inline for (0..rows_count) |row_offset| {
+                const query = queries[(query_offset + row_offset) * head_width ..][0..head_width];
+                sums_a[row_offset] = @mulAdd(F32x8, @as(F32x8, @splat(query[depth + 0])), keys_a, sums_a[row_offset]);
+                sums_b[row_offset] = @mulAdd(F32x8, @as(F32x8, @splat(query[depth + 1])), keys_b, sums_b[row_offset]);
+            }
         }
 
         const scales: F32x8 = @splat(score_scale);
-        scores_0[key_offset..][0..simd_lanes_count].* = (sums_0a + sums_0b) * scales;
-        scores_1[key_offset..][0..simd_lanes_count].* = (sums_1a + sums_1b) * scales;
-        scores_2[key_offset..][0..simd_lanes_count].* = (sums_2a + sums_2b) * scales;
-        scores_3[key_offset..][0..simd_lanes_count].* = (sums_3a + sums_3b) * scales;
-    }
-}
-
-inline fn calculateOneScoreRow(query: []const f32, packed_keys: []const f32, scores: []f32, key_position_begin: usize, rounded_key_positions_count: usize, packed_positions_count: usize) void {
-    var key_offset: usize = 0;
-    while (key_offset < rounded_key_positions_count) : (key_offset += simd_lanes_count) {
-        var sums_a: F32x8 = @splat(0);
-        var sums_b: F32x8 = @splat(0);
-        var depth: usize = 0;
-        while (depth < head_width) : (depth += 2) {
-            const keys_a: F32x8 = packed_keys[(depth + 0) * packed_positions_count + key_position_begin + key_offset ..][0..simd_lanes_count].*;
-            const keys_b: F32x8 = packed_keys[(depth + 1) * packed_positions_count + key_position_begin + key_offset ..][0..simd_lanes_count].*;
-            sums_a = @mulAdd(F32x8, @as(F32x8, @splat(query[depth + 0])), keys_a, sums_a);
-            sums_b = @mulAdd(F32x8, @as(F32x8, @splat(query[depth + 1])), keys_b, sums_b);
+        inline for (0..rows_count) |row_offset| {
+            const score_row = scores[row_offset * key_positions_per_tile ..][0..key_positions_per_tile];
+            score_row[key_offset..][0..simd_lanes_count].* = (sums_a[row_offset] + sums_b[row_offset]) * scales;
         }
-        scores[key_offset..][0..simd_lanes_count].* = (sums_a + sums_b) * @as(F32x8, @splat(score_scale));
     }
 }
 
@@ -461,84 +452,55 @@ inline fn vectorExp(input: F32x8) F32x8 {
 
 // ─── Probability-Value Accumulation ───────────────────────────────────────
 
-inline fn accumulateValueTilePair(output_0: []f32, output_1: []f32, probabilities_0: []const f32, probabilities_1: []const f32, values: []const f32, previous_scale_0: f32, previous_scale_1: f32, key_positions_count: usize, output_has_previous_keys: bool) void {
-    accumulateValueHalfPair(0, output_0, output_1, probabilities_0, probabilities_1, values, previous_scale_0, previous_scale_1, key_positions_count, output_has_previous_keys);
-    accumulateValueHalfPair(32, output_0, output_1, probabilities_0, probabilities_1, values, previous_scale_0, previous_scale_1, key_positions_count, output_has_previous_keys);
-}
+inline fn accumulateValueRows(comptime query_rows_count: usize, comptime column_begin: usize, output_rows: [query_rows_count][]f32, probability_rows: [query_rows_count][]const f32, previous_scales: [query_rows_count]f32, values: []const f32, key_positions_count: usize, output_has_previous_keys: bool) void {
+    assert(query_rows_count == 1 or query_rows_count == 2);
 
-inline fn accumulateValueHalfPair(comptime column_begin: usize, output_0: []f32, output_1: []f32, probabilities_0: []const f32, probabilities_1: []const f32, values: []const f32, previous_scale_0: f32, previous_scale_1: f32, key_positions_count: usize, output_has_previous_keys: bool) void {
-    const scale_0: F32x8 = @splat(previous_scale_0);
-    const scale_1: F32x8 = @splat(previous_scale_1);
-
-    var accumulator_00: F32x8 = if (output_has_previous_keys) output_0[column_begin + 0 ..][0..8].* * scale_0 else @splat(0);
-    var accumulator_01: F32x8 = if (output_has_previous_keys) output_0[column_begin + 8 ..][0..8].* * scale_0 else @splat(0);
-    var accumulator_02: F32x8 = if (output_has_previous_keys) output_0[column_begin + 16 ..][0..8].* * scale_0 else @splat(0);
-    var accumulator_03: F32x8 = if (output_has_previous_keys) output_0[column_begin + 24 ..][0..8].* * scale_0 else @splat(0);
-    var accumulator_10: F32x8 = if (output_has_previous_keys) output_1[column_begin + 0 ..][0..8].* * scale_1 else @splat(0);
-    var accumulator_11: F32x8 = if (output_has_previous_keys) output_1[column_begin + 8 ..][0..8].* * scale_1 else @splat(0);
-    var accumulator_12: F32x8 = if (output_has_previous_keys) output_1[column_begin + 16 ..][0..8].* * scale_1 else @splat(0);
-    var accumulator_13: F32x8 = if (output_has_previous_keys) output_1[column_begin + 24 ..][0..8].* * scale_1 else @splat(0);
-
-    for (0..key_positions_count) |key_offset| {
-        const probability_0: F32x8 = @splat(probabilities_0[key_offset]);
-        const probability_1: F32x8 = @splat(probabilities_1[key_offset]);
-        const value_row = values[key_offset * head_width + column_begin ..][0..32];
-        const values_0: F32x8 = value_row[0..8].*;
-        const values_1: F32x8 = value_row[8..16].*;
-        const values_2: F32x8 = value_row[16..24].*;
-        const values_3: F32x8 = value_row[24..32].*;
-        accumulator_00 = @mulAdd(F32x8, probability_0, values_0, accumulator_00);
-        accumulator_01 = @mulAdd(F32x8, probability_0, values_1, accumulator_01);
-        accumulator_02 = @mulAdd(F32x8, probability_0, values_2, accumulator_02);
-        accumulator_03 = @mulAdd(F32x8, probability_0, values_3, accumulator_03);
-        accumulator_10 = @mulAdd(F32x8, probability_1, values_0, accumulator_10);
-        accumulator_11 = @mulAdd(F32x8, probability_1, values_1, accumulator_11);
-        accumulator_12 = @mulAdd(F32x8, probability_1, values_2, accumulator_12);
-        accumulator_13 = @mulAdd(F32x8, probability_1, values_3, accumulator_13);
+    const output_vectors_count = @divExact(simd_lanes_count, query_rows_count);
+    assert(column_begin + output_vectors_count * simd_lanes_count <= head_width);
+    assert(values.len == key_positions_count * head_width);
+    inline for (0..query_rows_count) |query_row| {
+        assert(output_rows[query_row].len == head_width);
+        assert(probability_rows[query_row].len == key_positions_count);
     }
 
-    output_0[column_begin + 0 ..][0..8].* = accumulator_00;
-    output_0[column_begin + 8 ..][0..8].* = accumulator_01;
-    output_0[column_begin + 16 ..][0..8].* = accumulator_02;
-    output_0[column_begin + 24 ..][0..8].* = accumulator_03;
-    output_1[column_begin + 0 ..][0..8].* = accumulator_10;
-    output_1[column_begin + 8 ..][0..8].* = accumulator_11;
-    output_1[column_begin + 16 ..][0..8].* = accumulator_12;
-    output_1[column_begin + 24 ..][0..8].* = accumulator_13;
-}
-
-inline fn accumulateValueTileSingle(output: []f32, probabilities: []const f32, values: []const f32, previous_scale: f32, key_positions_count: usize, output_has_previous_keys: bool) void {
-    const scale: F32x8 = @splat(previous_scale);
-    var accumulator_0: F32x8 = if (output_has_previous_keys) output[0..8].* * scale else @splat(0);
-    var accumulator_1: F32x8 = if (output_has_previous_keys) output[8..16].* * scale else @splat(0);
-    var accumulator_2: F32x8 = if (output_has_previous_keys) output[16..24].* * scale else @splat(0);
-    var accumulator_3: F32x8 = if (output_has_previous_keys) output[24..32].* * scale else @splat(0);
-    var accumulator_4: F32x8 = if (output_has_previous_keys) output[32..40].* * scale else @splat(0);
-    var accumulator_5: F32x8 = if (output_has_previous_keys) output[40..48].* * scale else @splat(0);
-    var accumulator_6: F32x8 = if (output_has_previous_keys) output[48..56].* * scale else @splat(0);
-    var accumulator_7: F32x8 = if (output_has_previous_keys) output[56..64].* * scale else @splat(0);
+    var accumulators: [query_rows_count][output_vectors_count]F32x8 = undefined;
+    inline for (0..query_rows_count) |query_row| {
+        const previous_scale: F32x8 = @splat(previous_scales[query_row]);
+        inline for (0..output_vectors_count) |output_vector| {
+            const output_column = column_begin + output_vector * simd_lanes_count;
+            accumulators[query_row][output_vector] = if (output_has_previous_keys) output_rows[query_row][output_column..][0..simd_lanes_count].* * previous_scale else @splat(0);
+        }
+    }
 
     for (0..key_positions_count) |key_offset| {
-        const probability: F32x8 = @splat(probabilities[key_offset]);
         const value_row = values[key_offset * head_width ..][0..head_width];
-        accumulator_0 = @mulAdd(F32x8, probability, value_row[0..8].*, accumulator_0);
-        accumulator_1 = @mulAdd(F32x8, probability, value_row[8..16].*, accumulator_1);
-        accumulator_2 = @mulAdd(F32x8, probability, value_row[16..24].*, accumulator_2);
-        accumulator_3 = @mulAdd(F32x8, probability, value_row[24..32].*, accumulator_3);
-        accumulator_4 = @mulAdd(F32x8, probability, value_row[32..40].*, accumulator_4);
-        accumulator_5 = @mulAdd(F32x8, probability, value_row[40..48].*, accumulator_5);
-        accumulator_6 = @mulAdd(F32x8, probability, value_row[48..56].*, accumulator_6);
-        accumulator_7 = @mulAdd(F32x8, probability, value_row[56..64].*, accumulator_7);
+        if (query_rows_count == 1) {
+            const probability: F32x8 = @splat(probability_rows[0][key_offset]);
+            inline for (0..output_vectors_count) |output_vector| {
+                const output_column = column_begin + output_vector * simd_lanes_count;
+                accumulators[0][output_vector] = @mulAdd(F32x8, probability, value_row[output_column..][0..simd_lanes_count].*, accumulators[0][output_vector]);
+            }
+        } else {
+            var value_vectors: [output_vectors_count]F32x8 = undefined;
+            inline for (0..output_vectors_count) |output_vector| {
+                const output_column = column_begin + output_vector * simd_lanes_count;
+                value_vectors[output_vector] = value_row[output_column..][0..simd_lanes_count].*;
+            }
+            inline for (0..query_rows_count) |query_row| {
+                const probability: F32x8 = @splat(probability_rows[query_row][key_offset]);
+                inline for (0..output_vectors_count) |output_vector| {
+                    accumulators[query_row][output_vector] = @mulAdd(F32x8, probability, value_vectors[output_vector], accumulators[query_row][output_vector]);
+                }
+            }
+        }
     }
 
-    output[0..8].* = accumulator_0;
-    output[8..16].* = accumulator_1;
-    output[16..24].* = accumulator_2;
-    output[24..32].* = accumulator_3;
-    output[32..40].* = accumulator_4;
-    output[40..48].* = accumulator_5;
-    output[48..56].* = accumulator_6;
-    output[56..64].* = accumulator_7;
+    inline for (0..query_rows_count) |query_row| {
+        inline for (0..output_vectors_count) |output_vector| {
+            const output_column = column_begin + output_vector * simd_lanes_count;
+            output_rows[query_row][output_column..][0..simd_lanes_count].* = accumulators[query_row][output_vector];
+        }
+    }
 }
 
 inline fn scaleScores(scores: []f32, scale: f32) void {
