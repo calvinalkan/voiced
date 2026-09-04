@@ -83,6 +83,11 @@ fn add_default_build_command(b: *std.Build) void {
     // contracts remain active; ReleaseFast is reserved for comparative
     // benchmarks where removing those assertions is intentional.
     const optimize = b.standardOptimizeOption(.{});
+    const pack_decoder_weights = b.option(
+        bool,
+        "pack-decoder-weights",
+        "Pack INT8 decoder weights at model load to reduce inference latency",
+    ) orelse false;
 
     const mkl_prefix = b.option(
         []const u8,
@@ -158,6 +163,15 @@ fn add_default_build_command(b: *std.Build) void {
         "-fno-sanitize=undefined",
     };
 
+    // Decoder Dense weights are reused for every generated token. Generate one
+    // patched upstream translation unit that packs those INT8 weights once at
+    // model load instead of making MKL repack them in the serial decoder loop.
+    const patched_ctranslate2_model_source = generate_patched_ctranslate2_model_source(
+        b,
+        ctranslate2,
+        pack_decoder_weights,
+    );
+
     // This list is the CPU-only `SOURCES` list from the pinned CTranslate2
     // CMake target. `src/cpu/kernels.cc` supplies its SSE4.1 implementation;
     // the dispatched AVX variants are compiled as separate objects below.
@@ -191,7 +205,6 @@ fn add_default_build_command(b: *std.Build) void {
         "src/layers/whisper.cc",
         "src/logging.cc",
         "src/models/language_model.cc",
-        "src/models/model.cc",
         "src/models/model_factory.cc",
         "src/models/model_reader.cc",
         "src/models/sequence_to_sequence.cc",
@@ -279,6 +292,10 @@ fn add_default_build_command(b: *std.Build) void {
     ctranslate2_library.root_module.addCSourceFiles(.{
         .root = ctranslate2.path(""),
         .files = &ctranslate2_source_paths,
+        .flags = &ctranslate2_cpp_flags,
+    });
+    ctranslate2_library.root_module.addCSourceFile(.{
+        .file = patched_ctranslate2_model_source,
         .flags = &ctranslate2_cpp_flags,
     });
 
@@ -579,6 +596,72 @@ fn resolve_linux_x86_target(
         .glibc_version = .{ .major = 2, .minor = 35, .patch = 0 },
         .abi = .gnu,
     });
+}
+
+fn generate_patched_ctranslate2_model_source(
+    b: *std.Build,
+    ctranslate2: *std.Build.Dependency,
+    pack_decoder_weights: bool,
+) std.Build.LazyPath {
+    const upstream_source_path = ctranslate2.path("src/models/model.cc").getPath(b);
+    const upstream_source = std.Io.Dir.cwd().readFileAlloc(
+        b.graph.io,
+        upstream_source_path,
+        b.allocator,
+        .limited(2 * 1024 * 1024),
+    ) catch @panic("failed to read pinned CTranslate2 model source");
+
+    if (!pack_decoder_weights) {
+        return b.addWriteFiles().add("ctranslate2-model.cc", upstream_source);
+    }
+
+    const pack_mode_declaration =
+        "      const bool pack_weights = cpu::pack_gemm_weights(_effective_compute_type);";
+    const decoder_pack_mode_declaration = pack_mode_declaration ++ "\n" ++
+        "      // Voiced reuses decoder weights for every generated token. Pack these\n" ++
+        "      // INT8 matrices once when MKL owns GEMM instead of repacking each call.\n" ++
+        "      const bool pack_decoder_weights = (cpu::get_gemm_backend(_effective_compute_type)\n" ++
+        "                                         == cpu::GemmBackend::MKL);";
+    const source_with_pack_mode = replace_exactly_once(
+        b,
+        upstream_source,
+        pack_mode_declaration,
+        decoder_pack_mode_declaration,
+    );
+
+    const upstream_pack_condition =
+        "        if (pack_weights && is_packable(name)) {";
+    const decoder_pack_condition =
+        "        if ((pack_weights\n" ++
+        "             || (pack_decoder_weights\n" ++
+        "                 && dtype == DataType::INT8\n" ++
+        "                 && starts_with(name, \"decoder/\")))\n" ++
+        "            && is_packable(name)\n" ++
+        "            && weight.rank() == 2) {";
+    const patched_source = replace_exactly_once(
+        b,
+        source_with_pack_mode,
+        upstream_pack_condition,
+        decoder_pack_condition,
+    );
+
+    return b.addWriteFiles().add("ctranslate2-model.cc", patched_source);
+}
+
+fn replace_exactly_once(
+    b: *std.Build,
+    source: []const u8,
+    needle: []const u8,
+    replacement: []const u8,
+) []const u8 {
+    assert(std.mem.count(u8, source, needle) == 1);
+    return std.mem.replaceOwned(
+        u8,
+        b.allocator,
+        source,
+        needle,
+        replacement,
+    ) catch @panic("OOM");
 }
 
 fn add_update_compile_flags_command(b: *std.Build) void {

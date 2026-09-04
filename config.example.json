@@ -4,6 +4,7 @@
     "input_device": null,
     "silence_threshold": 0.01,
     "silence_duration": 0.6,
+    "whisper_vad_filter": false,
     "auto_enter": false,
     "insertion_method": "paste",
     "paste_keybind": "ctrl+shift+v"

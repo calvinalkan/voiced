@@ -375,6 +375,25 @@ dictation app does.
 works in terminals, works as plain-paste in browsers (no rich formatting),
 works in nearly every GUI app.
 
+## Spikes
+
+Durable native CTranslate2 optimization experiments are stored outside the
+production repository:
+
+- `/home/calvin/code/experiments/2026-09-03-zig-cpp-custom` — current best
+  Whisper-small runtime, combining CTranslate2 orchestration and MKL with
+  shape-specialized Zig AVX2/VNNI kernels. It includes the modified C++ and
+  Zig sources, vendored build dependencies, static artifacts, binaries,
+  fixtures, benchmark evidence, and rebuild instructions.
+- `/home/calvin/code/experiments/2026-09-03-ctranslate2-cpp-variants` —
+  reconstructed C++/MKL-only optimization lineage: packing-only, packing plus
+  attention-buffer reuse, scoped packing, and the strongest measured fixed-input
+  C++ path. It includes normalized patches, historical binaries, evidence, and
+  a script that materializes each variant from pinned CTranslate2 upstream.
+
+These are research snapshots and are not used by the installed `voiced`
+runtime.
+
 ## Testing
 
 ```bash
