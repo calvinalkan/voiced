@@ -1,318 +1,571 @@
-# Voiced Zig implementation
+# Voiced Zig daemon
 
-Three executable entry points establish the native boundaries and supervisor:
-
-- `voiced supervisor-spike` runs the one-binary supervisor with deterministic
-  roles, real PipeWire audio, or the complete PipeWire-to-CTranslate2 path.
-- `audio-spike` independently exercises the same PipeWire worker and writes
-  retained PCM to WAV.
-- `model-spike` computes Whisper log-Mel features and measures CTranslate2
-  transcription.
-
-The model spike compiles pinned CTranslate2, cpu_features, and spdlog sources
-through Zig's bundled C++ toolchain. It statically links verified Intel oneMKL
-and OpenMP archives. The audio spike dynamically links the desktop's PipeWire
-client library.
-
-The supervisor implementation remains shallow:
+The native executable contains the production daemon, its CLI client, and three
+private worker roles. There are no experimental commands, synthetic workers,
+WAV-output modes, or test-configuration flags.
 
 ```text
 main.zig
-└── supervisor.zig
-    ├── audio_process.zig
-    │   ├── pipewire.zig
-    │   └── audio_exchange.zig
-    ├── transcription_process.zig
-    └── descriptor_handoff.zig
+├── serve → supervisor.runService
+│            ├── control_socket.zig        public commands and status
+│            ├── audio_process.zig         isolated PipeWire worker
+│            │   ├── pipewire.zig          stream ownership and callbacks
+│            │   └── audio_exchange.zig    three shared Float32 slots
+│            ├── transcription_process.zig resident Whisper worker and mailbox
+│            │   ├── model_cache.zig
+│            │   └── ../runtime/root.zig
+│            ├── clipboard_process.zig     guardian and wl-copy ownership
+│            └── paste_keyboard.zig        persistent native uinput keyboard
+└── listen / record / stop / cancel / status / kill → control socket
 ```
 
-`main.zig` chooses the user-facing supervisor spike or one private worker role.
-`supervisor.zig` owns epoll ordering, session outcome, absolute deadlines,
-retries, slot release, and final transcript acceptance. Deterministic roles use
-exactly the seqpacket, pidfd, memfd, eventfd, descriptor-handoff, and
-parent-death contracts used by the attached PipeWire and resident CTranslate2
-roles.
+`--internal-role` is the daemon's private re-execution mechanism, not a user
+command. The audio and model processes need separate lifetimes so the daemon
+can terminate blocked capture or inference without surrendering session state.
+The supervisor transfers their shared descriptors through `SCM_RIGHTS`. The
+clipboard guardian instead inherits a transcript pipe and contains wl-copy's
+background owner and transfer children in a separate session.
 
-`audio-spike` remains a focused adapter over five operations from
-`audio_process.zig`: `start`, `requestStop`, `requestCancel`, `receiveReport`,
-and `killAndReap`. `pipewire.zig` owns the real stream and callbacks;
-`audio_exchange.zig` owns count-based PCM publication. The transcription result
-mailbox belongs to `transcription_process.zig`.
+## Build and install models
 
-Install PipeWire's development package once so pkg-config can supply its public
-headers and linker name:
-
-```bash
-sudo apt install libpipewire-0.3-dev
-```
-
-Install the verified Intel archives required by the build and both named
-CTranslate2 English Whisper models:
+The build links libc, the desktop's PipeWire client library, and libsystemd for
+asynchronous desktop notifications. Inference uses
+host-targeted AVX-VNNI kernels; this is not a portable baseline binary. There is
+no external inference engine or C++ bridge. The checkpoint importer reads the
+published CTranslate2 serialization format, not CTranslate2 code or libraries.
 
 ```bash
-zig build setup
-```
-
-They can also be installed independently:
-
-```bash
-zig build setup-native
+sudo apt install libpipewire-0.3-dev libsystemd-dev wl-clipboard
+cd zig
 zig build setup-models
+zig build
 ```
 
-Build the supervisor, both boundary spikes, and the private real-audio worker
-without running any of them:
+Setup atomically installs the pinned Systran `base.en` and `small.en` checkpoints.
+It verifies `model.bin` and `vocabulary.txt` against their sizes and SHA-256 pins,
+reusing valid installed payloads. `zig build setup` is an alias for model setup;
+ordinary builds neither download models nor run inference.
+
+`zig build update-compile-flags` regenerates clangd's flags for the PipeWire C
+boundary. Build on the Ubuntu release where the executable will run: it links
+that host's PipeWire and libc. Plain `zig build` defaults to ReleaseSafe for both
+application and inference code, retaining lifecycle assertions and Zig runtime
+safety checks. Use `-Doptimize=Debug` for an unoptimized checked build;
+ReleaseFast is not the production policy.
+
+For an opt-in compact build, `-Doptimize=ReleaseSmall` compiles the application
+and control code with ReleaseSmall and the inference module with ReleaseFast.
+This profile disables Zig runtime safety checks; it does not replace the
+ReleaseSafe production policy. Debug, ReleaseSafe, and ReleaseFast continue to
+apply their selected mode to both application and inference code.
 
 ```bash
-zig build -Doptimize=ReleaseSafe
+zig build -Doptimize=ReleaseSmall
+strip --strip-all -o zig-out/bin/voiced-stripped zig-out/bin/voiced
 ```
 
-Exercise the complete process boundary without opening a microphone or loading a
-model:
+The build retains debug data, and the daemon explicitly enables stack tracing.
+Keep the unstripped binary for offline symbolization; the separate stripped copy
+retains stack-trace machinery, not the removed debug data. The daemon disables
+unused `std.Io` networking in every build mode. Raw Unix sockets, PipeWire, and
+libsystemd remain available, and the separate model-setup tool keeps networking.
+
+## Run
 
 ```bash
-./zig-out/bin/voiced supervisor-spike normal
-./zig-out/bin/voiced supervisor-spike burst_publications
-./zig-out/bin/voiced supervisor-spike transcription_crash_after_result
+# Use a separate instance while evaluating the native daemon.
+export VOICED_INSTANCE=test
+./zig-out/bin/voiced serve
+
+# In another terminal with the same VOICED_INSTANCE:
+./zig-out/bin/voiced record -t
+./zig-out/bin/voiced stop
+./zig-out/bin/voiced listen
+./zig-out/bin/voiced status
+./zig-out/bin/voiced cancel
+./zig-out/bin/voiced kill
 ```
 
-Replace only deterministic audio with the real default PipeWire source:
+The service opens no microphone or model at startup. A recording starts capture
+and model loading concurrently. Small.en and four inference threads are the
+defaults. Service options are:
+
+| Option | Meaning |
+| --- | --- |
+| `--log-level <critical\|error\|warn\|info\|debug>` | Diagnostic threshold; default `info` |
+| `--model <name>` | `Systran/faster-whisper-small.en` or `Systran/faster-whisper-base.en` |
+| `--model-encoder-threads <1-32>` | Inference worker count |
+| `--model-decoder-threads <1-32>` | Decoder subset of the encoder pool; omitted uses the whole pool |
+| `--model-encoder-padding-seconds <5\|10\|30>` | Encoder silence appended after each audio chunk; default 10 seconds, with total input capped at 30 seconds |
+| `--recording-seconds-max <1-65535>` | Maximum recording duration; default 3,600 seconds |
+| `--model-idle-seconds-max <seconds>` | Idle retention interval; default 300, zero disables retention |
+| `--microphone-serial <serial>` | Select exactly one source by stable physical Device identity |
+| `--microphone-node <node-name>` | Select an explicit PipeWire source; mutually exclusive with Device serial |
+| `--transcript-output <mode>` | `desktop` copies and pastes (default); `clipboard` only copies; `stdout` writes diagnostic text |
+| `--notification-mode <errors\|off>` | Error popups; default `errors`. Diagnostic `stdout` always disables notifications |
+| `--paste-shortcut <chord>` | `ctrl+shift+v` (default), `ctrl+v`, or `shift+insert`; used in desktop mode |
+| `--paste-settle-ms <0-65535>` | Wait after clipboard acquisition before pasting; default 10 ms |
+| `--paste-key-gap-ms <0-65535>` | Gap between the four paste key-event frames; default 4 ms |
+
+All service settings also accept snake_case keys in
+`$XDG_CONFIG_HOME/voiced/config` (or `~/.config/voiced/config`). For example:
+
+```ini
+# Example tuned worker counts; the built-in default remains four.
+model=Systran/faster-whisper-small.en
+model_encoder_threads=16
+model_decoder_threads=8
+model_encoder_padding_seconds=10
+model_idle_seconds_max=300
+recording_seconds_max=3600
+transcript_output=desktop
+paste_shortcut=ctrl+shift+v
+paste_settle_ms=10
+paste_key_gap_ms=4
+# microphone_serial=ABC123
+```
+
+Use `voiced serve --config PATH` to select another file. A missing default file
+uses built-in defaults; an explicitly selected file must exist. The file is read
+once at startup and limited to 64 KiB. Restart the service after edits.
+
+Each line is `key=value`, split at the first `=`. Blank lines and lines starting
+with `#` after whitespace are ignored. Surrounding whitespace is trimmed; values
+are literal, without quotes, escaping, interpolation, or inline comments. A `#`
+inside a value is preserved. Unknown keys, duplicate settings, and invalid values
+are errors; file syntax and value errors include the filename and line number.
+
+CLI settings override file settings. A CLI microphone choice replaces the file's
+choice; specifying both node and serial within one input is an error. Decoder
+threads must not exceed encoder threads after overrides are applied. Both phases
+share one pool; workers outside the decoder subset park during decoding.
+`--config` and command actions such as `record --toggle` are not file settings.
+
+Desktop mode opens one virtual keyboard through `/dev/uinput` and keeps it
+across dictations. It needs the user's existing uinput permissions; Voiced does
+not change device permissions or run as root. Missing access is logged and
+delivery continues with clipboard only. Choose `ctrl+v` for applications using
+that paste shortcut. The shortcut goes to the application focused at delivery
+time; physically held modifier keys can affect it.
+
+After clipboard/paste finishes, desktop and clipboard modes save the final UTF-8
+text to `$XDG_STATE_HOME/voiced/transcript.txt`, defaulting to
+`~/.local/state/voiced/transcript.txt`. Named instances use `voiced-<instance>`.
+The file is replaced atomically, with no added newline; rejected, empty, and
+cancelled recordings preserve the previous file. Clipboard/paste failures still
+attempt saving. Save errors are logged without undoing desktop delivery.
+
+The destination path is resolved and allocated once at service startup. Saving
+reuses that path and the existing transcript buffer, with no per-save path
+allocations or environment lookups. It uses a direct temporary-file write and
+rename, without fsync. It happens after delivery and logs its elapsed time. This
+avoids a save worker, but slow storage can block commands and power-loss durability
+is not guaranteed. Diagnostic stdout mode does not update the file.
+
+Failed model-worker transcriptions automatically retain one private diagnostic
+bundle at `$XDG_STATE_HOME/voiced/last-failed/` (default
+`~/.local/state/voiced/last-failed/`; named instances use `voiced-<instance>`):
+
+- `audio.wav`: the exact failed chunk, mono 16 kHz IEEE Float32, before padding;
+- `generated.txt`: generated bytes, including a partial text conversion;
+- `tokens.json`: all generated token IDs available from the decoder;
+- `metadata.json`: the original error, chunk/sample counts, decoder evidence,
+  phase timings, model revision/checksums, compiler/build mode, threads, padding,
+  prompt, suppression lists, and token limit.
+
+Directories are mode `0700`, files `0600`. Each failed attempt atomically replaces
+the previous complete bundle. An interrupted save can leave one additional
+`last-failed.pending` bundle, reused on the next failure; the maximum audio per
+bundle is 30 seconds (1.83 MiB). Successful recordings preserve the last failure.
+Transcript contents and token IDs stay out of journal logs. Failure logs include
+the chunk, audio duration, token count/limit, actual encoder positions,
+no-speech/average log probabilities, and separate phase timings when available.
+Unknown decoding evidence is explicitly marked unavailable in the saved metadata.
+
+The existing model worker writes the capture after reporting its error, borrowing
+its sealed audio and decoder buffers. Paths are resolved once at initialization;
+successful inference adds no disk work or per-chunk allocation. Diagnostic saving
+is best effort under the existing worker deadline: filesystem problems are logged
+independently, and a killed/crashed worker cannot produce this bundle. These are
+runtime/feature/text-conversion errors, not normally completed results rejected
+by the supervisor's speech-confidence policy. A missing model has no decoded
+chunk to capture. Saving never updates the accepted transcript or clipboard.
+
+Build and replay from the repository root, using the existing Python environment
+for the CTranslate2 reference (no model downloads):
 
 ```bash
-./zig-out/bin/voiced supervisor-spike pipewire \
-  --seconds 5 \
-  --slot-seconds 1
+(cd zig && zig build replay)
+.venv/bin/python zig/scripts/replay-transcription.py
 ```
 
-`--seconds` configures the maximum duration of this recording. It defaults to
-one hour and accepts values through 65,535 seconds—the natural `u16` limit of
-18 hours, 12 minutes, and 15 seconds. Reaching it performs a normal stop and
-final drain. Add `--listen` to end early after speech followed by 800 ms of
-quiet. Without it, quiet affects internal chunk boundaries but never ends
-capture before that configured limit.
+The replay copies a consistent snapshot to a new private temporary directory,
+then compares Zig and CTranslate2 INT8 with 10- and 30-second trailing padding,
+matching greedy prompt, suppression, token limit, and normalized-zero padding.
+A capture made with 5-second padding also gets that original setting replayed.
+The reference uses independent NumPy feature extraction and CTranslate2 kernels;
+its one thread count applies to both encoder and decoder. The summary reports
+first differing token positions and token-limit exhaustion, with text kept in
+private result files. It checks pinned source/packed-image identity and reports
+compiler/build-mode differences; it does not preserve the old executable.
 
-Without `--model`, this command drives real PCM publications through the
-supervisor while transcription emits deterministic `chunk-N` text. Add a named model to exercise direct shared-memory inference:
+Use an explicit capture path as the positional argument, or compare a fixture:
 
 ```bash
-./zig-out/bin/voiced supervisor-spike pipewire \
-  --seconds 25 \
-  --slot-seconds 20 \
-  --model Systran/faster-whisper-small.en \
-  --threads 4
+.venv/bin/python zig/scripts/replay-transcription.py --audio test-fixtures/hello_world.wav
+VOICED_INSTANCE=test agent-run './test.sh --zig-replay'
 ```
 
-`Systran/faster-whisper-small.en` is the default production choice for
-technical dictation quality. `Systran/faster-whisper-base.en` uses less memory
-and returns sooner at the measured cost of more changed words. Setup installs
-both under `$XDG_DATA_HOME/voiced/models/Systran/`, or under
-`~/.local/share/voiced/models/Systran/` when `XDG_DATA_HOME` is unset.
-
-`--model-residency session` is the default: model loading and one silent warm-up
-start alongside capture, so ordinary dictation hides most startup work.
-`--model-residency service` requires the model to be ready before capture. The
-one-session spike then shuts it down with the command; the future long-running
-service keeps that same ready worker across recordings.
-
-The model worker reuses its loaded model for every sealed slot. Each mailbox
-commit includes the audio-activity observation and Whisper confidence values
-used to accept its text. Inactive
-chunks with no-speech probability at least 0.60 become a normal `no_speech`
-result. Any disagreement between activity and model confidence fails explicitly
-instead of publishing a likely hallucination or silently discarding possible
-quiet speech. It accepts the same
-`--device-serial`, low-level `--target`, and `--main-loop` source controls as the
-audio experiment. Capture setup, sample-progress, teardown, session, inference,
-and worker-exit deadlines belong to the epoll supervisor rather than either
-worker.
-
-Model-ready and result packets already carry nanosecond timings as structured
-fields. The supervisor aggregates worker startup, model load, warm-up, feature
-extraction, and inference totals and maxima into `SessionTimingReport`, together
-with audio-start-to-finish and audio-finish-to-session-completion durations.
-Console output is only a rendering of that report; later persistence and control
-responses can consume the structured value directly.
-
-ReleaseSafe is the production policy. It retains `std.debug.assert`, overflow,
-bounds, enum, and other Zig runtime-safety checks around trusted lifecycle and
-shared-exchange contracts. PipeWire formats and buffers remain explicitly
-validated in every mode. ReleaseFast is reserved for deliberate performance
-comparison because it removes the internal assertions that diagnose Voiced
-defects.
-
-In ten one-second runs per mode, ReleaseSafe's median longest callback was 7.5
-µs versus ReleaseFast's 6 µs; maxima were 27 µs and 93 µs. With one sustained
-low-priority load on every logical CPU, medians were 6.5 µs and 7 µs and the
-largest callback gaps were 25 ms and 22 ms. All runs completed 16,014 samples.
-The isolated server could not provide RTKit, so these are conservative
-normal-scheduler measurements rather than a claim that safety checks improve
-speed. They show no meaningful ReleaseSafe cost against a roughly 20 ms graph
-interval.
-
-Record five seconds from the default PipeWire source:
+For a diagnostic run that does not copy or press keys:
 
 ```bash
-./zig-out/bin/audio-spike --output /tmp/voiced-audio.wav
+VOICED_INSTANCE=test ./zig-out/bin/voiced serve --transcript-output stdout
 ```
 
-By default, the worker selects PipeWire's `client-rt.conf` and requests its
-realtime process callback. That client configuration loads PipeWire's realtime
-module, which can ask RTKit to promote the callback data thread when ordinary
-process limits do not permit realtime scheduling. Capture continues with a
-warning when promotion is unavailable; setup and progress deadlines still
-contain a starved worker. `--main-loop` provides the non-realtime comparison
-path. `--device-serial <serial>` selects a configured physical microphone by
-stable PipeWire `device.serial`; for example:
+To use a 10-second encoder silence tail, start the service with
+`voiced serve --model-encoder-padding-seconds 10`. This changes Whisper's
+trailing padding, not microphone buffering or the recording limit.
+
+Run `voiced --help`, `voiced help serve`, or `voiced record --help` for help
+and examples. Help writes to stdout and does not contact the daemon. A bare
+`voiced` prints a short introduction. `-h` and `--help` take precedence over
+other arguments before the `--` end-of-options marker.
+
+Service values accept both `--model-encoder-threads 8` and `--model-encoder-threads=8`. Each option may
+appear only once, even if repeated values are identical; `record -t --toggle`
+is also a duplicate. Source flags are mutually exclusive. Invalid commands,
+unknown flags, missing or invalid values, duplicates, and conflicts produce a
+specific message on stderr with a help hint. Exit status is 0 for success or
+help, 1 for operational failures, and 2 for command-line errors.
+
+Without a source option, each recording resolves the current default source.
+An absent or ambiguous configured device fails rather than opening another
+microphone. The observer independently verifies the linked source before
+accepting samples. Source removal, replacement, or timeline discontinuity stops
+capture and retains its valid published prefix for transcription.
+
+Capture requests realtime processing. Missing scheduler promotion or memory
+locking does not invalidate capture; deadlines still contain an unresponsive
+worker. The shared exchange is touched before capture and locked when permitted.
+
+## Lifecycle and output
+
+The supervisor is the only owner of session transitions, absolute deadlines,
+worker replacement, slot release, and final transcript acceptance. It processes
+one complete epoll batch before starting replacement workers, so old readiness
+notifications cannot affect a newly reused descriptor.
+
+Commands use one newline-terminated JSON request/response per connection at
+`$XDG_RUNTIME_DIR/voiced/control.sock`, or `voiced-<instance>/control.sock` for a
+named instance. Status exposes `idle`, `capturing`, `stopping`, `transcribing`, or `delivering`,
+plus whether the model is absent, loading, warm, restarting, or unloading.
+Toggles during stopping, transcription, or delivery are ignored. Client sizes, concurrency,
+and request lifetimes are bounded.
+
+The complete model process remains resident across successful recordings until
+its idle deadline. A retained worker owns weights, vocabulary, CPU threads,
+activation workspace, and decoder caches. Readiness follows initialization;
+there is no dummy inference. Cancellation discards the session and releases its
+model process. Normal shutdown stops and reaps workers before removing the
+control socket.
+
+Accepted nonempty text is streamed through a nonblocking pipe to stock
+`wl-copy --type text/plain;charset=utf-8 --`. The two-second acquisition limit
+includes that transfer. A guardian preserves wl-copy's default launcher-exit
+signal and requires a surviving adopted instance of the same binary before
+reporting acquisition. A zero exit without an owner is a failure.
+
+After acquisition, the supervisor waits `paste_settle_ms` (default 10 ms) and
+sends the configured chord through native Linux input events, with
+`paste_key_gap_ms` (default 4 ms) between its four frames. Both settings accept
+0 through 65535 milliseconds; zero removes that intentional delay. They apply
+only to desktop output. The default scheduled delay is 10 + 3 × 4 = 22 ms;
+clipboard acquisition, scheduling, and application response add their own time.
+Lower delays are not a guarantee of readiness in every application. To restore
+the previous margins, use `paste_settle_ms=50` and `paste_key_gap_ms=8`.
+
+The keyboard retains its one-second initial device enumeration allowance.
+The paste deadline includes all three configured key gaps plus 200 ms for
+scheduling delays and nonblocking writes. These are timer-driven stages; the
+event loop keeps serving commands. Completion
+means the kernel accepted the key releases, not proof that an application pasted.
+An uncertain paste is never retried. A paste error preserves the clipboard.
+
+The clipboard owner survives later recordings and model expiry. At most two
+guardians coexist during replacement; a failed candidate leaves the prior owner
+running where selection has not already changed. Normal selection loss retires
+ownership without copying again. Guardians reap transfer children; the supervisor
+is also a subreaper and contains their session if a guardian crashes. Cancellation
+during delivery stops further output but cannot undo a copy or paste already sent.
+
+`--transcript-output stdout` retains the synchronous diagnostic sink: final text followed
+by a newline. Operational messages go to the journal. Discarded sessions and empty
+no-speech results emit no transcription. A capture failure can still deliver a
+successfully transcribed valid prefix while reporting the capture error.
+
+Output adds no C bindings, input helper daemon, or service thread. The external
+clipboard dependency is wl-clipboard; the existing PipeWire boundary still links
+C and libc. Desktop notifications additionally link libsystemd. Native journal
+logging is implemented directly in Zig. Repository-level systemd installation
+remains separate work.
+
+## Journal logging
+
+Service and worker diagnostics use `src/logging.zig`, including foreground
+`voiced serve`. CLI argument/help/error messages may use stderr directly;
+command responses and explicit transcript output keep their stdout contracts.
+Offline replay uses the same logger with a CLI stderr sink. Zig's emergency
+panic/stack-trace machinery retains its stderr path.
+
+Set `log_level=info` in the config or `--log-level info` on the command line.
+Levels are `critical`, `error`, `warn`, `info`, and `debug`; the threshold includes
+all more severe events. Worker launches explicitly carry the effective level.
+Changing the config requires a restart. At `warn` or above, info-level readiness
+and effective-configuration messages are intentionally filtered.
 
 ```bash
-./zig-out/bin/audio-spike \
-  --device-serial Shure_Inc_Shure_MV7 \
-  --output /tmp/voiced-audio.wav
+journalctl --user -u voiced -f -o short-precise
+journalctl --user -u voiced -p warning
+# Foreground serve has no voiced.service unit:
+journalctl --user -t voiced -f
 ```
 
-Before creating a capture stream, the worker inventories current source Nodes
-and Devices and resolves that serial to exactly one current node name. An absent
-or ambiguous device fails without opening the default microphone and reports
-the available sources. The observer then verifies that PipeWire actually linked
-the resolved Device before permitting sample copies.
+Every service event is a single native journal datagram with real `PRIORITY`,
+`SYSLOG_IDENTIFIER=voiced`, and `VOICED_COMPONENT`. Where supplied by the caller,
+`VOICED_RECORDING_ORDINAL` provides the same recording identity in supervisor
+and transcription-worker events, without logger-owned recording state. Model
+cache and clipboard-worker events can instead be correlated by their journal PID. Newlines in error details stay inside one binary-encoded
+`MESSAGE`; they cannot create extra journal fields. Human-readable messages
+use snake_case, concept-first field names. Numeric values carry no unit suffix;
+time fields name their unit, and `size` always means bytes. Free-text strings
+are quoted with escaped quotes, newlines, and control bytes. Typed error payloads
+retain their diagnostic representation; MESSAGE is not a rigid parsing API.
 
-`--target <pipewire-node-name>` remains a mutually exclusive low-level spike
-control for virtual sources and graph experiments. `--seconds` defaults to 5
-and accepts values from 1 through 90. `--stop-after-ms <0-90000>` makes the
-parent send a normal-stop command: the worker closes its sample gate, waits for
-stream destruction to synchronize with any callback already running, and
-publishes the final partial slot before reporting `stopped`.
-`--cancel-after-ms <0-90000>` sends the mutually exclusive cancel command. It
-abandons the private final slot, reports `cancelled`, and leaves the requested
-output path absent even when earlier complete slots had already been consumed.
-The parent allows two seconds for either command to finish teardown, then kills
-and reaps an unresponsive worker and reports forced termination.
+Records use fixed stack storage, at most 4 KiB per datagram; oversized messages
+end with `[truncated]`. No audio callback or inference kernel logs. Disabled
+events skip formatting, and expensive argument preparation must be guarded with
+`logging.enabled()`. There is no logging queue, thread, or event-loop registration.
+A full or unavailable journal drops the event without blocking or falling back
+to stderr. `VOICED_DROPPED` on the next successfully submitted event counts local
+submission losses; it does not claim that journald persisted an accepted event.
+The socket is close-on-exec and each worker opens its own. Path-based sends allow
+subsequent messages to reach journald after it restarts without reconnect state.
 
-`--slot-seconds <1-30>` shortens the publication boundary without shrinking the
-production 30-second slot capacity; use it to exercise concurrent publication
-and physical-slot reuse quickly. `--consumer-delay-ms <0-10000>` keeps each
-publication occupied for a controlled interval, simulating a slow model process
-and eventually producing `pipeline_full` when all three slots remain
-unavailable.
+`./test.sh --zig-logging` tests native fields, multiline framing, truncation,
+early filtering, a deliberately full receiver, recovery loss counts, and public
+config/CLI behavior. Service integration tests supply a private datagram stderr
+socket, which the logger duplicates; neither test path writes to the host journal.
 
-The activity lines in the final report come from the adaptive volume detector
-that drives natural chunking and optional automatic stop. It calibrates the
-first 300 ms, then reports active and quiet sample counts, run lengths, the
-learned noise floor, and its hysteresis thresholds. `audio_policy.zig` fixes the
-production policy at a 30-second slot capacity, a 20-second internal minimum, a
-natural boundary after 300 ms of quiet, and automatic stop after 800 ms of quiet.
+## Desktop error notifications
 
-Capture publishes a natural boundary only after the current slot contains at
-least 20 seconds. `--listen` arms automatic stop only after activity has been
-observed, so an idle microphone still reaches the explicit duration limit. When
-a 300 ms boundary starts Whisper early and the same quiet run reaches 800 ms,
-the worker discards the private 500 ms confirmation tail rather than sending a
-second silence-only chunk to Whisper. Explicit `--slot-seconds` values below 20
-remain fixed experimental boundaries for pipeline-pressure tests.
+`notification_mode=errors` (the default) reports failed capture/transcription,
+unreliable speech, incomplete recordings, and failed clipboard, paste, or save
+operations. Recording, transcription progress, ordinary silence, cancellation,
+and successful delivery produce no popups. `notification_mode=off` disables the
+connection; `transcript_output=stdout` always disables it.
 
-Forced 30-second boundaries currently use no PCM overlap. A 250–500 ms overlap
-recovered one deliberately divided word, but broader cuts added more word errors
-than they removed, including on dense speech designed to force the boundary.
-Voiced therefore keeps the simpler independent chunks until timestamp-aware
-reconciliation or stronger evidence can prevent overlap from deleting or
-repeating dictated words.
+Each service owns its `Error` tagged union and returns `Result { ok, err }`
+(`Result(T)` for operations with different success values). Capture errors retain
+valid audio and the complete native report, including a separate teardown error.
+Transcription reports preserve the stage and exact Zig error name. Paste errors
+include the syscall errno, ioctl request/argument or chord/frame progress. Save
+errors retain the failing operation, write progress, and any temporary-file
+cleanup error. These operational results do not allocate.
 
-Neither the requested node nor the discovery result is trusted as the source
-identity. PipeWire represents
-one capture as a source-node Link into Voiced's stream node, and WirePlumber can
-replace that Link after a microphone disappears. The worker observes the graph,
-locks the first concrete source before permitting realtime sample copies, and
-stops the recording if its Link, source Node, or Device disappears or a different
-source is linked. Reports include the source name and description, ephemeral
-PipeWire IDs and object serials, and the underlying `device.serial` when the
-source belongs to a device. That stable device serial survives the unplug/replug
-case tested with the MV7; PipeWire IDs and object serials do not.
+The supervisor maps those types to concise notifications. It distinguishes
+missing/ambiguous microphones, lost connections, source changes, audio stalls,
+model loading/transcription errors, and clipboard/paste/storage errors. It logs
+full diagnostics before retaining only the notification category and delivery
+outcome. Mic ambiguity logs include the match count and candidate sources; use
+`microphone_node` **instead of** `microphone_serial` to select one input.
 
-The audio worker rejects callback blocks larger than 100 ms and rejects NaN or
-infinite PipeWire samples before publication. It clamps finite samples to
-PipeWire's normalized `[-1.0, +1.0]` range, reports the number clipped, and
-quantizes them directly into the shared signed 16-bit slot. These checks keep
-validation and conversion bounded on PipeWire's realtime thread; no second
-float PCM block is retained.
-
-Before capture, the worker touches every shared-exchange page and attempts to
-lock the complete mapping in memory. Locking is best effort: failure does not
-make the exchange unsafe, but the report warns with the Linux errno and
-`RLIMIT_MEMLOCK` soft limit because reclaimed pages could delay a callback.
-
-The same source builds against Ubuntu 22.04's PipeWire 0.3.48 headers and
-Ubuntu 24.04's PipeWire 1.0.5 headers. Build the audio executable on the Ubuntu
-release where it will run: it links that host's PipeWire and libc rather than
-pretending one desktop binary covers both releases.
-
-Every build requests SPA Header metadata during buffer negotiation. When
-PipeWire supplies it, Voiced rejects corrupted or discontinuous blocks and
-inserts zero samples for the exact duration of Header-marked gaps. Header
-metadata remains optional: PipeWire can accept the request but omit it on a
-valid audio-converter stream.
-
-PipeWire 1.0.5 adds the per-buffer timestamp needed for full timeline
-validation. When both the build headers and loaded library provide it, Voiced
-also compares every buffer's cycle with the graph clock and received sample
-duration. Graph time advancing beyond the duration represented by received
-samples then stops capture while retaining the valid prefix, even without a
-Header warning. PipeWire may combine multiple ready graph quanta in one buffer;
-the validator accepts that longer block because `pw_buffer.time` identifies its
-queue cycle rather than the first contained sample. Older builds continue in
-`header-only` mode. The worker publishes that already-resolved capability before
-the first callback, so the supervisor warns once when capture starts without
-parsing the PipeWire version again. Every successful report names the
-build-header, client-library, and server versions plus the selected validation
-mode.
-
-The three shared signed 16-bit PCM slots occupy about 2.75 MiB in total
-regardless of recording length: consumed slots are reused rather than retaining
-the complete recording.
-The supervisor allocates the session transcript once at 64 UTF-8 bytes per
-configured audio second plus one 4 KiB result. The extra 4 KiB guarantees that
-one maximum-sized mailbox result fits beyond the duration-based budget. The
-one-hour default reserves about 229 KiB; the natural `u16` duration ceiling
-reserves about 4 MiB. At the one-hour default, the audio exchange, transcript
-mailbox, and aggregate transcript together occupy about 2.98 MiB of fixed
-recording/session storage, excluding the Whisper model and ordinary process or
-library overhead. If accepted model output exceeds this fixed capacity, the
-supervisor reports `transcript_capacity_exceeded` and discards the session
-instead of reallocating or truncating text. Allocation failure remains an
-ordinary session-start failure.
-
-The parent requires the first copied samples within three seconds and continued
-sample progress at least every two seconds. It uses kernel parent-death signaling
-and unconditional `SIGKILL` containment so a crashed, stopped, or orphaned
-worker cannot retain the microphone. This process split is a lifecycle boundary,
-not a security boundary: Voiced asserts its own packet and shared-memory
-contracts on both sides, while validating formats and buffers received from
-PipeWire. Setup failures report the exact stage, native error domain and code,
-platform message, linked PipeWire version, requested target, and processing
-mode. Runtime reports separately preserve the actual linked source and classify
-source removal or replacement. Their captured and published sample counts differ
-only when cancel discards the final unpublished slot. Deadlines report the stage
-and last observed callback/sample counters. The memfd is sealed against
-resizing, and the worker rejects a descriptor soft
-limit below 64 before entering PipeWire.
-
-Transcribe either that recording or the checked-in fixture:
+`wl-copy` diagnostics retain 2 KiB of stderr plus an omitted-byte count, the
+original error/native errno, and the raw child wait status. Its guardian drains
+stderr even when retention is full and journals primary and cleanup errors
+separately. Capture's bounded source-list presentation can omit entries; the
+worker journals the complete observed candidate catalog on selection errors.
+For the full cause and affected recording, run:
 
 ```bash
-./zig-out/bin/model-spike \
-  --model ~/.local/share/voiced/models/Systran/faster-whisper-small.en \
-  --audio ../test-fixtures/hello_world.wav \
-  --threads 4 \
-  --beam-size 1 \
-  --runs 3
+journalctl --user -u voiced -b -n 50 --no-pager
 ```
 
-`--threads` defaults to 4. `--beam-size` defaults to the selected greedy value
-of 1 and accepts 1 through 16 so decoding policy can be measured without
-rebuilding. `--runs` defaults to 3 and must be an odd number between 1 and 9.
-`--input-gain <0-1>` scales the signed 16-bit fixture in place before feature
-extraction. Unlike the supervisor's named-model option, this measurement binary
-deliberately accepts a model directory so it can probe uninstalled conversions.
+The supervisor uses sd-bus on the user session bus through its existing epoll and
+timerfd loop. There is no notification subprocess or thread. One outstanding
+request and one pending operation coalesce bursts; replies have a one-second
+timeout. Repeated identical problem/outcome pairs are suppressed within a recording.
+Each new recording resets suppression; ignored commands do not. The next error
+can replace the existing popup, and a successful recording closes it.
+Dismissal invalidates the held ID; notification
+server restarts reset IDs and redisplay an unresolved problem. Replacement and
+closure address the original server's unique bus name, preventing ID reuse races.
 
-`-Dmkl-prefix=/path/to/prefix` overrides the downloaded
-`zig-pkg/mkl` installation. The prefix must contain `include/`,
-`opt/compiler/include/`, and the required static archives under `lib/`.
+Clipboard/paste failure messages distinguish successful transcript saving from
+failed saving. Popup bodies never contain the transcript. Notification failures
+are logged and leave recording and output working. A missing or disconnected
+session bus disables notifications until voiced restarts; a notification server
+can appear or restart on a live bus without restarting voiced. Shutdown attempts
+to close a known popup without waiting or flushing the bus. A timed-out Notify
+whose reply never arrives has no usable ID; its popup follows desktop expiration.
+
+`./test.sh --zig-output` tests the native client against a private D-Bus server
+(requires `dbus-daemon` and `/usr/bin/python3` with PyGObject/Gio). Setting
+`VOICED_ZIG_MODEL_TESTS=1` also checks notifications from real transcription,
+failed clipboard delivery, recovery, cancellation, and failed saving. These tests
+use private state and cannot notify your desktop.
+
+## Recording metrics
+
+`recording_ordinal` counts accepted recordings within one service lifetime;
+`chunk_ordinal` counts their chunks from zero. Failure and cancellation consume
+an ordinal. Restarting the service resets the recording sequence. Journal PID
+and invocation metadata distinguish service lifetimes.
+
+`Recording requested` marks acceptance before worker startup. `Capture started`
+marks the supervisor's first observation of a PipeWire callback. That observation
+waits for an event-loop wake-up; it is not the exact first-sample timestamp. `Transcription
+complete` precedes clipboard acquisition, paste, and saving. `Paste shortcut sent`
+confirms keyboard event submission; it cannot confirm application insertion.
+`Desktop notification accepted` confirms the server accepted the request.
+
+Field names put the subject before the measurement. Time values use fixed units
+in their names; byte quantities use `size` without another byte suffix:
+
+| Field | Meaning |
+|---|---|
+| `audio_duration_seconds` | Actual audio duration, excluding encoder silence padding |
+| `audio_samples_count` | Samples in this chunk |
+| `features_duration_ms` | Measured feature extraction work |
+| `inference_duration_ms` | Measured encoder, cross-KV, and decoder work |
+| `transcription_compute_duration_ms` | Sum of feature and inference work for consumed results |
+| `transcription_compute_speed_ratio` | Audio duration divided by measured computation duration; 12.5 means 12.5 times realtime |
+| `transcript_size` | UTF-8 bytes: raw chunk text, or accumulated trimmed text at completion/delivery |
+| `tokens_count`, `tokens_count_max` | Generated token count and its inclusive maximum |
+
+Recording computation totals include consumed no-speech chunks. They exclude
+model preparation, queueing, failed attempts, text assembly, and desktop delivery;
+they are neither end-to-end latency nor total computation including retries.
+Capture-end audio duration covers all captured samples, which can exceed the
+processed prefix after a failure. A recovered mailbox may lack timings; its
+chunk and recording computation totals/speed then say `unavailable`. A speed
+with zero audio or computation duration is also `unavailable`. Discarded
+recordings have `transcript_size=0`. Transcript contents are never diagnostics.
+
+Durations measure one named operation; elapsed fields measure from a named
+reference event. There is no duration relative to the previous log line.
+
+| Timing | Start → end |
+|---|---|
+| `capture_start_duration_ms` | Accepted command received → first callback observed by supervisor |
+| `model_cache_load_duration_ms` | Cache resolution and locking → mapped image read/validation complete |
+| `model_convert_duration_ms` | Pristine source resolution/read/validation → conversion complete |
+| `model_prepare_duration_ms` | Worker starts model loading → vocabulary, workspace and runtime ready |
+| `clipboard_acquire_duration_ms` | Desktop delivery begins → supervisor observes clipboard acquisition |
+| `paste_duration_ms` | Clipboard acquisition observed → shortcut submission complete, including settle/key waits |
+| `transcript_save_duration_ms` | Save begins → atomic publication finishes, or save returns an error |
+| `recording_stop_elapsed_ms` | Stop reference → this milestone |
+
+Cache lookup, publication, remapping, vocabulary loading and runtime initialization
+have additional duration fields at `debug`. Main lifecycle, chunk and completion
+measurements remain at `info`. Synchronous operations use local timestamps; the
+supervisor retains only the recording request timestamp and one delivery boundary,
+reused after clipboard acquisition. No callback or per-token timers were added.
+
+With `recording_stop_origin=command`, the stop reference is the supervisor
+receiving the accepted stop/toggle command. Repeated stops do not reset it.
+With `recording_stop_origin=capture_end`, it is the supervisor observing the
+capture worker's final report, excluding its earlier stop decision and teardown.
+Without either reference, origin and elapsed are `unavailable`. These timings
+exclude keybinding/CLI startup and application rendering after the paste shortcut.
+Each new recording resets the reference.
+
+Expected worker shutdowns are `debug`; unexpected exits are `error`, with
+`exit_code` or `signal` and `core_dumped`. An unexpected zero exit is still an
+error when work remained. Requested cancellation is `info`. Retrying a chunk is
+`warn` and names the recording, chunk, reason and attempt. No-speech evidence is
+included in the chunk event instead of a duplicate rejection event.
+
+Expected startup refusals such as an already running instance are `error`.
+Unrecoverable supervisor operation errors are `critical`. Operational event-loop
+syscall failures retain operation and native errno before returning through that
+exit path; cleanup errors are logged independently. Programming assertions and
+native panic traces retain Zig's emergency stderr path.
+
+## Audio and inference ownership
+
+PipeWire negotiates mono 16 kHz Float32 audio. Its callback validates complete
+blocks, rejects NaN/Inf, clamps finite overrange samples, and copies bounded
+blocks into three shared slots. It performs no model work or allocation.
+Inference borrows each sealed slot without quantization or a second waveform
+allocation. The fixed PCM exchange occupies about 5.49 MiB.
+
+`audio_policy.zig` owns the recording policy:
+
+- Physical slot capacity and forced boundary: 30 seconds.
+- Natural boundary: at least 20 seconds of audio, followed by 300 ms quiet.
+- Automatic listening stop: observed activity followed by 800 ms quiet.
+- Initial background calibration: 300 ms.
+
+Chunks are independent, without PCM overlap or previous-text prompting. If a
+natural boundary has already published the utterance, automatic stop abandons
+the private quiet confirmation tail instead of creating another silence chunk.
+Outside capacity-stop cases, activity and model confidence suppress normal
+no-speech results; disagreement is an explicit failure.
+
+The session transcript is allocated once at 64 UTF-8 bytes per configured
+recording second plus one full 4 KiB mailbox result. The one-hour default uses
+about 229 KiB. Reaching this bound, the 4 KiB chunk-text bound, or the decoder's
+446-token bound stops further recording/transcription and delivers the available
+text. The final prefix ends at a complete UTF-8 character; words or sentences may
+be incomplete. Desktop mode copies, sends the paste shortcut, then saves;
+clipboard mode copies and saves. No buffer grows and no second transcript is
+allocated.
+
+A notification distinguishes recording size, chunk size, and decoder token
+limits. Decoder-limit text is retained even when confidence is low: it may repeat
+or contain inaccuracies, so the notification asks you to check it. Both chunk
+limits are reported if reached together. Chunk/token limits still attempt the
+`last-failed/` diagnostic capture. A committed prefix remains recoverable if that
+save stalls or the worker exits. Explicit cancellation suppresses pending output
+and preserves the previous saved transcript. Start a new recording to continue;
+unprocessed audio after the cutoff is not resumed automatically.
+
+The supervisor requires the first callback within three seconds and progress
+at least every two seconds. Each inference has a ten-second deadline; model
+startup has fifteen seconds. Stop, cancellation, worker report/exit, and forced
+termination have separate bounded states. A committed mailbox result survives
+worker death; uncommitted work receives one retry. The audio owner alone closes
+its PipeWire stream. The parent uses pidfds and parent-death signaling to
+contain workers it cannot shut down cooperatively.
+
+## Model cache and runtime
+
+The worker verifies installed weights, converts them once, and atomically
+publishes a packed image under `$XDG_CACHE_HOME/voiced/models/`. Cache identity
+includes the model, pristine checksum, packing revision, and image format.
+BLAKE3-256 protects the cached payload. Private permissions, a builder lock,
+atomic replacement, and file/directory synchronization prevent partial cache
+publication. Unavailable caches fall back to verified pristine conversion;
+invalid pristine data fails explicitly.
+
+The caller supplies an address-stable runtime and its tensor arena:
+
+```zig
+var runtime: inference.Runtime = undefined;
+try runtime.init(io, &model, vocabulary, memory, policy);
+defer runtime.deinit();
+```
+
+Do not copy or move the runtime until `deinit` joins its workers. The caller
+then releases the arena and any heap storage used for the runtime itself.
+Transcription allocates nothing and returns untrimmed text in the supplied
+buffer. The supervisor trims only the assembled final transcript.
+
+[The runtime guide](runtime/README.md) explains the native Whisper implementation.
+
+Run `./test.sh --zig-output` from the repository root for
+guardian/process and CLI checks. `VOICED_ZIG_MODEL_TESTS=1 ./test.sh --zig-output`
+also exercises real inference, repeated delivery, replacement failures, guardian
+crashes, deadlines, and cancellation on a private PipeWire graph. These use a
+compiled clipboard fixture and never access the live desktop or uinput. Existing
+`--zig` checks that invoke removed experimental paths need a separate follow-up.

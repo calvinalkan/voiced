@@ -476,7 +476,6 @@ static const struct pw_stream_events stream_events = {
 struct pw_stream *voiced_audio_pipewire_capture_stream_create(
     struct pw_loop *loop,
     const char *target,
-    const bool process_realtime,
     struct voiced_audio_pipewire_stream_callbacks *callbacks,
     struct voiced_audio_pipewire_error *error_out
 ) {
@@ -507,7 +506,7 @@ struct pw_stream *voiced_audio_pipewire_capture_stream_create(
         return NULL;
     }
 
-    if (process_realtime && !set_capture_property(
+    if (!set_capture_property(
         properties,
         PW_KEY_CONFIG_NAME,
         "client-rt.conf",
@@ -676,7 +675,7 @@ static bool build_audio_buffer_parameters(
  *
  * The operation offers native float32/mono at `sample_rate_hz`, bounds each
  * callback buffer, requests optional Header metadata, enables automatic target
- * linking and mapped buffers, disables implicit reconnect, and optionally asks
+ * linking and mapped buffers, disables implicit reconnect, and asks
  * PipeWire to dispatch processing on its realtime data thread. A zero result
  * accepts only this asynchronous request; callbacks and supervisor deadlines
  * establish actual readiness.
@@ -685,7 +684,6 @@ int voiced_audio_pipewire_capture_stream_connect(
     struct pw_stream *stream,
     const uint32_t sample_rate_hz,
     const uint32_t samples_per_buffer_max,
-    const bool process_realtime,
     struct voiced_audio_pipewire_error *error_out
 ) {
     uint64_t storage[96];
@@ -731,13 +729,9 @@ int voiced_audio_pipewire_capture_stream_connect(
     stream_flags = (enum pw_stream_flags)(
         PW_STREAM_FLAG_AUTOCONNECT |
         PW_STREAM_FLAG_MAP_BUFFERS |
-        PW_STREAM_FLAG_DONT_RECONNECT
+        PW_STREAM_FLAG_DONT_RECONNECT |
+        PW_STREAM_FLAG_RT_PROCESS
     );
-    if (process_realtime) {
-        stream_flags = (enum pw_stream_flags)(
-            stream_flags | PW_STREAM_FLAG_RT_PROCESS
-        );
-    }
 
     /* PipeWire's connect API requires a raw C array of borrowed pod pointers. */
 #pragma clang diagnostic push

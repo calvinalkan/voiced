@@ -6,8 +6,8 @@
 //!
 //! One `Detector` belongs to one capture session. `observe` retains no sample
 //! memory and performs no allocation, locking, atomics, I/O, or system calls, so
-//! the PipeWire data thread can call it after converting each validated block to
-//! the signed 16-bit PCM stored in the shared exchange.
+//! the PipeWire data thread can call it on the validated, normalized Float32
+//! block stored in the shared exchange.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -79,9 +79,9 @@ pub const Detector = struct {
         };
     }
 
-    /// `observe` consumes the next ordered signed 16-bit mono block and returns
-    /// the current activity run. `samples` remains owned by the caller.
-    pub fn observe(detector: *Detector, samples: []const i16) Observation {
+    /// `observe` consumes the next ordered finite mono block in `[-1, 1]` and
+    /// returns the current activity run. `samples` remains owned by the caller.
+    pub fn observe(detector: *Detector, samples: []const f32) Observation {
         assert(samples.len > 0);
         assert(samples.len <= std.math.maxInt(u32));
         assert(detector.sample_rate_hz >= 8_000);
@@ -264,12 +264,12 @@ fn calculateThresholds(noise_floor_rms: f32) struct {
     };
 }
 
-fn calculateRms(samples: []const i16) f32 {
+fn calculateRms(samples: []const f32) f32 {
     assert(samples.len > 0);
 
     var squares_sum: f64 = 0;
     for (samples) |sample| {
-        const normalized = @as(f64, @floatFromInt(sample)) / 32768.0;
+        const normalized: f64 = sample;
         squares_sum += normalized * normalized;
     }
 

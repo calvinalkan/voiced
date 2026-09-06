@@ -24,7 +24,13 @@ pub fn send(
     record: anytype,
     descriptors: *const [2]std.posix.fd_t,
 ) !void {
-    const Record = @TypeOf(record.*);
+    return sendRecordBytes(socket, std.mem.asBytes(record), descriptors);
+}
+
+// Only conversion to a fixed byte span depends on the launch-record type.
+// Share the syscall/control-message work instead of inlining it into each type;
+// the extra call occurs at worker launch, not during audio or inference work.
+noinline fn sendRecordBytes(socket: std.posix.fd_t, record: []const u8, descriptors: *const [2]std.posix.fd_t) !void {
     assert(socket >= 0);
 
     for (descriptors) |descriptor| assert(descriptor >= 0);
@@ -45,8 +51,8 @@ pub fn send(
     );
 
     var vectors = [_]std.posix.iovec_const{.{
-        .base = std.mem.asBytes(record).ptr,
-        .len = @sizeOf(Record),
+        .base = record.ptr,
+        .len = record.len,
     }};
 
     const message: linux.msghdr_const = .{
@@ -60,22 +66,35 @@ pub fn send(
     };
 
     const send_result = linux.sendmsg(socket, &message, linux.MSG.NOSIGNAL);
-    if (linux.errno(send_result) != .SUCCESS) return error.DescriptorHandoffSendFailed;
-    if (send_result != @sizeOf(Record)) return error.DescriptorHandoffRecordTruncated;
+    if (linux.errno(send_result) != .SUCCESS) {
+        return error.DescriptorHandoffSendFailed;
+    }
+    if (send_result != record.len) {
+        return error.DescriptorHandoffRecordTruncated;
+    }
 }
 
 /// `receive` reads one complete launch record and returns exactly two owned
 /// descriptors. If the kernel installs rights but any later packet validation
 /// fails, this function closes those descriptors before returning the error.
 pub fn receive(socket: std.posix.fd_t, record: anytype) !DescriptorPair {
-    const Record = @TypeOf(record.*);
+    return receiveRecordBytes(socket, std.mem.asBytes(record));
+}
+
+// Keep packet validation and descriptor rollback in one shared operation.
+// The typed wrapper supplies exactly the record's size, not spare capacity.
+noinline fn receiveRecordBytes(socket: std.posix.fd_t, record: []u8) !DescriptorPair {
     assert(socket >= 0);
 
-    const descriptors_size = @sizeOf([2]std.posix.fd_t);
-    var control_buffer: [controlSpace(descriptors_size)]u8 align(@alignOf(usize)) = undefined;
+    const descriptors_count_expected = 2;
+    const descriptors_count_max = 8;
+    const descriptors_size = @sizeOf(std.posix.fd_t) * descriptors_count_expected;
+    // Receive more SCM_RIGHTS slots than we accept so extras can be closed
+    // instead of truncated out of this process with no handle to reclaim.
+    var control_buffer: [controlSpace(@sizeOf(std.posix.fd_t) * descriptors_count_max)]u8 align(@alignOf(usize)) = undefined;
     var vectors = [_]std.posix.iovec{.{
-        .base = std.mem.asBytes(record).ptr,
-        .len = @sizeOf(Record),
+        .base = record.ptr,
+        .len = record.len,
     }};
     var message: linux.msghdr = .{
         .name = null,
@@ -95,7 +114,9 @@ pub fn receive(socket: std.posix.fd_t, record: anytype) !DescriptorPair {
     if (linux.errno(receive_result) != .SUCCESS) {
         return error.DescriptorHandoffReceiveFailed;
     }
-    if (receive_result == 0) return error.DescriptorHandoffSocketClosed;
+    if (receive_result == 0) {
+        return error.DescriptorHandoffSocketClosed;
+    }
 
     // SCM_RIGHTS descriptors become owned by this process during `recvmsg`, not
     // when the packet is later accepted. Recover the expected pair first and
@@ -107,8 +128,9 @@ pub fn receive(socket: std.posix.fd_t, record: anytype) !DescriptorPair {
         control_buffer[0..@sizeOf(linux.cmsghdr)].ptr,
     ));
 
-    var installed_descriptors: [2]std.posix.fd_t = undefined;
+    var installed_descriptors: [descriptors_count_max]std.posix.fd_t = undefined;
     var installed_descriptors_count: usize = 0;
+    var announced_descriptors_count: usize = 0;
     if (header.level == linux.SOL.SOCKET and
         header.type == linux.SCM.RIGHTS and
         header.len >= controlLength(0) and
@@ -116,10 +138,8 @@ pub fn receive(socket: std.posix.fd_t, record: anytype) !DescriptorPair {
     {
         const installed_bytes_count = header.len - controlAlign(@sizeOf(linux.cmsghdr));
         if (installed_bytes_count % @sizeOf(std.posix.fd_t) == 0) {
-            installed_descriptors_count = @min(
-                installed_bytes_count / @sizeOf(std.posix.fd_t),
-                installed_descriptors.len,
-            );
+            announced_descriptors_count = installed_bytes_count / @sizeOf(std.posix.fd_t);
+            installed_descriptors_count = @min(announced_descriptors_count, installed_descriptors.len);
             @memcpy(
                 std.mem.sliceAsBytes(installed_descriptors[0..installed_descriptors_count]),
                 control_buffer[controlAlign(@sizeOf(linux.cmsghdr))..][0 .. installed_descriptors_count * @sizeOf(std.posix.fd_t)],
@@ -136,25 +156,25 @@ pub fn receive(socket: std.posix.fd_t, record: anytype) !DescriptorPair {
     if (header.len != controlLength(descriptors_size) or
         header.level != linux.SOL.SOCKET or
         header.type != linux.SCM.RIGHTS or
-        message.controllen < controlSpace(descriptors_size) or
-        installed_descriptors_count != installed_descriptors.len)
+        message.controllen != controlSpace(descriptors_size) or
+        announced_descriptors_count != descriptors_count_expected or
+        installed_descriptors_count != descriptors_count_expected)
     {
         return error.DescriptorHandoffUnexpectedControl;
     }
 
-    const pair: DescriptorPair = .{ .values = installed_descriptors };
-    if (receive_result != @sizeOf(Record)) {
+    const pair: DescriptorPair = .{ .values = installed_descriptors[0..descriptors_count_expected].* };
+    if (receive_result != record.len) {
         return error.DescriptorHandoffRecordTruncated;
     }
     if (message.flags & (linux.MSG.CTRUNC | linux.MSG.TRUNC) != 0) {
         return error.DescriptorHandoffControlTruncated;
     }
-    if (message.controllen != controlSpace(descriptors_size)) {
-        return error.DescriptorHandoffUnexpectedControlSize;
-    }
 
     for (pair.values) |descriptor| {
-        if (descriptor < 0) return error.DescriptorHandoffInvalidDescriptor;
+        if (descriptor < 0) {
+            return error.DescriptorHandoffInvalidDescriptor;
+        }
         const descriptor_flags = linux.fcntl(descriptor, linux.F.GETFD, 0);
         if (linux.errno(descriptor_flags) != .SUCCESS) {
             return error.DescriptorHandoffDescriptorStatusFailed;

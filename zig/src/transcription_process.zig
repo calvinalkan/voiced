@@ -5,32 +5,28 @@
 //! sealed audio slot.
 
 const std = @import("std");
+const logging = @import("logging.zig");
+const log = logging.scoped(.transcription);
 const audio_exchange = @import("audio_exchange.zig");
 const descriptor_handoff = @import("descriptor_handoff.zig");
-const gpt2_text = @import("gpt2_text.zig");
-const log_mel = @import("log_mel.zig");
+const inference = @import("inference");
+const transcription_debug = @import("transcription_debug.zig");
+const transcript_file = @import("transcript_file.zig");
+const model_cache = @import("model_cache.zig");
 const models = @import("models");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 
-const bridge = @cImport({
-    @cInclude("ctranslate2_bridge.h");
-});
-
 const AudioExchange = audio_exchange.AudioExchange;
 
-pub const format_version: u32 = 3;
+pub const format_version: u32 = 4;
 pub const result_bytes_capacity: u32 = 4096;
-pub const protocol_version: u16 = 2;
+pub const protocol_version: u16 = 9;
 pub const inference_threads_count_max: u32 = 32;
 
-// Fixture sweeps found no normalized-word loss from greedy decoding with the
-// selected small.en model, while its four-thread inference was 8–17% faster.
-const decoding_beam_size: u32 = 1;
 pub const no_activity_no_speech_probability_reject_min: f32 = 0.60;
 pub const active_no_speech_probability_conflict_min: f32 = 0.60;
-const gpt2_encoded_text_bytes_capacity: u32 = 64 * 1024;
-const failure_message_bytes_capacity: u32 = @intCast(bridge.error_message_capacity);
+const failure_message_bytes_capacity: u32 = 1024;
 const mailbox_empty: u32 = 0;
 const mailbox_cancelled: u32 = 1;
 const mailbox_published_offset: u32 = 2;
@@ -39,7 +35,10 @@ pub const MailboxState = union(enum) {
     empty,
     cancelled,
     published: u32,
+    corrupt,
 };
+
+pub const Limit = enum(u32) { none, text_size, tokens_count, text_size_and_tokens_count };
 
 pub const CommittedResult = struct {
     publication_ordinal: u32,
@@ -48,10 +47,12 @@ pub const CommittedResult = struct {
     no_speech_probability: f32,
     average_log_probability: f32,
     bytes: []const u8,
+    limit: Limit = .none,
 };
 
 pub const ResultDisposition = enum {
     accepted,
+    partial,
     no_speech,
     speech_detection_conflict,
     speech_unrecognized,
@@ -73,45 +74,16 @@ pub const TranscriptExchange = extern struct {
     contains_activity: u32,
     no_speech_probability: f32,
     average_log_probability: f32,
-    reserved_2: u32,
+    limit: u32,
     bytes: [result_bytes_capacity]u8,
-};
-
-pub const FakeLaunchOptions = struct {
-    session_id: u64,
-    behavior: FakeBehavior,
-    inference_duration_ms: u32,
-};
-
-const FakeWireLaunch = extern struct {
-    version: u16,
-    behavior: u8,
-    reserved: u8,
-    session_id: u64,
-    inference_duration_ms: u32,
-    reserved_2: u32,
 };
 
 pub const ModelLaunchOptions = struct {
     session_id: u64,
     model: models.Model,
     inference_threads_count: u32,
-};
-
-const ModelWireLaunch = extern struct {
-    version: u16,
-    model_vendor: u8,
-    model_variant: u8,
-    inference_threads_count: u32,
-    session_id: u64,
-    reserved: u64,
-};
-
-pub const FakeBehavior = enum(u8) {
-    normal,
-    crash_before_result,
-    crash_after_result,
-    hang,
+    decoder_threads_count: ?u32 = null,
+    encoder_trailing_padding: inference.EncoderTrailingPadding,
 };
 
 pub const Command = union(enum) {
@@ -119,91 +91,71 @@ pub const Command = union(enum) {
     shutdown,
 };
 
-const WireCommand = extern struct {
-    kind: u16,
-    slot_index: u8,
-    reserved: u8,
-};
-
 pub const ReadyReport = struct {
-    model_load_elapsed_ns: u64,
-    warmup_elapsed_ns: u64,
+    model_prepare_duration_ns: u64,
 };
 
-const GeneratedText = struct {
-    size: u32,
-    no_speech_probability: f32,
-    average_log_probability: f32,
-};
-
+/// A result notification acknowledges the end of the worker's shared-memory
+/// access and carries timing data. Acceptance evidence lives only in the
+/// committed mailbox, including when the worker dies before this notification.
 pub const ResultReport = struct {
     publication_ordinal: u32,
-    samples_count: u32,
-    feature_extraction_elapsed_ns: u64,
-    inference_elapsed_ns: u64,
-    no_speech_probability: f32,
-    average_log_probability: f32,
+    features_duration_ns: u64,
+    inference_duration_ns: u64,
 };
 
-pub const FailureStage = enum(u16) {
+const ErrorStage = enum(u16) {
     model_load,
-    warmup_feature_extraction,
-    warmup_inference,
     feature_extraction,
     inference,
     text_decode,
+    exchange,
 };
 
-pub const FailureReport = struct {
-    stage: FailureStage,
+const Diagnostic = struct {
+    stage: ErrorStage,
     message: [failure_message_bytes_capacity]u8,
     message_size: u16,
+    evidence: transcription_debug.Evidence = .{},
 
-    pub fn messageBytes(failure: *const FailureReport) []const u8 {
+    pub fn messageBytes(failure: *const Diagnostic) []const u8 {
         assert(failure.message_size <= failure.message.len);
         return failure.message[0..failure.message_size];
     }
 };
 
-pub const Report = union(enum) {
+const Report = union(enum) {
     ready: ReadyReport,
     result: ResultReport,
     stopped,
-    failed: FailureReport,
+    failed: Diagnostic,
 };
 
-const WireReportKind = enum(u16) {
-    ready,
-    result,
-    stopped,
-    failed,
+pub const Error = union(enum) {
+    model_load: Diagnostic,
+    feature_extraction: Diagnostic,
+    inference: Diagnostic,
+    text_decode: Diagnostic,
+    exchange: Diagnostic,
 };
+pub const Event = union(enum) { ready: ReadyReport, result: ResultReport, stopped };
+pub const Result = union(enum) { ok: Event, err: Error };
 
-const WireReport = extern struct {
-    kind: u16,
-    failure_stage: u16,
-    message_size: u16,
-    reserved: u16,
-    publication_ordinal: u32,
-    samples_count: u32,
-    no_speech_probability: f32,
-    average_log_probability: f32,
-    model_load_elapsed_ns: u64,
-    warmup_elapsed_ns: u64,
-    feature_extraction_elapsed_ns: u64,
-    inference_elapsed_ns: u64,
-    message: [failure_message_bytes_capacity]u8,
-};
+fn serviceResult(report: Report) Result {
+    return switch (report) {
+        .ready => |ready| .{ .ok = .{ .ready = ready } },
+        .result => |result| .{ .ok = .{ .result = result } },
+        .stopped => .{ .ok = .stopped },
+        .failed => |detail| switch (detail.stage) {
+            inline else => |stage| .{ .err = @unionInit(Error, @tagName(stage), detail) },
+        },
+    };
+}
 
 comptime {
-    assert(failure_message_bytes_capacity == bridge.error_message_capacity);
     assert(@sizeOf(TranscriptExchange) == 48 + result_bytes_capacity);
-    assert(@sizeOf(FakeWireLaunch) == 24);
-    assert(@sizeOf(ModelWireLaunch) == 24);
     assert(@offsetOf(TranscriptExchange, "publication_state_atomic") % @alignOf(u32) == 0);
     assert(@offsetOf(TranscriptExchange, "bytes") % @alignOf(u8) == 0);
-    assert(@sizeOf(WireCommand) == 4);
-    assert(@sizeOf(WireReport) == 56 + failure_message_bytes_capacity);
 }
 
 /// `initializeExchange` assigns a new session after every process that could
@@ -222,7 +174,7 @@ pub fn initializeExchange(exchange: *TranscriptExchange, session_id: u64) void {
     assert(exchange.contains_activity == 0);
     assert(exchange.no_speech_probability == 0);
     assert(exchange.average_log_probability == 0);
-    assert(exchange.reserved_2 == 0);
+    assert(exchange.limit == @intFromEnum(Limit.none));
 }
 
 /// `requestCancellation` prevents a cooperative worker from committing text
@@ -241,7 +193,9 @@ pub fn requestCancellation(exchange: *TranscriptExchange) void {
 }
 
 pub fn mailboxState(exchange: *const TranscriptExchange) MailboxState {
-    assert(exchange.version == format_version);
+    if (exchange.version != format_version) {
+        return .corrupt;
+    }
     const encoded = @atomicLoad(
         u32,
         &exchange.publication_state_atomic,
@@ -250,38 +204,60 @@ pub fn mailboxState(exchange: *const TranscriptExchange) MailboxState {
     return switch (encoded) {
         mailbox_empty => .empty,
         mailbox_cancelled => .cancelled,
-        else => .{ .published = encoded - mailbox_published_offset },
+        else => {
+            const bytes_count = encoded - mailbox_published_offset;
+            if (bytes_count > exchange.bytes.len) {
+                return .corrupt;
+            }
+            return .{ .published = bytes_count };
+        },
     };
 }
 
+/// Shared-mailbox contents the other process published. `none` is empty or
+/// cancelled; `corrupt` is a protocol failure, never a clamped prefix.
+pub const AcquiredResult = union(enum) {
+    none,
+    committed: CommittedResult,
+    corrupt,
+};
+
 /// `acquireResult` returns a committed UTF-8 result. The returned slice remains
 /// valid until the supervisor calls `releaseResult` after copying its bytes.
-pub fn acquireResult(exchange: *const TranscriptExchange) ?CommittedResult {
-    const state = mailboxState(exchange);
-    const bytes_count = switch (state) {
-        .empty, .cancelled => return null,
+/// Out-of-range fields or invalid UTF-8 are `corrupt`; do not clamp them.
+pub fn acquireResult(exchange: *const TranscriptExchange) AcquiredResult {
+    const bytes_count = switch (mailboxState(exchange)) {
+        .empty, .cancelled => return .none,
+        .corrupt => return .corrupt,
         .published => |count| count,
     };
-    assert(bytes_count <= exchange.bytes.len);
-    assert(exchange.samples_count > 0);
-    assert(exchange.contains_activity <= 1);
-    assert(std.math.isFinite(exchange.no_speech_probability));
-    assert(exchange.no_speech_probability >= 0);
-    assert(exchange.no_speech_probability <= 1);
-    assert(std.math.isFinite(exchange.average_log_probability));
-    assert(exchange.average_log_probability <= 0);
-    assert(exchange.reserved_2 == 0);
-    return .{
+    const limit = std.enums.fromInt(Limit, exchange.limit) orelse return .corrupt;
+    if (bytes_count > exchange.bytes.len or
+        exchange.samples_count == 0 or
+        exchange.samples_count > audio_exchange.slot_samples_capacity or
+        exchange.contains_activity > 1 or
+        !std.math.isFinite(exchange.no_speech_probability) or
+        exchange.no_speech_probability < 0 or
+        exchange.no_speech_probability > 1 or
+        !std.math.isFinite(exchange.average_log_probability) or
+        exchange.average_log_probability > 0 or
+        !std.unicode.utf8ValidateSlice(exchange.bytes[0..bytes_count]))
+    {
+        return .corrupt;
+    }
+    return .{ .committed = .{
         .publication_ordinal = exchange.publication_ordinal,
         .samples_count = exchange.samples_count,
         .contains_activity = exchange.contains_activity == 1,
         .no_speech_probability = exchange.no_speech_probability,
         .average_log_probability = exchange.average_log_probability,
         .bytes = exchange.bytes[0..bytes_count],
-    };
+        .limit = limit,
+    } };
 }
 
-/// `classifyResult` accepts text only when the audio detector and Whisper both
+/// Limited results retain the generated prefix for the user to judge, including
+/// low-confidence or repetitive text. Otherwise, accept only when both detectors
 /// support speech. A high-confidence inactive chunk is normal no-speech; any
 /// other disagreement becomes an explicit error rather than publishing a
 /// hallucination or silently discarding possible quiet speech.
@@ -293,6 +269,7 @@ pub fn classifyResult(result: CommittedResult) ResultDisposition {
     assert(std.math.isFinite(result.average_log_probability));
     assert(result.average_log_probability <= 0);
 
+    if (result.limit != .none) return .partial;
     const text = std.mem.trim(u8, result.bytes, " \t\r\n");
     if (text.len == 0) {
         return if (result.contains_activity) .speech_unrecognized else .no_speech;
@@ -321,34 +298,6 @@ pub fn releaseResult(exchange: *TranscriptExchange) void {
     );
 }
 
-/// `sendFakeLaunch` gives a deterministic worker both shared exchanges and its
-/// fault behavior. The sender retains ownership of all descriptors.
-pub fn sendFakeLaunch(
-    socket: std.posix.fd_t,
-    audio_exchange_fd: std.posix.fd_t,
-    transcript_exchange_fd: std.posix.fd_t,
-    options: FakeLaunchOptions,
-) !void {
-    assert(socket >= 0);
-    assert(audio_exchange_fd >= 0);
-    assert(transcript_exchange_fd >= 0);
-    assert(options.session_id > 0);
-
-    const wire: FakeWireLaunch = .{
-        .version = protocol_version,
-        .behavior = @intFromEnum(options.behavior),
-        .reserved = 0,
-        .session_id = options.session_id,
-        .inference_duration_ms = options.inference_duration_ms,
-        .reserved_2 = 0,
-    };
-    const descriptors = [_]std.posix.fd_t{
-        audio_exchange_fd,
-        transcript_exchange_fd,
-    };
-    try descriptor_handoff.send(socket, &wire, &descriptors);
-}
-
 /// `sendModelLaunch` gives a resident worker one named model and both shared
 /// exchanges. The worker resolves the model's XDG installation itself, so the
 /// process protocol never treats an arbitrary filesystem path as model identity.
@@ -367,9 +316,10 @@ pub fn sendModelLaunch(
 
     const wire: ModelWireLaunch = .{
         .version = protocol_version,
-        .model_vendor = options.model.vendorCode(),
-        .model_variant = options.model.variantCode(),
+        .model = @intFromEnum(options.model),
+        .encoder_trailing_padding = @intFromEnum(options.encoder_trailing_padding),
         .inference_threads_count = options.inference_threads_count,
+        .decoder_threads_count = options.decoder_threads_count orelse options.inference_threads_count,
         .session_id = options.session_id,
         .reserved = 0,
     };
@@ -381,129 +331,13 @@ pub fn sendModelLaunch(
     try descriptor_handoff.send(socket, &wire, &descriptors);
 }
 
-fn decodeTrustedFakeLaunch(wire: FakeWireLaunch) FakeLaunchOptions {
-    assert(wire.version == protocol_version);
-    assert(wire.reserved == 0);
-    assert(wire.session_id > 0);
-    assert(wire.reserved_2 == 0);
-    return .{
-        .session_id = wire.session_id,
-        .behavior = @enumFromInt(wire.behavior),
-        .inference_duration_ms = wire.inference_duration_ms,
-    };
-}
-
-/// `runFakeWorker` exercises the complete process, descriptor, shared-memory,
-/// publication, crash, and cancellation contract without loading CTranslate2.
-/// Production replaces only its deterministic inference body.
-pub fn runFakeWorker(
-    control_socket: std.posix.fd_t,
-    expected_supervisor_pid: linux.pid_t,
-) !void {
-    assert(control_socket >= 0);
-    assert(expected_supervisor_pid > 1);
-
-    bindLifetimeToSupervisor(expected_supervisor_pid);
-    unblockServiceSignals();
-    defer closeDescriptor(control_socket);
-
-    var launch_packet: FakeWireLaunch = undefined;
-    var shared_descriptors = try descriptor_handoff.receive(
-        control_socket,
-        &launch_packet,
-    );
-    defer shared_descriptors.deinit();
-
-    const launch = decodeTrustedFakeLaunch(launch_packet);
-
-    const audio_mapping = try mapShared(AudioExchange, shared_descriptors.values[0]);
-    defer std.posix.munmap(audio_mapping.bytes);
-    const transcript_mapping = try mapShared(
-        TranscriptExchange,
-        shared_descriptors.values[1],
-    );
-    defer std.posix.munmap(transcript_mapping.bytes);
-    const audio = audio_mapping.pointer;
-    const transcript = transcript_mapping.pointer;
-
-    assert(audio.version == audio_exchange.format_version);
-    assert(audio.session_id == launch.session_id);
-    assert(transcript.version == format_version);
-    assert(transcript.session_id == launch.session_id);
-    try sendReport(control_socket, .{ .ready = .{
-        .model_load_elapsed_ns = 0,
-        .warmup_elapsed_ns = 0,
-    } });
-
-    while (true) {
-        const command = try receiveCommand(control_socket);
-        const slot_index = switch (command) {
-            .shutdown => {
-                try sendReport(control_socket, .stopped);
-                return;
-            },
-            .transcribe => |index| index,
-        };
-
-        const slot = &audio.slots[slot_index.arrayIndex()];
-        const published = audio_exchange.acquirePublishedSlot(slot).?;
-        assert(mailboxState(transcript) == .empty);
-
-        switch (launch.behavior) {
-            .crash_before_result => terminateSelf(),
-            .hang => hangForever(),
-            .normal, .crash_after_result => {},
-        }
-        sleepMilliseconds(launch.inference_duration_ms);
-
-        if (mailboxState(transcript) == .cancelled) {
-            try sendReport(control_socket, .stopped);
-            return;
-        }
-
-        transcript.publication_ordinal = published.publication_ordinal;
-        transcript.samples_count = published.samples_count;
-        transcript.contains_activity = @intFromBool(published.contains_activity);
-        transcript.no_speech_probability = 0;
-        transcript.average_log_probability = 0;
-        transcript.reserved_2 = 0;
-        const text = std.fmt.bufPrint(
-            &transcript.bytes,
-            "chunk-{d};",
-            .{published.publication_ordinal},
-        ) catch unreachable;
-        const published_state = @as(u32, @intCast(text.len)) +
-            mailbox_published_offset;
-        if (@cmpxchgStrong(
-            u32,
-            &transcript.publication_state_atomic,
-            mailbox_empty,
-            published_state,
-            .release,
-            .acquire,
-        ) != null) {
-            assert(mailboxState(transcript) == .cancelled);
-            try sendReport(control_socket, .stopped);
-            return;
-        }
-
-        if (launch.behavior == .crash_after_result) terminateSelf();
-        try sendReport(control_socket, .{ .result = .{
-            .publication_ordinal = published.publication_ordinal,
-            .samples_count = published.samples_count,
-            .feature_extraction_elapsed_ns = 0,
-            .inference_elapsed_ns = @as(u64, launch.inference_duration_ms) *
-                std.time.ns_per_ms,
-            .no_speech_probability = 0,
-            .average_log_probability = 0,
-        } });
-    }
-}
-
-/// `runModelWorker` loads and warms one CTranslate2 model, then serves sealed
-/// audio slots sequentially until shutdown. The synchronous native call is
-/// confined to this process; cancellation prevents publication, while the
-/// supervisor may kill the process if native inference does not return.
+/// `runModelWorker` loads a cached packed model and initializes one runtime,
+/// reporting readiness without running inference. It borrows sealed Float32
+/// slots sequentially until shutdown. After a result
+/// notification the worker touches neither exchange until its next command;
+/// the supervisor may reset both exchanges for a new session while it is idle.
+/// Cancellation prevents publication; the supervisor contains stalled inference
+/// by terminating this process and its complete CPU worker group.
 pub fn runModelWorker(
     init: std.process.Init,
     control_socket: std.posix.fd_t,
@@ -525,11 +359,11 @@ pub fn runModelWorker(
     assert(launch.inference_threads_count > 0);
     assert(launch.inference_threads_count <= inference_threads_count_max);
     assert(launch.reserved == 0);
-    const selected_model = models.Model.fromCodes(
-        launch.model_vendor,
-        launch.model_variant,
-    );
+    assert(launch.decoder_threads_count > 0 and launch.decoder_threads_count <= launch.inference_threads_count);
+    const selected_model = std.enums.fromInt(models.Model, launch.model);
     assert(selected_model != null);
+    const encoder_trailing_padding = std.enums.fromInt(inference.EncoderTrailingPadding, launch.encoder_trailing_padding);
+    assert(encoder_trailing_padding != null);
 
     const audio_mapping = try mapShared(AudioExchange, shared_descriptors.values[0]);
     defer std.posix.munmap(audio_mapping.bytes);
@@ -546,82 +380,56 @@ pub fn runModelWorker(
     assert(transcript.version == format_version);
     assert(transcript.session_id == launch.session_id);
 
-    // ── Load And Warm The Resident Model ──
+    // ── Load The Resident Runtime ──
     //
-    // Resolve the trusted model identity through the same XDG convention used
-    // by setup. CTranslate2 then creates native worker threads and lazily
-    // initializes inference kernels. `ready` follows one complete silent
-    // transcription, so later slot deadlines measure steady-state inference.
+    // The cache loader releases pristine input before workspace allocation.
+    // Shutdown joins the runtime's workers before releasing its borrowed model,
+    // vocabulary, and arena. No per-chunk allocation or waveform copy is needed.
 
     const allocator = init.gpa;
-    const model_path = models.allocInstalledDirectoryPath(
-        init,
-        selected_model.?,
-    ) catch |path_error| {
-        try sendFailureReport(control_socket, .model_load, @errorName(path_error));
-        return;
+    const capture_directory = transcript_file.allocDirectoryPath(allocator, init.environ_map.get("XDG_STATE_HOME"), init.environ_map.get("HOME"), init.environ_map.get("VOICED_INSTANCE") orelse "") catch |err| unavailable: {
+        log.err(.{}, "Failed transcription capture unavailable: detail=\"{f}\"", .{std.zig.fmtString(@errorName(err))});
+        break :unavailable null;
     };
-    defer allocator.free(model_path);
-
-    var extractor: log_mel.Extractor = undefined;
-    extractor.init(allocator) catch |extractor_error| {
-        try sendFailureReport(
-            control_socket,
-            .warmup_feature_extraction,
-            @errorName(extractor_error),
-        );
-        return;
-    };
-    defer extractor.deinit();
-
-    var bridge_error: bridge.Error = undefined;
+    defer if (capture_directory) |path| allocator.free(path);
     const model_load_started_ns = monotonicNanoseconds();
-    const model = bridge.model_create(
-        model_path.ptr,
-        launch.inference_threads_count,
-        decoding_beam_size,
-        &bridge_error,
-    ) orelse {
-        try sendFailureReport(
-            control_socket,
-            .model_load,
-            std.mem.sliceTo(&bridge_error.message, 0),
-        );
+    var loaded = model_cache.loadModel(init, selected_model.?) catch |err| {
+        try sendDiagnostic(control_socket, .model_load, @errorName(err), .{});
         return;
     };
-    defer bridge.model_destroy(model);
-    const model_load_elapsed_ns = monotonicNanoseconds() - model_load_started_ns;
-
-    const warmup_started_ns = monotonicNanoseconds();
-    var warmup_samples: [audio_exchange.sample_rate_hz]i16 = @splat(0);
-    const warmup_features = extractor.calculate(&warmup_samples) catch |feature_error| {
-        try sendFailureReport(
-            control_socket,
-            .warmup_feature_extraction,
-            @errorName(feature_error),
-        );
+    defer loaded.deinit();
+    log.debug(.{ .recording_ordinal = audio.session_id }, "Model weights loaded: recording_ordinal={d}, model_weights_load_duration_ms={d:.3}", .{ audio.session_id, @as(f64, @floatFromInt(monotonicNanoseconds() - model_load_started_ns)) / std.time.ns_per_ms });
+    const vocabulary_started_ns = monotonicNanoseconds();
+    const vocabulary = model_cache.loadVocabulary(init, selected_model.?) catch |err| {
+        try sendDiagnostic(control_socket, .model_load, @errorName(err), .{});
         return;
     };
-
-    var encoded_text: [gpt2_encoded_text_bytes_capacity]u8 = undefined;
-    _ = transcribeFeatures(
-        model,
-        warmup_features,
-        &encoded_text,
-        &bridge_error,
-    ) catch {
-        try sendFailureReport(
-            control_socket,
-            .warmup_inference,
-            std.mem.sliceTo(&bridge_error.message, 0),
-        );
+    defer allocator.free(vocabulary);
+    log.debug(.{ .recording_ordinal = audio.session_id }, "Model vocabulary loaded: recording_ordinal={d}, model_vocabulary_load_duration_ms={d:.3}", .{ audio.session_id, @as(f64, @floatFromInt(monotonicNanoseconds() - vocabulary_started_ns)) / std.time.ns_per_ms });
+    const runtime_started_ns = monotonicNanoseconds();
+    const policy: inference.Policy = .{
+        .samples_count_max = audio_exchange.slot_samples_capacity,
+        .workers_count = launch.inference_threads_count,
+        .decoder_workers_count = launch.decoder_threads_count,
+        .generated_tokens_count_max = 446,
+    };
+    const memory_size = try inference.Runtime.requiredMemorySize(loaded.model.kind, policy);
+    const memory = allocator.alignedAlloc(u8, .fromByteUnits(inference.runtime_memory_alignment), memory_size) catch |err| {
+        try sendDiagnostic(control_socket, .model_load, @errorName(err), .{});
         return;
     };
-    const warmup_elapsed_ns = monotonicNanoseconds() - warmup_started_ns;
+    defer allocator.free(memory);
+    var runtime: inference.Runtime = undefined;
+    runtime.init(init.io, &loaded.model, vocabulary, memory, policy) catch |err| {
+        try sendDiagnostic(control_socket, .model_load, @errorName(err), .{});
+        return;
+    };
+    defer runtime.deinit();
+    log.debug(.{ .recording_ordinal = audio.session_id }, "Model runtime initialized: recording_ordinal={d}, model_runtime_init_duration_ms={d:.3}, model_runtime_size={d}", .{ audio.session_id, @as(f64, @floatFromInt(monotonicNanoseconds() - runtime_started_ns)) / std.time.ns_per_ms, memory_size });
+    const model_prepare_duration_ns = monotonicNanoseconds() - model_load_started_ns;
 
     try sendReport(control_socket, .{ .ready = .{
-        .model_load_elapsed_ns = model_load_elapsed_ns,
-        .warmup_elapsed_ns = warmup_elapsed_ns,
+        .model_prepare_duration_ns = model_prepare_duration_ns,
     } });
 
     // ── Serve Sealed Audio Slots ──
@@ -642,134 +450,178 @@ pub fn runModelWorker(
         };
 
         const slot = &audio.slots[slot_index.arrayIndex()];
-        const published = audio_exchange.acquirePublishedSlot(slot).?;
-        assert(mailboxState(transcript) == .empty);
-
-        const feature_extraction_started_ns = monotonicNanoseconds();
-        const features = extractor.calculate(
-            slot.samples[0..published.samples_count],
-        ) catch |feature_error| {
-            try sendFailureReport(
-                control_socket,
-                .feature_extraction,
-                @errorName(feature_error),
-            );
-            return;
+        const published = switch (audio_exchange.acquireSlot(slot)) {
+            .published => |publication| publication,
+            .empty, .corrupt => {
+                try sendDiagnostic(control_socket, .exchange, "CorruptAudioSlot", .{});
+                return;
+            },
         };
-        const feature_extraction_elapsed_ns = monotonicNanoseconds() -
-            feature_extraction_started_ns;
+        switch (mailboxState(transcript)) {
+            .empty => {},
+            .cancelled, .published, .corrupt => {
+                try sendDiagnostic(control_socket, .exchange, "CorruptMailbox", .{});
+                return;
+            },
+        }
 
-        if (mailboxState(transcript) == .cancelled) {
+        assert(audio.session_id == transcript.session_id);
+        var timings: inference.Timings = .{};
+        var decoded: ?inference.Transcription = null;
+        var stage: ErrorStage = .inference;
+        var error_message: ?[]const u8 = null;
+        var limit: Limit = .none;
+        const samples = slot.samples[0..published.samples_count];
+        const generated_text = runtime.transcribe(samples, &transcript.bytes, .{
+            .encoder_trailing_padding = encoder_trailing_padding.?,
+            .timings = &timings,
+            .evidence = &decoded,
+        }) catch |err| failed: {
+            stage = switch (err) {
+                error.AudioTooShort, error.AudioDurationExceedsLimit, error.InvalidSamples => .feature_extraction,
+                error.InvalidVocabulary, error.OutputTooSmall => .text_decode,
+                else => .inference,
+            };
+            if (err == error.OutputTooSmall) limit = .text_size;
+            error_message = @errorName(err);
+            break :failed null;
+        };
+        if (decoded) |value| {
+            if (value.end == .token_limit) {
+                limit = if (limit == .text_size) .text_size_and_tokens_count else .tokens_count;
+                if (error_message == null) error_message = "GeneratedTokenLimitExceeded";
+            }
+        }
+        // Commit limited text before diagnostic disk I/O. Recovery can deliver
+        // it if saving stalls or the worker exits. No result notification or
+        // subsequent command permits storage reuse while the snapshot borrows it.
+        if (limit != .none and !publishResult(transcript, published, decoded.?, limit)) {
             try sendReport(control_socket, .stopped);
             return;
         }
-
-        const inference_started_ns = monotonicNanoseconds();
-        const generated_text = transcribeFeatures(
-            model,
-            features,
-            &encoded_text,
-            &bridge_error,
-        ) catch {
-            try sendFailureReport(
-                control_socket,
-                .inference,
-                std.mem.sliceTo(&bridge_error.message, 0),
-            );
-            return;
-        };
-        const inference_elapsed_ns = monotonicNanoseconds() - inference_started_ns;
-
-        const decoded_text = gpt2_text.decodeInto(
-            &transcript.bytes,
-            encoded_text[0..generated_text.size],
-        ) catch |decode_error| {
-            try sendFailureReport(
-                control_socket,
-                .text_decode,
-                @errorName(decode_error),
-            );
-            return;
-        };
-        // GPT-2 text tokens carry their own leading spaces. Preserve those
-        // bytes across chunk publication and trim only the complete session;
-        // trimming every chunk would turn `sentence.` plus ` Next` into
-        // `sentence.Next` and discard the model's boundary decision.
-        const text = decoded_text;
-
-        if (mailboxState(transcript) == .cancelled) {
-            try sendReport(control_socket, .stopped);
-            return;
+        if (error_message) |message| {
+            if (mailboxState(transcript) == .cancelled) {
+                try sendReport(control_socket, .stopped);
+                return;
+            }
+            var evidence: transcription_debug.Evidence = .{
+                .chunk_available = 1,
+                .chunk = published.publication_ordinal,
+                .samples = published.samples_count,
+                .token_limit = @intCast(policy.generated_tokens_count_max),
+            };
+            evidence.finish(decoded, timings);
+            // Preserve the original error and decoder evidence even when the
+            // available text will be delivered with a limit warning.
+            try sendDiagnostic(control_socket, stage, message, evidence);
+            if (capture_directory) |path| {
+                var timestamp: linux.timespec = undefined;
+                const time_result = linux.clock_gettime(.REALTIME, &timestamp);
+                assert(linux.errno(time_result) == .SUCCESS);
+                const metadata: transcription_debug.Metadata = .{
+                    .session_id = audio.session_id,
+                    .captured_unix_seconds = timestamp.sec,
+                    .stage = @tagName(stage),
+                    .error_name = message,
+                    .evidence = evidence,
+                    .contains_activity = published.contains_activity,
+                    .model = selected_model.?.name(),
+                    .model_revision = selected_model.?.metadata().revision,
+                    .source_sha256 = selected_model.?.metadata().weights.sha256,
+                    .packed_image_sha256 = transcription_debug.imageDigest(&loaded.model),
+                    .model_encoder_threads = launch.inference_threads_count,
+                    .model_decoder_threads = @intCast(runtime.decoder_workers_count),
+                    .model_encoder_padding_seconds = transcription_debug.paddingSeconds(encoder_trailing_padding.?),
+                    .text_decode_complete = generated_text != null,
+                    .end = if (decoded) |value| @tagName(value.end) else null,
+                };
+                switch (transcription_debug.save(init.io, path, samples, if (decoded) |value| value.text else "", runtime.generated_tokens[0..evidence.tokens], metadata)) {
+                    .ok => log.info(.{ .recording_ordinal = audio.session_id }, "Failed transcription saved: recording_ordinal={d}, chunk_ordinal={d}, path=\"{f}/last-failed\"", .{ audio.session_id, evidence.chunk, std.zig.fmtString(path) }),
+                    .err => |err| transcription_debug.logError(.{ .recording_ordinal = audio.session_id }, err, path),
+                }
+            }
+            if (limit == .none) return;
         }
-
-        transcript.publication_ordinal = published.publication_ordinal;
-        transcript.samples_count = published.samples_count;
-        transcript.contains_activity = @intFromBool(published.contains_activity);
-        transcript.no_speech_probability = generated_text.no_speech_probability;
-        transcript.average_log_probability = generated_text.average_log_probability;
-        transcript.reserved_2 = 0;
-        const published_state = @as(u32, @intCast(text.len)) +
-            mailbox_published_offset;
-        if (@cmpxchgStrong(
-            u32,
-            &transcript.publication_state_atomic,
-            mailbox_empty,
-            published_state,
-            .release,
-            .acquire,
-        ) != null) {
-            assert(mailboxState(transcript) == .cancelled);
+        const features_duration_ns = timings.log_mel_ns;
+        const inference_duration_ns = timings.encoder_ns + timings.cross_key_values_ns + timings.decoder_ns;
+        if (limit == .none and !publishResult(transcript, published, generated_text.?, .none)) {
             try sendReport(control_socket, .stopped);
             return;
         }
 
         try sendReport(control_socket, .{ .result = .{
             .publication_ordinal = published.publication_ordinal,
-            .samples_count = published.samples_count,
-            .feature_extraction_elapsed_ns = feature_extraction_elapsed_ns,
-            .inference_elapsed_ns = inference_elapsed_ns,
-            .no_speech_probability = generated_text.no_speech_probability,
-            .average_log_probability = generated_text.average_log_probability,
+            .features_duration_ns = features_duration_ns,
+            .inference_duration_ns = inference_duration_ns,
         } });
     }
 }
 
-fn transcribeFeatures(
-    model: *bridge.ModelHandle,
-    features: log_mel.Features,
-    encoded_text_buffer: *[gpt2_encoded_text_bytes_capacity]u8,
-    bridge_error_out: *bridge.Error,
-) !GeneratedText {
-    assert(features.values.len == bridge.log_mel_values_count);
-    assert(features.frames_count == bridge.log_mel_frames_count);
-
-    var encoded_text_out: bridge.Gpt2EncodedText = .{
-        .bytes = encoded_text_buffer,
-        .capacity = encoded_text_buffer.len,
-        .size = 0,
-        .no_speech_probability = 0,
-        .average_log_probability = 0,
-    };
-    if (!bridge.model_transcribe(
-        model,
-        features.values.ptr,
-        &encoded_text_out,
-        bridge_error_out,
-    )) {
-        return error.ModelTranscriptionFailed;
+/// A capacity cut or final token may split a UTF-8 character. Keep only whole
+/// characters; this scans the bounded chunk, never the accumulated recording.
+pub fn utf8Prefix(bytes: []const u8) []const u8 {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const size = std.unicode.utf8ByteSequenceLength(bytes[offset]) catch break;
+        if (size > bytes.len - offset) break;
+        _ = std.unicode.utf8Decode(bytes[offset..][0..size]) catch break;
+        offset += size;
     }
+    return bytes[0..offset];
+}
 
-    assert(encoded_text_out.size <= encoded_text_buffer.len);
-    assert(std.math.isFinite(encoded_text_out.no_speech_probability));
-    assert(encoded_text_out.no_speech_probability >= 0);
-    assert(encoded_text_out.no_speech_probability <= 1);
-    assert(std.math.isFinite(encoded_text_out.average_log_probability));
-    assert(encoded_text_out.average_log_probability <= 0);
-    return .{
-        .size = encoded_text_out.size,
-        .no_speech_probability = encoded_text_out.no_speech_probability,
-        .average_log_probability = encoded_text_out.average_log_probability,
-    };
+fn publishResult(transcript: *TranscriptExchange, published: audio_exchange.PublishedSlot, decoded: inference.Transcription, limit: Limit) bool {
+    // Preserve token-leading spaces across chunks; trim only the assembled text.
+    const text = if (limit == .none) decoded.text else utf8Prefix(decoded.text);
+    transcript.publication_ordinal = published.publication_ordinal;
+    transcript.samples_count = published.samples_count;
+    transcript.contains_activity = @intFromBool(published.contains_activity);
+    transcript.no_speech_probability = decoded.no_speech_probability;
+    transcript.average_log_probability = decoded.average_log_probability;
+    transcript.limit = @intFromEnum(limit);
+    return @cmpxchgStrong(u32, &transcript.publication_state_atomic, mailbox_empty, @as(u32, @intCast(text.len)) + mailbox_published_offset, .release, .acquire) == null;
+}
+
+const ModelWireLaunch = extern struct {
+    version: u16,
+    model: u8,
+    encoder_trailing_padding: u8,
+    inference_threads_count: u32,
+    session_id: u64,
+    decoder_threads_count: u32,
+    reserved: u32,
+};
+
+const WireCommand = extern struct {
+    kind: u16,
+    slot_index: u8,
+    reserved: u8,
+};
+
+const WireReportKind = enum(u16) {
+    ready,
+    result,
+    stopped,
+    failed,
+};
+
+const WireReport = extern struct {
+    kind: u16,
+    failure_stage: u16,
+    message_size: u16,
+    reserved: u16,
+    publication_ordinal: u32,
+    model_prepare_duration_ns: u64,
+    features_duration_ns: u64,
+    inference_duration_ns: u64,
+    message: [failure_message_bytes_capacity]u8,
+    evidence: transcription_debug.Evidence,
+};
+
+comptime {
+    assert(@sizeOf(ModelWireLaunch) == 24);
+    assert(@sizeOf(WireCommand) == 4);
+    assert(@sizeOf(WireReport) == 40 + failure_message_bytes_capacity + @sizeOf(transcription_debug.Evidence));
 }
 
 fn mapShared(comptime T: type, descriptor: std.posix.fd_t) !struct {
@@ -797,41 +649,30 @@ fn sendReport(socket: std.posix.fd_t, report: Report) !void {
         .message_size = 0,
         .reserved = 0,
         .publication_ordinal = 0,
-        .samples_count = 0,
-        .no_speech_probability = 0,
-        .average_log_probability = 0,
-        .model_load_elapsed_ns = 0,
-        .warmup_elapsed_ns = 0,
-        .feature_extraction_elapsed_ns = 0,
-        .inference_elapsed_ns = 0,
+        .model_prepare_duration_ns = 0,
+        .features_duration_ns = 0,
+        .inference_duration_ns = 0,
         .message = @splat(0),
+        .evidence = .{},
     };
 
     switch (report) {
         .ready => |ready| {
             wire.kind = @intFromEnum(WireReportKind.ready);
-            wire.model_load_elapsed_ns = ready.model_load_elapsed_ns;
-            wire.warmup_elapsed_ns = ready.warmup_elapsed_ns;
+            wire.model_prepare_duration_ns = ready.model_prepare_duration_ns;
         },
         .result => |result| {
-            assert(std.math.isFinite(result.no_speech_probability));
-            assert(result.no_speech_probability >= 0);
-            assert(result.no_speech_probability <= 1);
-            assert(std.math.isFinite(result.average_log_probability));
-            assert(result.average_log_probability <= 0);
             wire.kind = @intFromEnum(WireReportKind.result);
             wire.publication_ordinal = result.publication_ordinal;
-            wire.samples_count = result.samples_count;
-            wire.feature_extraction_elapsed_ns = result.feature_extraction_elapsed_ns;
-            wire.inference_elapsed_ns = result.inference_elapsed_ns;
-            wire.no_speech_probability = result.no_speech_probability;
-            wire.average_log_probability = result.average_log_probability;
+            wire.features_duration_ns = result.features_duration_ns;
+            wire.inference_duration_ns = result.inference_duration_ns;
         },
         .stopped => wire.kind = @intFromEnum(WireReportKind.stopped),
         .failed => |failure| {
             assert(failure.message_size <= failure.message.len);
             wire.kind = @intFromEnum(WireReportKind.failed);
             wire.failure_stage = @intFromEnum(failure.stage);
+            wire.evidence = failure.evidence;
             wire.message_size = failure.message_size;
             @memcpy(wire.message[0..failure.message_size], failure.messageBytes());
         },
@@ -839,15 +680,18 @@ fn sendReport(socket: std.posix.fd_t, report: Report) !void {
     try sendRecord(socket, std.mem.asBytes(&wire));
 }
 
-fn sendFailureReport(
+fn sendDiagnostic(
     socket: std.posix.fd_t,
-    stage: FailureStage,
+    stage: ErrorStage,
     message: []const u8,
+    evidence: transcription_debug.Evidence,
 ) !void {
-    var failure: FailureReport = .{
+    assert(message.len <= failure_message_bytes_capacity);
+    var failure: Diagnostic = .{
         .stage = stage,
         .message = @splat(0),
-        .message_size = @intCast(@min(message.len, failure_message_bytes_capacity)),
+        .message_size = @intCast(message.len),
+        .evidence = evidence,
     };
     @memcpy(failure.message[0..failure.message_size], message[0..failure.message_size]);
     try sendReport(socket, .{ .failed = failure });
@@ -856,12 +700,14 @@ fn sendFailureReport(
 fn receiveCommand(socket: std.posix.fd_t) !Command {
     var wire: WireCommand = undefined;
     try receiveRecord(socket, std.mem.asBytes(&wire));
-    assert(wire.reserved == 0);
+    if (wire.reserved != 0) {
+        return error.InvalidCommand;
+    }
 
     return switch (wire.kind) {
-        0 => .{ .transcribe = @enumFromInt(wire.slot_index) },
+        0 => .{ .transcribe = std.enums.fromInt(audio_exchange.SlotIndex, wire.slot_index) orelse return error.InvalidCommand },
         1 => .shutdown,
-        else => unreachable,
+        else => error.InvalidCommand,
     };
 }
 
@@ -886,7 +732,7 @@ pub fn sendCommand(socket: std.posix.fd_t, command: Command) !void {
 
 /// `receiveReportNonblocking` returns one complete logical report, outer null
 /// when no packet is ready, and inner null after orderly peer closure.
-pub fn receiveReportNonblocking(socket: std.posix.fd_t) ??Report {
+pub fn receiveReportNonblocking(socket: std.posix.fd_t) ??Result {
     var wire: WireReport = undefined;
     while (true) {
         const result = linux.recvfrom(
@@ -899,41 +745,51 @@ pub fn receiveReportNonblocking(socket: std.posix.fd_t) ??Report {
         );
         switch (linux.errno(result)) {
             .SUCCESS => {
-                if (result == 0) return @as(?Report, null);
-                assert(result == @sizeOf(WireReport));
-                return decodeTrustedReport(wire);
+                if (result == 0) {
+                    return @as(?Result, null);
+                }
+                if (result != @sizeOf(WireReport)) {
+                    return @as(?Result, .{ .err = .{ .exchange = protocolDiagnostic("InvalidReport") } });
+                }
+                const decoded = decodeReport(wire) catch {
+                    return @as(?Result, .{ .err = .{ .exchange = protocolDiagnostic("InvalidReport") } });
+                };
+                return serviceResult(decoded);
             },
             .INTR => continue,
-            .AGAIN => return null,
-            .CONNRESET => return @as(?Report, null),
-            else => @trap(),
+            .AGAIN => {
+                return null;
+            },
+            .CONNRESET => {
+                return @as(?Result, null);
+            },
+            else => return @as(?Result, .{ .err = .{ .exchange = protocolDiagnostic("InvalidReport") } }),
         }
     }
 }
 
-fn decodeTrustedReport(wire: WireReport) Report {
-    assert(wire.reserved == 0);
-    assert(wire.message_size <= wire.message.len);
-
-    return switch (@as(WireReportKind, @enumFromInt(wire.kind))) {
+fn decodeReport(wire: WireReport) error{InvalidReport}!Report {
+    if (wire.reserved != 0 or wire.message_size > wire.message.len) {
+        return error.InvalidReport;
+    }
+    const kind = std.enums.fromInt(WireReportKind, wire.kind) orelse return error.InvalidReport;
+    return switch (kind) {
         .ready => .{ .ready = .{
-            .model_load_elapsed_ns = wire.model_load_elapsed_ns,
-            .warmup_elapsed_ns = wire.warmup_elapsed_ns,
+            .model_prepare_duration_ns = wire.model_prepare_duration_ns,
         } },
         .result => .{ .result = .{
             .publication_ordinal = wire.publication_ordinal,
-            .samples_count = wire.samples_count,
-            .feature_extraction_elapsed_ns = wire.feature_extraction_elapsed_ns,
-            .inference_elapsed_ns = wire.inference_elapsed_ns,
-            .no_speech_probability = wire.no_speech_probability,
-            .average_log_probability = wire.average_log_probability,
+            .features_duration_ns = wire.features_duration_ns,
+            .inference_duration_ns = wire.inference_duration_ns,
         } },
         .stopped => .stopped,
         .failed => failed: {
-            var failure: FailureReport = .{
-                .stage = @enumFromInt(wire.failure_stage),
+            const stage = std.enums.fromInt(ErrorStage, wire.failure_stage) orelse return error.InvalidReport;
+            var failure: Diagnostic = .{
+                .stage = stage,
                 .message = @splat(0),
                 .message_size = wire.message_size,
+                .evidence = wire.evidence,
             };
             @memcpy(
                 failure.message[0..failure.message_size],
@@ -942,6 +798,17 @@ fn decodeTrustedReport(wire: WireReport) Report {
             break :failed .{ .failed = failure };
         },
     };
+}
+
+fn protocolDiagnostic(message: []const u8) Diagnostic {
+    assert(message.len <= failure_message_bytes_capacity);
+    var failure: Diagnostic = .{
+        .stage = .exchange,
+        .message = @splat(0),
+        .message_size = @intCast(message.len),
+    };
+    @memcpy(failure.message[0..failure.message_size], message);
+    return failure;
 }
 
 fn sendRecord(socket: std.posix.fd_t, bytes: []const u8) !void {
@@ -960,8 +827,12 @@ fn sendRecord(socket: std.posix.fd_t, bytes: []const u8) !void {
                 return;
             },
             .INTR => continue,
-            .PIPE, .CONNRESET => return error.TranscriptionPeerClosed,
-            else => return error.TranscriptionPacketSendFailed,
+            .PIPE, .CONNRESET => {
+                return error.TranscriptionPeerClosed;
+            },
+            else => {
+                return error.TranscriptionPacketSendFailed;
+            },
         }
     }
 }
@@ -975,9 +846,15 @@ fn receiveRecord(socket: std.posix.fd_t, bytes: []u8) !void {
         null,
         null,
     );
-    if (linux.errno(result) != .SUCCESS) return error.TranscriptionPacketReceiveFailed;
-    if (result == 0) return error.TranscriptionSocketClosed;
-    if (result != bytes.len) return error.TranscriptionPacketSizeMismatch;
+    if (linux.errno(result) != .SUCCESS) {
+        return error.TranscriptionPacketReceiveFailed;
+    }
+    if (result == 0) {
+        return error.TranscriptionSocketClosed;
+    }
+    if (result != bytes.len) {
+        return error.TranscriptionPacketSizeMismatch;
+    }
 }
 
 fn bindLifetimeToSupervisor(expected_supervisor_pid: linux.pid_t) void {
@@ -1003,25 +880,6 @@ fn terminateSelf() noreturn {
     const result = linux.kill(linux.getpid(), .KILL);
     assert(linux.errno(result) == .SUCCESS);
     unreachable;
-}
-
-fn hangForever() noreturn {
-    while (true) sleepMilliseconds(1000);
-}
-
-fn sleepMilliseconds(milliseconds: u32) void {
-    var requested: linux.timespec = .{
-        .sec = @intCast(milliseconds / 1000),
-        .nsec = @intCast((milliseconds % 1000) * std.time.ns_per_ms),
-    };
-    var remaining: linux.timespec = undefined;
-    while (true) {
-        switch (linux.errno(linux.nanosleep(&requested, &remaining))) {
-            .SUCCESS => return,
-            .INTR => requested = remaining,
-            else => unreachable,
-        }
-    }
 }
 
 fn monotonicNanoseconds() u64 {

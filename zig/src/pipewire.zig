@@ -1294,7 +1294,6 @@ fn runCapture(launch: Launch, setup_error: *SetupError) !Report {
     const stream_optional = pipewire.voiced_audio_pipewire_capture_stream_create(
         pipewire_loop,
         if (capture_target) |target| target.ptr else null,
-        launch.process_realtime,
         &stream_callbacks,
         &native_error,
     );
@@ -1356,7 +1355,6 @@ fn runCapture(launch: Launch, setup_error: *SetupError) !Report {
         stream,
         audio_exchange.sample_rate_hz,
         audio_exchange.callback_samples_count_max,
-        launch.process_realtime,
         &native_error,
     );
     if (connect_result < 0) {
@@ -3586,13 +3584,7 @@ fn publishCompleteBlock(
                         block_clipped_samples_count += 1;
                     }
 
-                    destination_samples[destination_index] = @intFromFloat(
-                        std.math.clamp(
-                            @round(sample * 32768.0),
-                            @as(f32, std.math.minInt(i16)),
-                            @as(f32, std.math.maxInt(i16)),
-                        ),
-                    );
+                    destination_samples[destination_index] = sample;
                     destination_index += 1;
                 }
             }

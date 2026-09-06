@@ -23,7 +23,7 @@ pub const slot_samples_capacity: u32 = sample_rate_hz * slot_duration_seconds_ma
 // PipeWire format requirement: it bounds realtime validation and conversion.
 pub const callback_samples_count_max: u32 = sample_rate_hz / 10;
 
-pub const format_version: u32 = 7;
+pub const format_version: u32 = 8;
 
 pub const TimelineValidation = enum(u32) {
     header_only = 1,
@@ -54,11 +54,10 @@ pub const AudioSlot = extern struct {
     contains_activity: u32,
     reserved: u32,
 
-    // Capture quantizes PipeWire's normalized F32 input directly into this
-    // signed 16-bit array. The model converts it directly into the reusable
-    // centered workspace required by log-Mel extraction, with no intermediate
-    // normalized float waveform.
-    samples: [slot_samples_capacity]i16,
+    // The extractor borrows normalized PCM directly. Keep the published prefix
+    // immutable until result acceptance: a replacement model worker needs the
+    // same audio even after the first worker has finished feature extraction.
+    samples: [slot_samples_capacity]f32,
 };
 
 pub const SlotIndex = enum(u8) {
@@ -97,6 +96,20 @@ pub const PublishedSlotRef = struct {
     publication: PublishedSlot,
 };
 
+/// Shared-slot contents the other process published. `empty` is normal;
+/// `corrupt` is a protocol failure, never a clamped prefix.
+pub const AcquiredSlot = union(enum) {
+    empty,
+    published: PublishedSlot,
+    corrupt,
+};
+
+pub const AcquiredTimelineValidation = union(enum) {
+    unpublished,
+    published: TimelineValidation,
+    corrupt,
+};
+
 comptime {
     assert(sample_rate_hz > 0);
     assert(channels_count == 1);
@@ -109,18 +122,32 @@ comptime {
     assert(@offsetOf(AudioExchange, "audio_samples_count_atomic") % @alignOf(u32) == 0);
     assert(@offsetOf(AudioExchange, "slots") % @alignOf(AudioSlot) == 0);
     assert(@offsetOf(AudioSlot, "published_samples_count_atomic") % @alignOf(u32) == 0);
-    assert(@offsetOf(AudioSlot, "samples") % @alignOf(i16) == 0);
-    assert(@sizeOf(AudioSlot) == 16 + slot_samples_capacity * @sizeOf(i16));
+    assert(@offsetOf(AudioSlot, "samples") % @alignOf(f32) == 0);
+    assert(@sizeOf(AudioSlot) == 16 + slot_samples_capacity * @sizeOf(f32));
 }
 
-/// `initialize` assigns a fresh session to an exchange that no worker can still
-/// access. A canceled session must not call it until every old worker is reaped.
+/// `initialize` assigns a fresh session while no capture process exists. A
+/// retained model worker must have acknowledged its last result and await its
+/// next command without touching the exchange. After cancellation, every old
+/// worker must be reaped before this call.
 pub fn initialize(exchange: *AudioExchange, session_id: u64) void {
     assert(session_id > 0);
 
-    @memset(std.mem.asBytes(exchange), 0);
+    // Only published prefixes are readable. Clearing 5.49 MiB of PCM here
+    // would touch every page on each start without exposing any useful data;
+    // the next capture overwrites each prefix before publishing its count.
     exchange.version = format_version;
+    exchange.timeline_validation_atomic = 0;
     exchange.session_id = session_id;
+    exchange.audio_callbacks_count_atomic = 0;
+    exchange.audio_samples_count_atomic = 0;
+    exchange.reserved_2 = 0;
+    for (&exchange.slots) |*slot| {
+        slot.published_samples_count_atomic = 0;
+        slot.publication_ordinal = 0;
+        slot.contains_activity = 0;
+        slot.reserved = 0;
+    }
 
     assert(exchange.version == format_version);
     assert(exchange.timeline_validation_atomic == 0);
@@ -167,19 +194,26 @@ pub fn publishTimelineValidation(
 
 pub fn acquireTimelineValidation(
     exchange: *const AudioExchange,
-) ?TimelineValidation {
-    assert(exchange.version == format_version);
-    assert(exchange.session_id > 0);
+) AcquiredTimelineValidation {
+    if (exchange.version != format_version or exchange.session_id == 0) {
+        return .corrupt;
+    }
 
     const encoded = @atomicLoad(
         u32,
         &exchange.timeline_validation_atomic,
         .acquire,
     );
-    if (encoded == 0) return null;
-    assert(encoded == @intFromEnum(TimelineValidation.header_only) or
-        encoded == @intFromEnum(TimelineValidation.full));
-    return @enumFromInt(encoded);
+    if (encoded == 0) {
+        return .unpublished;
+    }
+    if (encoded == @intFromEnum(TimelineValidation.header_only)) {
+        return .{ .published = .header_only };
+    }
+    if (encoded == @intFromEnum(TimelineValidation.full)) {
+        return .{ .published = .full };
+    }
+    return .corrupt;
 }
 
 /// `publishAudioCallbacksCount` release-publishes callback progress separately
@@ -301,25 +335,30 @@ pub fn publishWrittenSlot(writer: SlotWriter, publication: SlotPublication) void
     );
 }
 
-/// `acquirePublishedSlot` returns immutable publication metadata while the
-/// shared count remains positive. The caller may read that sample prefix until
+/// `acquireSlot` returns immutable publication metadata while the shared count
+/// remains positive and in range. The caller may read that sample prefix until
 /// the supervisor calls `releaseConsumedSlot` after retaining its transcript.
-pub fn acquirePublishedSlot(slot: *const AudioSlot) ?PublishedSlot {
+/// Out-of-range fields are `corrupt`; do not clamp them into a readable prefix.
+pub fn acquireSlot(slot: *const AudioSlot) AcquiredSlot {
     const samples_count = @atomicLoad(
         u32,
         &slot.published_samples_count_atomic,
         .acquire,
     );
-    if (samples_count == 0) return null;
-
-    assert(samples_count <= slot_samples_capacity);
-    assert(slot.contains_activity <= 1);
-    assert(slot.reserved == 0);
-    return .{
+    if (samples_count == 0) {
+        return .empty;
+    }
+    if (samples_count > slot_samples_capacity or
+        slot.contains_activity > 1 or
+        slot.reserved != 0)
+    {
+        return .corrupt;
+    }
+    return .{ .published = .{
         .publication_ordinal = slot.publication_ordinal,
         .samples_count = samples_count,
         .contains_activity = slot.contains_activity == 1,
-    };
+    } };
 }
 
 /// `releaseConsumedSlot` returns a published slot to audio after no process can
@@ -353,4 +392,51 @@ pub fn abandonEmptyWrite(writer: SlotWriter) void {
         &writer.slot.published_samples_count_atomic,
         .acquire,
     ) == 0);
+}
+
+test "acquireSlot rejects out-of-range publication fields" {
+    const slot = try std.testing.allocator.create(AudioSlot);
+    defer std.testing.allocator.destroy(slot);
+    slot.* = std.mem.zeroes(AudioSlot);
+    try std.testing.expectEqual(AcquiredSlot.empty, acquireSlot(slot));
+
+    slot.published_samples_count_atomic = 1;
+    slot.contains_activity = 1;
+    switch (acquireSlot(slot)) {
+        .published => |publication| {
+            try std.testing.expectEqual(@as(u32, 1), publication.samples_count);
+            try std.testing.expect(publication.contains_activity);
+        },
+        .empty, .corrupt => return error.UnexpectedSlotState,
+    }
+
+    slot.published_samples_count_atomic = slot_samples_capacity + 1;
+    try std.testing.expectEqual(AcquiredSlot.corrupt, acquireSlot(slot));
+    slot.published_samples_count_atomic = std.math.maxInt(u32);
+    try std.testing.expectEqual(AcquiredSlot.corrupt, acquireSlot(slot));
+    slot.published_samples_count_atomic = 1;
+    slot.contains_activity = 2;
+    try std.testing.expectEqual(AcquiredSlot.corrupt, acquireSlot(slot));
+    slot.contains_activity = 1;
+    slot.reserved = 1;
+    try std.testing.expectEqual(AcquiredSlot.corrupt, acquireSlot(slot));
+}
+
+test "acquireTimelineValidation rejects unknown tags" {
+    const exchange = try std.testing.allocator.create(AudioExchange);
+    defer std.testing.allocator.destroy(exchange);
+    initialize(exchange, 1);
+    try std.testing.expectEqual(AcquiredTimelineValidation.unpublished, acquireTimelineValidation(exchange));
+
+    publishTimelineValidation(exchange, .full);
+    switch (acquireTimelineValidation(exchange)) {
+        .published => |value| try std.testing.expectEqual(TimelineValidation.full, value),
+        .unpublished, .corrupt => return error.UnexpectedTimelineState,
+    }
+
+    exchange.timeline_validation_atomic = 3;
+    try std.testing.expectEqual(AcquiredTimelineValidation.corrupt, acquireTimelineValidation(exchange));
+    exchange.timeline_validation_atomic = 1;
+    exchange.version = format_version + 1;
+    try std.testing.expectEqual(AcquiredTimelineValidation.corrupt, acquireTimelineValidation(exchange));
 }

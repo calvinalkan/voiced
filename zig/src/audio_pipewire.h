@@ -251,7 +251,6 @@ void voiced_audio_pipewire_loop_io_unregister(
 struct pw_stream *voiced_audio_pipewire_capture_stream_create(
     struct pw_loop *loop,
     const char *target,
-    bool process_realtime,
     struct voiced_audio_pipewire_stream_callbacks *callbacks,
     struct voiced_audio_pipewire_error *error_out
 );
@@ -260,7 +259,6 @@ int voiced_audio_pipewire_capture_stream_connect(
     struct pw_stream *stream,
     uint32_t sample_rate_hz,
     uint32_t samples_per_buffer_max,
-    bool process_realtime,
     struct voiced_audio_pipewire_error *error_out
 );
 
