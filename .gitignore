@@ -1,16 +1,5 @@
-# Python
+# Optional Python test and reference-comparison tools
 __pycache__/
-*.pyc
-*.pyo
-
-# Virtual environment
+*.py[cod]
 .venv/
-
-# Tool caches
 .ruff_cache/
-
-# Compiled binary (rebuild with ./build-dotool.sh)
-dotool
-
-# User config (use config.example.json as template)
-config.json

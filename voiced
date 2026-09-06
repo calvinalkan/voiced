@@ -1,6 +1,0 @@
-#!/bin/bash
-# Keep the public extensionless command while the Python CLI owns protocol and parsing.
-set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-exec /usr/bin/python3 "$SCRIPT_DIR/voiced_cli.py" "$@"

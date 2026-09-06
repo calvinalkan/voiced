@@ -191,8 +191,15 @@ runtime/feature/text-conversion errors, not normally completed results rejected
 by the supervisor's speech-confidence policy. A missing model has no decoded
 chunk to capture. Saving never updates the accepted transcript or clipboard.
 
-Build and replay from the repository root, using the existing Python environment
-for the CTranslate2 reference (no model downloads):
+The optional reference comparison uses its own Python environment; the daemon
+has no Python dependency. Set up these comparison tools from the repository root:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install numpy ctranslate2 faster-whisper
+```
+
+Build and replay against already installed models (the replay downloads none):
 
 ```bash
 (cd zig && zig build replay)
