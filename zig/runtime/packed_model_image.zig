@@ -226,7 +226,6 @@ pub const QuantizedSectionLayout = struct {
     scales_offset: usize,
     scales_size: usize,
     compensation_offset: usize,
-    compensation_size: usize,
     section_size: usize,
 };
 
@@ -250,13 +249,14 @@ pub fn quantizedSectionLayout(dimensions: TensorDimensions) QuantizedSectionLayo
         .scales_offset = scales_offset,
         .scales_size = scales_size,
         .compensation_offset = compensation_offset,
-        .compensation_size = compensation_size,
         .section_size = section_size,
     };
 }
 
-/// `validate` accepts only complete target-2 images and returns their model
-/// kind. It borrows `image` and performs no allocation.
+/// `validate` checks header validity, compatibility, and exact byte size for a
+/// trusted target-2 image, then returns its model kind. Payload validity is a
+/// caller precondition: tensor values and quantization metadata are not
+/// inspected. It borrows `image` and performs no allocation.
 pub fn validate(image: []align(alignment) const u8) LoadError!ModelKind {
     if (image.len < header_size or image.len > image_size_max) {
         return error.InvalidPackedImage;
@@ -320,7 +320,6 @@ pub fn quantizedSection(image: []align(alignment) const u8, specification: Model
         .values = values[0..layout.weights_size],
         .scales = scales[0..layout.weight.output_rows_count],
         .compensation = compensation[0..layout.weight.output_rows_count],
-        .output_rows_count = layout.weight.output_rows_count,
         .input_values_count = layout.weight.input_values_count,
     };
 }
@@ -340,10 +339,6 @@ pub const Builder = struct {
         // ── Measure And Allocate ──
 
         const specification = kind.specification();
-        const sections_count = countSections(specification);
-        assert(sections_count > 0);
-        assert(sections_count <= sections_count_max);
-
         const image_size = measureImageSize(specification);
         assert(image_size <= image_size_max);
         const image = try allocator.alignedAlloc(u8, .fromByteUnits(alignment), image_size);
@@ -373,9 +368,12 @@ pub const Builder = struct {
 
             previous_payload_end = section.payload_offset + section.payload_size;
         }
-        assert(iterator.section_index == sections_count);
         assert(iterator.payload_offset == image.len);
         @memset(image[previous_payload_end..], 0);
+
+        const sections_count = iterator.section_index;
+        assert(sections_count > 0);
+        assert(sections_count <= sections_count_max);
 
         return .{
             .allocator = allocator,
@@ -523,14 +521,6 @@ const SectionIterator = struct {
 
 const sections_count_max = std.enums.values(SectionKind).len * model_specification.layers_count_max;
 const SectionsWritten = std.StaticBitSet(sections_count_max);
-
-fn countSections(specification: ModelSpecification) usize {
-    var iterator = SectionIterator.init(specification);
-    while (iterator.next() != null) {}
-
-    assert(iterator.section_index <= sections_count_max);
-    return iterator.section_index;
-}
 
 fn measureImageSize(specification: ModelSpecification) usize {
     var iterator = SectionIterator.init(specification);

@@ -1,4 +1,4 @@
-//! `Model` is the public lifecycle facade over one validated packed model
+//! `Model` is the public lifecycle facade over one immutable packed model
 //! image. Packed-image layout and pristine CTranslate2 conversion remain in
 //! their representation-owning modules.
 
@@ -9,7 +9,6 @@ const packed_model_image = @import("packed_model_image.zig");
 const vnni_weight = @import("vnni_weight.zig");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
-const SectionKind = packed_model_image.SectionKind;
 
 pub const ModelKind = model_specification.ModelKind;
 pub const ModelSpecification = model_specification.ModelSpecification;
@@ -24,8 +23,15 @@ pub const packed_model_image_alignment = packed_model_image.alignment;
 /// payload sequence. The image header separately identifies packed target 2.
 pub const packed_model_image_format_version = packed_model_image.format_version;
 
-/// `ModelLoadError` reports malformed or incompatible model input and
-/// allocation failure. A failed load returns no partially initialized `Model`.
+/// `packed_model_cache_version` identifies conversion semantics and physical
+/// encoding together. Increment it when conversion values or image encoding
+/// change, even if the image remains structurally readable. Kernel scheduling
+/// changes alone do not invalidate cached images.
+pub const packed_model_cache_version: u32 = 1;
+
+/// `ModelLoadError` reports invalid pristine weights, malformed or incompatible
+/// packed-image structure, and allocation failure. A failed load returns no
+/// partially initialized `Model`.
 pub const ModelLoadError = packed_model_image.LoadError || ctranslate2_weights.ConvertError;
 
 pub const EncoderLayerWeights = struct {
@@ -95,18 +101,24 @@ pub const InferenceWeights = struct {
 /// until `deinit` returns.
 pub const Model = struct {
     kind: ModelKind,
-    specification: ModelSpecification,
     backing: Backing,
 
-    /// `fromPackedImage` validates an aligned target-2 native image and
-    /// constructs model views directly over its bytes. It performs no
-    /// allocation or copying and does not take ownership of `image`.
+    /// `fromPackedImage` constructs views over an aligned, trusted target-2
+    /// image. It checks header validity, format compatibility, and exact image
+    /// size. Tensor values and quantization metadata are not scanned.
+    ///
+    /// The caller guarantees that `image` is intact output from
+    /// `fromPristineWeights`, including a byte-for-byte persisted copy. Payload
+    /// corruption can cause incorrect results or failures during inference;
+    /// rejection is not guaranteed.
+    ///
+    /// Loading performs no allocation or copying and does not take ownership
+    /// of `image`. Keep it mapped and immutable until `deinit` returns.
     pub fn fromPackedImage(image: []align(packed_model_image_alignment) const u8) ModelLoadError!Model {
         const kind = try packed_model_image.validate(image);
 
         return .{
             .kind = kind,
-            .specification = kind.specification(),
             .backing = .{ .borrowed = image },
         };
     }
@@ -126,7 +138,6 @@ pub const Model = struct {
 
         return .{
             .kind = kind,
-            .specification = kind.specification(),
             .backing = .{ .owned = .{ .allocator = allocator, .image = image } },
         };
     }
@@ -136,7 +147,10 @@ pub const Model = struct {
     /// them verbatim to persistent storage and later pass a mapped copy to
     /// `fromPackedImage`.
     pub fn packedImage(model: *const Model) []align(packed_model_image_alignment) const u8 {
-        const image = model.backing.packedImage();
+        const image = switch (model.backing) {
+            .borrowed => |image| image,
+            .owned => |owned| owned.image,
+        };
         assert(image.len > 0);
 
         return image;
@@ -145,7 +159,10 @@ pub const Model = struct {
     /// `deinit` releases an image created by `fromPristineWeights` and leaves a
     /// borrowed image untouched. It invalidates the model in both cases.
     pub fn deinit(model: *Model) void {
-        model.backing.deinit();
+        switch (model.backing) {
+            .borrowed => {},
+            .owned => |owned| owned.allocator.free(owned.image),
+        }
         model.* = undefined;
     }
 
@@ -153,73 +170,68 @@ pub const Model = struct {
     /// tensor. The returned views remain valid while the model image remains
     /// mapped and immutable.
     pub fn inferenceWeights(model: *const Model) InferenceWeights {
+        const image = model.packedImage();
+        const specification = model.kind.specification();
+
         var encoder_layers: [model_specification.layers_count_max]EncoderLayerWeights = undefined;
-        for (encoder_layers[0..model.specification.encoder_layers_count], 0..) |*layer, layer_index| {
+        for (encoder_layers[0..specification.encoder_layers_count], 0..) |*layer, layer_index| {
             layer.* = .{
-                .self_attention_layer_norm_beta = model.floatSection(.encoder_layer_self_attention_layer_norm_beta, @intCast(layer_index)),
-                .self_attention_layer_norm_gamma = model.floatSection(.encoder_layer_self_attention_layer_norm_gamma, @intCast(layer_index)),
-                .self_attention_query_key_value_bias = model.floatSection(.encoder_layer_self_attention_query_key_value_bias, @intCast(layer_index)),
-                .self_attention_query_key_value_weight = model.quantizedSection(.encoder_layer_self_attention_query_key_value_weight, @intCast(layer_index)),
-                .self_attention_output_bias = model.floatSection(.encoder_layer_self_attention_output_bias, @intCast(layer_index)),
-                .self_attention_output_weight = model.quantizedSection(.encoder_layer_self_attention_output_weight, @intCast(layer_index)),
-                .ffn_layer_norm_beta = model.floatSection(.encoder_layer_ffn_layer_norm_beta, @intCast(layer_index)),
-                .ffn_layer_norm_gamma = model.floatSection(.encoder_layer_ffn_layer_norm_gamma, @intCast(layer_index)),
-                .ffn_expansion_bias = model.floatSection(.encoder_layer_ffn_expansion_bias, @intCast(layer_index)),
-                .ffn_expansion_weight = model.quantizedSection(.encoder_layer_ffn_expansion_weight, @intCast(layer_index)),
-                .ffn_contraction_bias = model.floatSection(.encoder_layer_ffn_contraction_bias, @intCast(layer_index)),
-                .ffn_contraction_weight = model.quantizedSection(.encoder_layer_ffn_contraction_weight, @intCast(layer_index)),
+                .self_attention_layer_norm_beta = packed_model_image.floatSection(image, specification, .encoder_layer_self_attention_layer_norm_beta, @intCast(layer_index)),
+                .self_attention_layer_norm_gamma = packed_model_image.floatSection(image, specification, .encoder_layer_self_attention_layer_norm_gamma, @intCast(layer_index)),
+                .self_attention_query_key_value_bias = packed_model_image.floatSection(image, specification, .encoder_layer_self_attention_query_key_value_bias, @intCast(layer_index)),
+                .self_attention_query_key_value_weight = packed_model_image.quantizedSection(image, specification, .encoder_layer_self_attention_query_key_value_weight, @intCast(layer_index)),
+                .self_attention_output_bias = packed_model_image.floatSection(image, specification, .encoder_layer_self_attention_output_bias, @intCast(layer_index)),
+                .self_attention_output_weight = packed_model_image.quantizedSection(image, specification, .encoder_layer_self_attention_output_weight, @intCast(layer_index)),
+                .ffn_layer_norm_beta = packed_model_image.floatSection(image, specification, .encoder_layer_ffn_layer_norm_beta, @intCast(layer_index)),
+                .ffn_layer_norm_gamma = packed_model_image.floatSection(image, specification, .encoder_layer_ffn_layer_norm_gamma, @intCast(layer_index)),
+                .ffn_expansion_bias = packed_model_image.floatSection(image, specification, .encoder_layer_ffn_expansion_bias, @intCast(layer_index)),
+                .ffn_expansion_weight = packed_model_image.quantizedSection(image, specification, .encoder_layer_ffn_expansion_weight, @intCast(layer_index)),
+                .ffn_contraction_bias = packed_model_image.floatSection(image, specification, .encoder_layer_ffn_contraction_bias, @intCast(layer_index)),
+                .ffn_contraction_weight = packed_model_image.quantizedSection(image, specification, .encoder_layer_ffn_contraction_weight, @intCast(layer_index)),
             };
         }
 
         var decoder_layers: [model_specification.layers_count_max]DecoderLayerWeights = undefined;
-        for (decoder_layers[0..model.specification.decoder_layers_count], 0..) |*layer, layer_index| {
+        for (decoder_layers[0..specification.decoder_layers_count], 0..) |*layer, layer_index| {
             layer.* = .{
-                .self_attention_layer_norm_beta = model.floatSection(.decoder_layer_self_attention_layer_norm_beta, @intCast(layer_index)),
-                .self_attention_layer_norm_gamma = model.floatSection(.decoder_layer_self_attention_layer_norm_gamma, @intCast(layer_index)),
-                .self_attention_query_key_value_bias = model.floatSection(.decoder_layer_self_attention_query_key_value_bias, @intCast(layer_index)),
-                .self_attention_query_key_value_weight = model.quantizedSection(.decoder_layer_self_attention_query_key_value_weight, @intCast(layer_index)),
-                .self_attention_output_bias = model.floatSection(.decoder_layer_self_attention_output_bias, @intCast(layer_index)),
-                .self_attention_output_weight = model.quantizedSection(.decoder_layer_self_attention_output_weight, @intCast(layer_index)),
-                .cross_attention_layer_norm_beta = model.floatSection(.decoder_layer_cross_attention_layer_norm_beta, @intCast(layer_index)),
-                .cross_attention_layer_norm_gamma = model.floatSection(.decoder_layer_cross_attention_layer_norm_gamma, @intCast(layer_index)),
-                .cross_attention_query_bias = model.floatSection(.decoder_layer_cross_attention_query_bias, @intCast(layer_index)),
-                .cross_attention_query_weight = model.quantizedSection(.decoder_layer_cross_attention_query_weight, @intCast(layer_index)),
-                .cross_attention_key_value_bias = model.floatSection(.decoder_layer_cross_attention_key_value_bias, @intCast(layer_index)),
-                .cross_attention_key_value_weight = model.quantizedSection(.decoder_layer_cross_attention_key_value_weight, @intCast(layer_index)),
-                .cross_attention_output_bias = model.floatSection(.decoder_layer_cross_attention_output_bias, @intCast(layer_index)),
-                .cross_attention_output_weight = model.quantizedSection(.decoder_layer_cross_attention_output_weight, @intCast(layer_index)),
-                .ffn_layer_norm_beta = model.floatSection(.decoder_layer_ffn_layer_norm_beta, @intCast(layer_index)),
-                .ffn_layer_norm_gamma = model.floatSection(.decoder_layer_ffn_layer_norm_gamma, @intCast(layer_index)),
-                .ffn_expansion_bias = model.floatSection(.decoder_layer_ffn_expansion_bias, @intCast(layer_index)),
-                .ffn_expansion_weight = model.quantizedSection(.decoder_layer_ffn_expansion_weight, @intCast(layer_index)),
-                .ffn_contraction_bias = model.floatSection(.decoder_layer_ffn_contraction_bias, @intCast(layer_index)),
-                .ffn_contraction_weight = model.quantizedSection(.decoder_layer_ffn_contraction_weight, @intCast(layer_index)),
+                .self_attention_layer_norm_beta = packed_model_image.floatSection(image, specification, .decoder_layer_self_attention_layer_norm_beta, @intCast(layer_index)),
+                .self_attention_layer_norm_gamma = packed_model_image.floatSection(image, specification, .decoder_layer_self_attention_layer_norm_gamma, @intCast(layer_index)),
+                .self_attention_query_key_value_bias = packed_model_image.floatSection(image, specification, .decoder_layer_self_attention_query_key_value_bias, @intCast(layer_index)),
+                .self_attention_query_key_value_weight = packed_model_image.quantizedSection(image, specification, .decoder_layer_self_attention_query_key_value_weight, @intCast(layer_index)),
+                .self_attention_output_bias = packed_model_image.floatSection(image, specification, .decoder_layer_self_attention_output_bias, @intCast(layer_index)),
+                .self_attention_output_weight = packed_model_image.quantizedSection(image, specification, .decoder_layer_self_attention_output_weight, @intCast(layer_index)),
+                .cross_attention_layer_norm_beta = packed_model_image.floatSection(image, specification, .decoder_layer_cross_attention_layer_norm_beta, @intCast(layer_index)),
+                .cross_attention_layer_norm_gamma = packed_model_image.floatSection(image, specification, .decoder_layer_cross_attention_layer_norm_gamma, @intCast(layer_index)),
+                .cross_attention_query_bias = packed_model_image.floatSection(image, specification, .decoder_layer_cross_attention_query_bias, @intCast(layer_index)),
+                .cross_attention_query_weight = packed_model_image.quantizedSection(image, specification, .decoder_layer_cross_attention_query_weight, @intCast(layer_index)),
+                .cross_attention_key_value_bias = packed_model_image.floatSection(image, specification, .decoder_layer_cross_attention_key_value_bias, @intCast(layer_index)),
+                .cross_attention_key_value_weight = packed_model_image.quantizedSection(image, specification, .decoder_layer_cross_attention_key_value_weight, @intCast(layer_index)),
+                .cross_attention_output_bias = packed_model_image.floatSection(image, specification, .decoder_layer_cross_attention_output_bias, @intCast(layer_index)),
+                .cross_attention_output_weight = packed_model_image.quantizedSection(image, specification, .decoder_layer_cross_attention_output_weight, @intCast(layer_index)),
+                .ffn_layer_norm_beta = packed_model_image.floatSection(image, specification, .decoder_layer_ffn_layer_norm_beta, @intCast(layer_index)),
+                .ffn_layer_norm_gamma = packed_model_image.floatSection(image, specification, .decoder_layer_ffn_layer_norm_gamma, @intCast(layer_index)),
+                .ffn_expansion_bias = packed_model_image.floatSection(image, specification, .decoder_layer_ffn_expansion_bias, @intCast(layer_index)),
+                .ffn_expansion_weight = packed_model_image.quantizedSection(image, specification, .decoder_layer_ffn_expansion_weight, @intCast(layer_index)),
+                .ffn_contraction_bias = packed_model_image.floatSection(image, specification, .decoder_layer_ffn_contraction_bias, @intCast(layer_index)),
+                .ffn_contraction_weight = packed_model_image.quantizedSection(image, specification, .decoder_layer_ffn_contraction_weight, @intCast(layer_index)),
             };
         }
 
         return .{
-            .decoder_embeddings_weight = model.quantizedSection(.decoder_embeddings_weight, packed_model_image.model_wide_layer_index),
-            .decoder_layer_norm_beta = model.floatSection(.decoder_layer_norm_beta, packed_model_image.model_wide_layer_index),
-            .decoder_layer_norm_gamma = model.floatSection(.decoder_layer_norm_gamma, packed_model_image.model_wide_layer_index),
-            .decoder_position_encodings = model.floatSection(.decoder_position_encodings, packed_model_image.model_wide_layer_index),
-            .encoder_convolution_1_bias = model.floatSection(.encoder_convolution_1_bias, packed_model_image.model_wide_layer_index),
-            .encoder_convolution_1_weight = model.quantizedSection(.encoder_convolution_1_weight, packed_model_image.model_wide_layer_index),
-            .encoder_convolution_2_bias = model.floatSection(.encoder_convolution_2_bias, packed_model_image.model_wide_layer_index),
-            .encoder_convolution_2_weight = model.quantizedSection(.encoder_convolution_2_weight, packed_model_image.model_wide_layer_index),
-            .encoder_layer_norm_beta = model.floatSection(.encoder_layer_norm_beta, packed_model_image.model_wide_layer_index),
-            .encoder_layer_norm_gamma = model.floatSection(.encoder_layer_norm_gamma, packed_model_image.model_wide_layer_index),
-            .encoder_position_encodings = model.floatSection(.encoder_position_encodings, packed_model_image.model_wide_layer_index),
+            .decoder_embeddings_weight = packed_model_image.quantizedSection(image, specification, .decoder_embeddings_weight, packed_model_image.model_wide_layer_index),
+            .decoder_layer_norm_beta = packed_model_image.floatSection(image, specification, .decoder_layer_norm_beta, packed_model_image.model_wide_layer_index),
+            .decoder_layer_norm_gamma = packed_model_image.floatSection(image, specification, .decoder_layer_norm_gamma, packed_model_image.model_wide_layer_index),
+            .decoder_position_encodings = packed_model_image.floatSection(image, specification, .decoder_position_encodings, packed_model_image.model_wide_layer_index),
+            .encoder_convolution_1_bias = packed_model_image.floatSection(image, specification, .encoder_convolution_1_bias, packed_model_image.model_wide_layer_index),
+            .encoder_convolution_1_weight = packed_model_image.quantizedSection(image, specification, .encoder_convolution_1_weight, packed_model_image.model_wide_layer_index),
+            .encoder_convolution_2_bias = packed_model_image.floatSection(image, specification, .encoder_convolution_2_bias, packed_model_image.model_wide_layer_index),
+            .encoder_convolution_2_weight = packed_model_image.quantizedSection(image, specification, .encoder_convolution_2_weight, packed_model_image.model_wide_layer_index),
+            .encoder_layer_norm_beta = packed_model_image.floatSection(image, specification, .encoder_layer_norm_beta, packed_model_image.model_wide_layer_index),
+            .encoder_layer_norm_gamma = packed_model_image.floatSection(image, specification, .encoder_layer_norm_gamma, packed_model_image.model_wide_layer_index),
+            .encoder_position_encodings = packed_model_image.floatSection(image, specification, .encoder_position_encodings, packed_model_image.model_wide_layer_index),
             .encoder_layers = encoder_layers,
             .decoder_layers = decoder_layers,
         };
-    }
-
-    fn floatSection(model: *const Model, kind: SectionKind, layer_index: u16) []const f32 {
-        return packed_model_image.floatSection(model.backing.packedImage(), model.specification, kind, layer_index);
-    }
-
-    fn quantizedSection(model: *const Model, kind: SectionKind, layer_index: u16) QuantizedWeight {
-        return packed_model_image.quantizedSection(model.backing.packedImage(), model.specification, kind, layer_index);
     }
 };
 
@@ -229,22 +241,6 @@ const Backing = union(enum) {
         allocator: Allocator,
         image: []align(packed_model_image_alignment) u8,
     },
-
-    fn packedImage(backing: *const Backing) []align(packed_model_image_alignment) const u8 {
-        return switch (backing.*) {
-            .borrowed => |image| image,
-            .owned => |owned| owned.image,
-        };
-    }
-
-    fn deinit(backing: *Backing) void {
-        switch (backing.*) {
-            .borrowed => {},
-            .owned => |owned| owned.allocator.free(owned.image),
-        }
-
-        backing.* = undefined;
-    }
 };
 
 // ─── Tests ─────────────────────────────────────────────────────────────────
@@ -304,14 +300,14 @@ fn testExpectPristineAndPackedModelsEqual(kind: ModelKind, installed_directory_n
     defer pristine_model.deinit();
 
     try std.testing.expectEqual(kind, pristine_model.kind);
-    try std.testing.expectEqualDeep(expected_specification, pristine_model.specification);
+    try std.testing.expectEqualDeep(expected_specification, pristine_model.kind.specification());
 
     const in_memory_packed_image = pristine_model.packedImage();
     try std.testing.expect(in_memory_packed_image.len > 0);
     try std.testing.expectEqual(@as(usize, 0), @intFromPtr(in_memory_packed_image.ptr) % packed_model_image_alignment);
 
     const inference_weights = pristine_model.inferenceWeights();
-    try std.testing.expectEqual(expected_specification.encoder_width, inference_weights.encoder_convolution_1_weight.output_rows_count);
+    try std.testing.expectEqual(expected_specification.encoder_width, inference_weights.encoder_convolution_1_weight.scales.len);
     try std.testing.expectEqual(expected_specification.mel_bins_count * 3, inference_weights.encoder_convolution_1_weight.input_values_count);
     try std.testing.expectEqual(expected_specification.encoder_width * 3, inference_weights.encoder_convolution_2_weight.input_values_count);
 
@@ -363,7 +359,7 @@ fn testExpectPristineAndPackedModelsEqual(kind: ModelKind, installed_directory_n
     defer mapped_model.deinit();
 
     try std.testing.expectEqual(pristine_model.kind, mapped_model.kind);
-    try std.testing.expectEqualDeep(pristine_model.specification, mapped_model.specification);
+    try std.testing.expectEqualDeep(pristine_model.kind.specification(), mapped_model.kind.specification());
     try std.testing.expectEqual(@intFromPtr(mapped_image.ptr), @intFromPtr(mapped_model.packedImage().ptr));
 
     // ── Reload ──
@@ -375,7 +371,7 @@ fn testExpectPristineAndPackedModelsEqual(kind: ModelKind, installed_directory_n
     defer packed_model.deinit();
 
     try std.testing.expectEqual(pristine_model.kind, packed_model.kind);
-    try std.testing.expectEqualDeep(pristine_model.specification, packed_model.specification);
+    try std.testing.expectEqualDeep(pristine_model.kind.specification(), packed_model.kind.specification());
     try std.testing.expectEqualSlices(u8, in_memory_packed_image, packed_model.packedImage());
     try std.testing.expectEqual(@intFromPtr(disk_packed_image.ptr), @intFromPtr(packed_model.packedImage().ptr));
 }
@@ -386,7 +382,9 @@ fn testReadInstalledPristineWeights(allocator: Allocator, installed_directory_na
     const path_parts: []const []const u8 = if (data_home) |path|
         &.{ path, "voiced/models", installed_directory_name, "model.bin" }
     else
-        &.{ env.getPosix("HOME") orelse return error.HomeNotSet, ".local/share/voiced/models", installed_directory_name, "model.bin" };
+        &.{ env.getPosix("HOME") orelse {
+            return error.HomeNotSet;
+        }, ".local/share/voiced/models", installed_directory_name, "model.bin" };
 
     const path = try std.fs.path.join(allocator, path_parts);
     defer allocator.free(path);

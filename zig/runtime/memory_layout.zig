@@ -26,6 +26,15 @@ pub fn Region(comptime Element: type) type {
         offset: usize,
         elements_count: usize,
 
+        pub fn rebase(region: @This(), base_offset: usize) @This() {
+            assert(base_offset % alignment == 0);
+
+            return .{
+                .offset = std.math.add(usize, base_offset, region.offset) catch unreachable,
+                .elements_count = region.elements_count,
+            };
+        }
+
         pub fn bind(region: @This(), memory: []align(alignment) u8) []align(alignment) Element {
             assert(region.offset % alignment == 0);
             const region_size = std.math.mul(usize, region.elements_count, @sizeOf(Element)) catch unreachable;

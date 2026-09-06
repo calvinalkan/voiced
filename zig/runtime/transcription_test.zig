@@ -53,23 +53,43 @@ test "transcribes audio fixtures" {
 
     // ── Initialize Runtime ──
     //
-    // Allocate the complete tensor arena before initialization. Runtime.init allocates one address-stable control object; transcribe() performs no dynamic allocation.
+    // The test owns both the tensor arena and address-stable runtime. Neither
+    // runtime initialization nor transcription allocates tensor/control storage.
 
-    const policy: voiced_runtime_module.Policy = .{ .workers_count = 4 };
+    const workers_count = if (std.testing.environ.getPosix("VOICED_RUNTIME_WORKERS")) |value| try std.fmt.parseInt(usize, value, 10) else 4;
+    const decoder_workers_count = if (std.testing.environ.getPosix("VOICED_RUNTIME_DECODER_WORKERS")) |value| try std.fmt.parseInt(usize, value, 10) else null;
+    const policy: voiced_runtime_module.Policy = .{ .workers_count = workers_count, .decoder_workers_count = decoder_workers_count };
     const runtime_memory_size = try voiced_runtime_module.Runtime.requiredMemorySize(model.kind, policy);
 
     const runtime_memory = try allocator.alignedAlloc(u8, .fromByteUnits(voiced_runtime_module.runtime_memory_alignment), runtime_memory_size);
     defer allocator.free(runtime_memory);
 
-    const runtime: *voiced_runtime_module.Runtime = try voiced_runtime_module.Runtime.init(
-        allocator,
+    var runtime: voiced_runtime_module.Runtime = undefined;
+    try runtime.init(
         std.testing.io,
         &model,
         vocabulary_text,
         runtime_memory,
         policy,
     );
-    defer runtime.deinit(allocator);
+    defer runtime.deinit();
+    if (std.testing.environ.getPosix("VOICED_RUNTIME_WORKER_CPUS")) |cpu_list| {
+        var binding: WorkerCpuBinding = .{};
+        var ids = std.mem.splitScalar(u8, cpu_list, ',');
+        var count: usize = 0;
+        while (ids.next()) |id| {
+            if (count == workers_count) {
+                return error.InvalidWorkerCpus;
+            }
+            binding.cpu_ids[count] = try std.fmt.parseInt(usize, id, 10);
+            count += 1;
+        }
+        if (count != workers_count) {
+            return error.InvalidWorkerCpus;
+        }
+        runtime.executor.run(&binding, bindWorkerCpu);
+        try std.testing.expect(!binding.failed.load(.acquire));
+    }
 
     // ── Discover Fixtures ──
     //
@@ -80,7 +100,8 @@ test "transcribes audio fixtures" {
 
     const selected_fixture = std.testing.environ.getPosix("VOICED_RUNTIME_AUDIO_FIXTURE");
     const encoder_trailing_padding = try selectedEncoderTrailingPadding();
-    const transcribe_options: voiced_runtime_module.TranscribeOptions = .{ .encoder_trailing_padding = encoder_trailing_padding };
+    var timings: voiced_runtime_module.Timings = .{};
+    const transcribe_options: voiced_runtime_module.TranscribeOptions = .{ .encoder_trailing_padding = encoder_trailing_padding, .timings = &timings };
     var transcript_output: [transcript_size_max]u8 = undefined;
 
     // ── Accumulate Suite Results ──
@@ -179,6 +200,12 @@ test "transcribes audio fixtures" {
         // ── Report Fixture ──
 
         std.debug.print("\n{s}\n  expected: {s}\n  actual:   {s}\n  word errors: {d}/{d}\n  encoder positions: {d}\n  no-speech probability: {d:.6}\n  average log probability: {d:.6}\n  latency: {d:.1} ms\n", .{ id, std.mem.trim(u8, expected_transcript, " \t\r\n"), transcription.text, errors_count, expected_words.len, transcription.encoder_positions_count, transcription.no_speech_probability, transcription.average_log_probability, transcription_elapsed_ms });
+        std.debug.print("  phases ms: mel={d:.3} encoder={d:.3} cross={d:.3} decoder={d:.3}\n", .{
+            @as(f64, @floatFromInt(timings.log_mel_ns)) / std.time.ns_per_ms,
+            @as(f64, @floatFromInt(timings.encoder_ns)) / std.time.ns_per_ms,
+            @as(f64, @floatFromInt(timings.cross_key_values_ns)) / std.time.ns_per_ms,
+            @as(f64, @floatFromInt(timings.decoder_ns)) / std.time.ns_per_ms,
+        });
     }
 
     // ── Report Suite ──
@@ -193,6 +220,276 @@ test "transcribes audio fixtures" {
     std.debug.print("\nPure Zig {s} transcription with {s} trailing padding: {d} fixtures, {d}/{d} word errors ({d:.2}%)\n", .{ test_model.name, @tagName(encoder_trailing_padding), fixtures_count, word_errors_count, reference_words_count, 100.0 * word_error_rate });
 
     try std.testing.expect(word_error_rate <= 0.06);
+}
+
+const WorkerCpuBinding = struct {
+    cpu_ids: [32]usize = @splat(0),
+    failed: std.atomic.Value(bool) = .init(false),
+};
+
+fn bindWorkerCpu(raw_context: *anyopaque, lane: executor_module.Lane) void {
+    const binding: *WorkerCpuBinding = @ptrCast(@alignCast(raw_context));
+    const cpu = binding.cpu_ids[lane.index];
+    var mask: std.os.linux.cpu_set_t = @splat(0);
+    if (cpu >= @bitSizeOf(@TypeOf(mask))) {
+        binding.failed.store(true, .release);
+        return;
+    }
+    mask[cpu / @bitSizeOf(usize)] = @as(usize, 1) << @intCast(cpu % @bitSizeOf(usize));
+    std.os.linux.sched_setaffinity(0, &mask) catch binding.failed.store(true, .release);
+}
+
+// ─── Convolution Frontend Equivalence ──────────────────────────────────────
+
+const encoder_module = @import("encoder.zig");
+const linear = @import("linear.zig");
+const log_mel = @import("log_mel.zig");
+const executor_module = @import("executor.zig");
+const model_module = @import("model.zig");
+
+test "blocked convolution frontend matches materialized reference" {
+    const allocator = std.testing.allocator;
+    const test_model = try selectedTestModel();
+    const model_directory = try modelsDirectory(allocator, test_model.installed_directory_name);
+    defer allocator.free(model_directory);
+    const model_path = try std.fs.path.join(allocator, &.{ model_directory, "model.bin" });
+    defer allocator.free(model_path);
+    const pristine = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, model_path, allocator, .limited(model_file_size_max));
+    defer allocator.free(pristine);
+    var model = try model_module.Model.fromPristineWeights(allocator, test_model.kind, pristine);
+    defer model.deinit();
+    const weights = model.inferenceWeights();
+    const specification = model.kind.specification();
+    const width = specification.encoder_width;
+
+    // Use actual Mel values, retaining channel-major storage when varying the
+    // logical length. Tiny/odd lengths and lane boundaries exercise both halos.
+    const fixtures = try openAudioFixturesDirectory();
+    defer fixtures.close(std.testing.io);
+    var entries = fixtures.iterate();
+    var wav: ?[]u8 = null;
+    while (try entries.next(std.testing.io)) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".wav")) {
+            wav = try fixtures.readFileAlloc(std.testing.io, entry.name, allocator, .limited(wav_file_size_max));
+            break;
+        }
+    }
+    const wav_bytes = wav orelse {
+        return error.MissingAudioFixture;
+    };
+    defer allocator.free(wav_bytes);
+    const sample_bytes = try parsePcmWav(wav_bytes);
+    const samples = try allocator.alloc(f32, sample_bytes.len / 2);
+    defer allocator.free(samples);
+    for (samples, 0..) |*sample, index| {
+        sample.* = @as(f32, @floatFromInt(std.mem.readInt(i16, sample_bytes[index * 2 ..][0..2], .little))) / 32768.0;
+    }
+    const mel_memory = try allocator.alignedAlloc(u8, .fromByteUnits(voiced_runtime_module.runtime_memory_alignment), log_mel.Extractor.requiredMemorySize(log_mel.samples_count_max));
+    defer allocator.free(mel_memory);
+    var extractor: log_mel.Extractor = undefined;
+    try extractor.init(mel_memory, log_mel.samples_count_max);
+    const mel_workspace = try allocator.alloc(f32, log_mel.workspace_values_count);
+    defer allocator.free(mel_workspace);
+    const actual_features = try extractor.calculate(samples, .seconds_30, mel_workspace);
+    const mel = try allocator.alloc(f32, log_mel.mel_bins_count * log_mel.encoder_frames_count_max);
+    defer allocator.free(mel);
+    const first = try allocator.alloc(f32, log_mel.encoder_frames_count_max * width);
+    defer allocator.free(first);
+    const expected = try allocator.alloc(f32, specification.encoder_positions_count_max * width);
+    defer allocator.free(expected);
+    const actual = try allocator.alloc(f32, expected.len);
+    defer allocator.free(actual);
+
+    for ([_]usize{ 1, 3, 4, 8, 16 }) |workers_count| {
+        const float_scratch = try allocator.alloc(f32, workers_count * encoder_module.laneFloatScratchValuesCount(specification));
+        defer allocator.free(float_scratch);
+        const quantized_scratch = try allocator.alloc(u8, workers_count * encoder_module.laneQuantizedScratchValuesCount(specification));
+        defer allocator.free(quantized_scratch);
+        var executor: executor_module.Executor = undefined;
+        try executor.init(std.testing.io, workers_count);
+        defer executor.deinit();
+
+        for ([_]usize{ 1, 2, 3, 11, 12, 13, 23, 24, 25, 47, 48, 49, 2119, 2120, 2999, 3000 }) |frames_count| {
+            for (0..log_mel.mel_bins_count) |channel| {
+                @memcpy(mel[channel * frames_count ..][0..frames_count], actual_features.values[channel * actual_features.frames_count ..][0..frames_count]);
+            }
+            const positions_count = (frames_count + 1) / 2;
+            var context: FrontendComparison = .{
+                .features = .{ .values = mel[0 .. log_mel.mel_bins_count * frames_count], .frames_count = frames_count },
+                .weights = &weights,
+                .first = first[0 .. frames_count * width],
+                .output = expected[0 .. positions_count * width],
+                .float_scratch = float_scratch,
+                .quantized_scratch = quantized_scratch,
+                .use_reference = true,
+            };
+            executor.run(&context, runFrontendComparison);
+            context.output = actual[0 .. positions_count * width];
+            context.use_reference = false;
+            @memset(actual, std.math.nan(f32));
+            @memset(float_scratch, std.math.nan(f32));
+            executor.run(&context, runFrontendComparison);
+            try std.testing.expectEqualSlices(f32, expected[0 .. positions_count * width], context.output);
+
+            if (workers_count == 4 and frames_count == 3000) {
+                if (std.testing.environ.getPosix("VOICED_RUNTIME_FRONTEND_BENCHMARK")) |variant| {
+                    context.use_reference = std.mem.eql(u8, variant, "reference");
+                    const start = std.Io.Clock.awake.now(std.testing.io);
+                    for (0..20) |_| executor.run(&context, runFrontendComparison);
+                    const elapsed = start.durationTo(std.Io.Clock.awake.now(std.testing.io));
+                    std.debug.print("\nfrontend {s}: {d:.3} ms/iteration\n", .{ variant, @as(f64, @floatFromInt(elapsed.nanoseconds)) / std.time.ns_per_ms / 20 });
+                }
+            }
+        }
+    }
+}
+
+const FrontendComparison = struct {
+    features: log_mel.Features,
+    weights: *const model_module.InferenceWeights,
+    first: []f32,
+    output: []f32,
+    float_scratch: []f32,
+    quantized_scratch: []u8,
+    use_reference: bool,
+};
+
+fn runFrontendComparison(raw_context: *anyopaque, lane: executor_module.Lane) void {
+    const context: *FrontendComparison = @ptrCast(@alignCast(raw_context));
+    const float_count = context.float_scratch.len / lane.count;
+    const quantized_count = context.quantized_scratch.len / lane.count;
+    const floats = context.float_scratch[lane.index * float_count ..][0..float_count];
+    const quantized = context.quantized_scratch[lane.index * quantized_count ..][0..quantized_count];
+    if (context.use_reference) {
+        referenceConvolution(context.features.values, context.features.frames_count, log_mel.mel_bins_count, context.weights.encoder_convolution_1_weight, context.weights.encoder_convolution_1_bias, 1, true, context.first, floats, quantized, lane);
+        lane.sync();
+        referenceConvolution(context.first, context.features.frames_count, context.weights.encoder_convolution_1_weight.scales.len, context.weights.encoder_convolution_2_weight, context.weights.encoder_convolution_2_bias, 2, false, context.output, floats, quantized, lane);
+    } else {
+        encoder_module.forwardConvolutionFrontend(context.features, context.weights, context.output, floats, quantized, lane);
+    }
+}
+
+// Deliberately materialize the complete first convolution using one-row
+// projections. This independent indexing path is the frontend's exact oracle.
+fn referenceConvolution(input: []const f32, input_positions_count: usize, channels_count: usize, weight: model_module.QuantizedWeight, bias: []const f32, stride: usize, channel_major: bool, output: []f32, float_scratch: []f32, quantized_scratch: []u8, lane: executor_module.Lane) void {
+    const depth = channels_count * 3;
+    const float_row = float_scratch[0..depth];
+    const quantized_row = quantized_scratch[0..depth];
+    const positions_range = lane.range(output.len / weight.scales.len);
+    for (positions_range.start_index..positions_range.end_index) |position| {
+        const origin = @as(isize, @intCast(position * stride)) - 1;
+        for (0..channels_count) |channel| {
+            for (0..3) |kernel_index| {
+                const source = origin + @as(isize, @intCast(kernel_index));
+                float_row[channel * 3 + kernel_index] = if (source < 0 or source >= input_positions_count) 0 else input[if (channel_major) channel * input_positions_count + @as(usize, @intCast(source)) else @as(usize, @intCast(source)) * channels_count + channel];
+            }
+        }
+        const scale = linear.quantizeRow(float_row, quantized_row);
+        linear.forwardQuantizedOne(quantized_row, scale, weight, bias, .gelu, output[position * weight.scales.len ..][0..weight.scales.len]);
+    }
+}
+
+// ─── Opt-In Hot-Kernel Benchmarks ──────────────────────────────────────────
+//
+// VOICED_RUNTIME_KERNEL_BENCHMARK selects attention, vocabulary, or ffn.
+// Setup and model loading are outside the timed region. Repeated projections
+// reuse one matrix, so these checks supplement rather than replace corpus
+// timing, where decoder layers compete for cache capacity.
+
+const attention_module = @import("attention.zig");
+
+test "benchmarks encoder attention" {
+    const selected = std.testing.environ.getPosix("VOICED_RUNTIME_KERNEL_BENCHMARK") orelse {
+        return error.SkipZigTest;
+    };
+    if (!std.mem.eql(u8, selected, "attention")) {
+        return error.SkipZigTest;
+    }
+    const allocator = std.testing.allocator;
+    const positions_count = 1500;
+    const width = 768;
+    const storage = try allocator.alloc(f32, attention_module.encoderQueryKeyValueValuesCount(positions_count, width));
+    defer allocator.free(storage);
+    var random = std.Random.DefaultPrng.init(42);
+    for (storage) |*value| value.* = random.random().float(f32) * 4 - 2;
+    const output = try allocator.alloc(f32, positions_count * width);
+    defer allocator.free(output);
+    const scratch = try allocator.alloc(f32, attention_module.encoderScratchValuesCount(4));
+    defer allocator.free(scratch);
+    var executor: executor_module.Executor = undefined;
+    try executor.init(std.testing.io, 4);
+    defer executor.deinit();
+    var context: AttentionBenchmark = .{ .qkv = attention_module.encoderQueryKeyValue(storage, positions_count, width), .output = output, .scratch = scratch };
+    const start = std.Io.Clock.awake.now(std.testing.io);
+    executor.run(&context, runAttentionBenchmark);
+    const elapsed = start.durationTo(std.Io.Clock.awake.now(std.testing.io));
+    for (output) |value| try std.testing.expect(std.math.isFinite(value));
+    std.debug.print("\nattention: {d:.3} ms/iteration\n", .{@as(f64, @floatFromInt(elapsed.nanoseconds)) / std.time.ns_per_ms / 100});
+}
+
+const AttentionBenchmark = struct {
+    qkv: attention_module.EncoderQueryKeyValue,
+    output: []f32,
+    scratch: []f32,
+};
+
+fn runAttentionBenchmark(raw_context: *anyopaque, lane: executor_module.Lane) void {
+    const context: *AttentionBenchmark = @ptrCast(@alignCast(raw_context));
+    for (0..100) |_| {
+        attention_module.forwardEncoder(context.qkv, 1500, 768, 12, context.output, context.scratch, lane);
+        lane.sync();
+    }
+}
+
+test "benchmarks token projections" {
+    const selected = std.testing.environ.getPosix("VOICED_RUNTIME_KERNEL_BENCHMARK") orelse {
+        return error.SkipZigTest;
+    };
+    if (!std.mem.eql(u8, selected, "vocabulary") and !std.mem.eql(u8, selected, "ffn")) {
+        return error.SkipZigTest;
+    }
+    const allocator = std.testing.allocator;
+    const test_model = try selectedTestModel();
+    const model_directory = try modelsDirectory(allocator, test_model.installed_directory_name);
+    defer allocator.free(model_directory);
+    const model_path = try std.fs.path.join(allocator, &.{ model_directory, "model.bin" });
+    defer allocator.free(model_path);
+    const pristine = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, model_path, allocator, .limited(model_file_size_max));
+    defer allocator.free(pristine);
+    var model = try model_module.Model.fromPristineWeights(allocator, test_model.kind, pristine);
+    defer model.deinit();
+    const weights = model.inferenceWeights();
+    const weight = if (std.mem.eql(u8, selected, "vocabulary")) weights.decoder_embeddings_weight else weights.decoder_layers[0].ffn_contraction_weight;
+    const input = try allocator.alloc(u8, weight.input_values_count);
+    defer allocator.free(input);
+    var random = std.Random.DefaultPrng.init(42);
+    random.random().bytes(input);
+    const output = try allocator.alloc(f32, weight.scales.len);
+    defer allocator.free(output);
+    var executor: executor_module.Executor = undefined;
+    try executor.init(std.testing.io, 4);
+    defer executor.deinit();
+    var context: ProjectionBenchmark = .{ .input = input, .weight = weight, .output = output, .iterations_count = if (std.mem.eql(u8, selected, "vocabulary")) 5000 else 50_000 };
+    const start = std.Io.Clock.awake.now(std.testing.io);
+    executor.run(&context, runProjectionBenchmark);
+    const elapsed = start.durationTo(std.Io.Clock.awake.now(std.testing.io));
+    for (output) |value| try std.testing.expect(std.math.isFinite(value));
+    std.debug.print("\n{s}: {d:.6} ms/iteration\n", .{ selected, @as(f64, @floatFromInt(elapsed.nanoseconds)) / std.time.ns_per_ms / @as(f64, @floatFromInt(context.iterations_count)) });
+}
+
+const ProjectionBenchmark = struct {
+    input: []const u8,
+    weight: model_module.QuantizedWeight,
+    output: []f32,
+    iterations_count: usize,
+};
+
+fn runProjectionBenchmark(raw_context: *anyopaque, lane: executor_module.Lane) void {
+    const context: *ProjectionBenchmark = @ptrCast(@alignCast(raw_context));
+    for (0..context.iterations_count) |_| {
+        linear.forwardQuantizedOneParallel(context.input, 17.3, context.weight, &.{}, .none, context.output, lane);
+        lane.sync();
+    }
 }
 
 fn openAudioFixturesDirectory() !std.Io.Dir {

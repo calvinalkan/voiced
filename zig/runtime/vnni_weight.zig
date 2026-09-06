@@ -18,19 +18,17 @@ pub const activation_zero_point: i32 = 128;
 
 /// `QuantizedWeight` exposes one o8/k4-packed INT8 matrix and the scale and
 /// compensation values needed to recover its Float32 result. The views borrow
-/// one packed model image.
+/// one packed model image. The output row count is `scales.len`.
 pub const QuantizedWeight = struct {
     values: []const i8,
     scales: []const f32,
     compensation: []const i32,
-    output_rows_count: usize,
     input_values_count: usize,
 
     pub fn layout(weight: QuantizedWeight) Layout {
-        const weight_layout = Layout.init(weight.output_rows_count, weight.input_values_count);
+        const weight_layout = Layout.init(weight.scales.len, weight.input_values_count);
         assert(weight.values.len == weight_layout.valuesCount());
-        assert(weight.scales.len == weight.output_rows_count);
-        assert(weight.compensation.len == weight.output_rows_count);
+        assert(weight.compensation.len == weight.scales.len);
 
         return weight_layout;
     }

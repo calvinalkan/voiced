@@ -33,7 +33,7 @@ pub fn convertToPackedImage(allocator: Allocator, kind: ModelKind, weights: []co
         return error.InvalidPristineWeights;
     }
 
-    var reader: WeightsReader = .{ .bytes = weights };
+    var reader: WeightsReader = .{ .remaining = weights };
 
     const binary_version = try reader.readInt(u32);
     if (binary_version != binary_version_supported) {
@@ -117,7 +117,7 @@ pub fn convertToPackedImage(allocator: Allocator, kind: ModelKind, weights: []co
         return error.InvalidPristineWeights;
     }
 
-    if (reader.offset != weights.len) {
+    if (reader.remaining.len != 0) {
         return error.InvalidPristineWeights;
     }
 
@@ -132,8 +132,7 @@ pub fn convertToPackedImage(allocator: Allocator, kind: ModelKind, weights: []co
 // tensor throughout because a scalar is a rank-zero tensor.
 
 const WeightsReader = struct {
-    bytes: []const u8,
-    offset: usize = 0,
+    remaining: []const u8,
 
     fn readTensor(reader: *WeightsReader) ConvertError!Tensor {
         const name = try reader.readString();
@@ -204,13 +203,12 @@ const WeightsReader = struct {
     }
 
     fn readBytes(reader: *WeightsReader, size: usize) ConvertError![]const u8 {
-        assert(reader.offset <= reader.bytes.len);
-        if (size > reader.bytes.len - reader.offset) {
+        if (size > reader.remaining.len) {
             return error.InvalidPristineWeights;
         }
 
-        const bytes = reader.bytes[reader.offset..][0..size];
-        reader.offset += size;
+        const bytes = reader.remaining[0..size];
+        reader.remaining = reader.remaining[size..];
         return bytes;
     }
 };
@@ -430,13 +428,11 @@ fn convertTensor(reader: *WeightsReader, builder: *Builder, specification: Model
             }
         },
         .packed_section => |section_kind| {
-            const definition = packed_model_image.sectionDefinition(section_kind, specification);
-            if (tensor.data_type != .float16 or !tensor.hasDimensions(definition.dimensions.slice())) {
+            const section = builder.claimSection(section_kind, layer_index);
+            if (tensor.data_type != .float16 or !tensor.hasDimensions(section.definition.dimensions.slice())) {
                 return error.InvalidPristineWeights;
             }
 
-            const section = builder.claimSection(section_kind, layer_index);
-            assert(std.meta.eql(definition, section.definition));
             switch (section.definition.encoding) {
                 .float32_little_endian => try convertFloat16TensorToFloat32(tensor.data, section.payload),
                 .vnni_u8s8_o8_k4_with_float32_scales_and_int32_compensation => try quantizeVnniWeight(tensor.data, section.definition.dimensions, section.payload),
