@@ -1,31 +1,37 @@
 # Voiced Zig daemon
 
-The native executable contains the production daemon, its CLI client, and two
-private worker roles. There are no experimental commands, synthetic workers,
-WAV-output modes, or test-configuration flags.
+The native executable contains the daemon and its CLI client. One process owns
+three persistent threads: the supervisor, capture, and transcription coordinator.
+The resident runtime adds the configured inference pool while a model is loaded.
 
 ```text
 main.zig
-├── serve → supervisor.runService
+├── serve → supervisor.runService          main-thread epoll loop
 │            ├── control_socket.zig        public commands and status
-│            ├── audio_process.zig         isolated PipeWire worker
-│            │   ├── pipewire.zig          stream ownership and callbacks
-│            │   └── audio_exchange.zig    three shared Float32 slots
-│            ├── transcription_process.zig resident Whisper worker and mailbox
-│            │   ├── model_cache.zig
-│            │   └── ../runtime/root.zig
-│            ├── clipboard_wayland.zig     native Wayland clipboard and transfers
-│            └── paste_keyboard.zig        persistent native uinput keyboard
-└── listen / record / stop / cancel / status / kill → control socket
+│            ├── capture.zig               persistent capture thread
+│            │   ├── pipewire.zig          stream ownership and graph cycles
+│            │   └── audio_exchange.zig    three reusable Float32 slots
+│            ├── transcription.zig         persistent model coordinator thread
+│            │   ├── model_cache.zig       mapped weights
+│            │   └── ../runtime/root.zig   resident inference thread pool
+│            ├── worker.zig                typed job/result mailboxes and wakeups
+│            ├── clipboard.zig             Wayland/X11 clipboard selection
+│            │   ├── clipboard_wayland.zig native Wayland ownership and transfers
+│            │   └── clipboard_x11.zig     native X11 ownership and transfers
+│            └── paste_keyboard.zig        native uinput keyboard
+└── record / stop / cancel / status / kill → control socket
 ```
 
-`--internal-role` is the daemon's private re-execution mechanism, not a user
-command. The audio and model processes need separate lifetimes so the daemon
-can terminate blocked capture or inference without surrendering session state.
-The supervisor transfers their shared descriptors through `SCM_RIGHTS`. The
-capture process stays alive and maps its shared exchange once, opening and
-closing the microphone for each recording. Native clipboard I/O runs in the
-supervisor's existing epoll loop.
+Each worker has one fixed job/result mailbox and an eventfd wakeup. Completion
+releases its borrowed data before the supervisor submits another job. Capture
+has a separate atomic stop command; transcription checks cancellation collectively
+between encoder layers and decoder steps. Capture alone requests realtime
+scheduling. Native clipboard and notification I/O remain on the main event loop.
+
+No internal exec roles, launch packets, descriptor handoff, child processes,
+or pidfds are needed. A worker crash or overdue cancellation exits the entire
+daemon; `Restart=on-failure` restarts it. An in-progress recording may be lost.
+The supervisor never frees or reuses storage while a worker might still access it.
 
 ## Build and install models
 
@@ -46,7 +52,7 @@ zig build
 ```
 
 Setup atomically installs the pinned Systran `base.en` and `small.en` checkpoints.
-It verifies `model.bin` and `vocabulary.txt` against their sizes and SHA-256 pins,
+It verifies `model.bin` and `vocabulary.txt` against their sizes and BLAKE3-256 pins,
 reusing valid installed payloads. `zig build setup` is an alias for model setup;
 ordinary builds neither download models nor run inference.
 
@@ -62,35 +68,44 @@ ReleaseSafe production policy. Debug, ReleaseSafe, and ReleaseFast continue to
 apply their selected mode to both application and inference code.
 
 ```bash
-zig build -Doptimize=ReleaseSmall
-strip --strip-all -o zig-out/bin/voiced-stripped zig-out/bin/voiced
+zig build -Doptimize=ReleaseSmall -Dstrip=true
 ```
 
-The build retains debug data, and `-Dcrash-diagnostics=true` (the default) keeps
-in-process panic stack tracing and Zig's mode-dependent fault handler. Keep the
-unstripped binary for offline symbolization; the separate stripped copy retains
-stack-trace machinery, not the removed debug data.
+`-Dstrip=true` asks Zig to omit debug information and symbols from `voiced` at
+link time. Omit it to retain an unstripped executable for debugging. One build
+invocation emits the selected form; use separate prefixes when both forms are
+required. `-Dcrash-diagnostics=true` (the default) independently keeps in-process
+panic stack tracing and Zig's mode-dependent fault handler.
 
 To remove in-process symbolization without disabling ReleaseSafe checks:
 
 ```bash
-zig build -Doptimize=ReleaseSafe -Dcrash-diagnostics=false
-strip --strip-all -o zig-out/bin/voiced-stripped zig-out/bin/voiced
+zig build -Doptimize=ReleaseSafe -Dcrash-diagnostics=false -Dstrip=true
 ```
+
+The matching size gate checks Zig's natively stripped static PIE and fails unless
+it remains strictly below 1 MiB:
+
+```bash
+zig build size-check -Doptimize=ReleaseSafe -Dcrash-diagnostics=false -Dstrip=true
+```
+
+The step rejects other optimization, crash-diagnostic, stripping, and PIE
+settings so a passing result always represents the documented profile.
 
 This daemon-only option is independent of stripping and optimization mode. Normal
 CLI output and operational logs remain unchanged. Panics print a best-effort
 message to stderr and abort with SIGABRT; memory faults use the OS signal handling
 instead of Zig's rich fault handler. Neither path prints an in-process stack
-trace. Unwind information and the unstripped debug executable remain available
-for external debugging.
+trace. Omit `-Dstrip=true` when external debug information is required; Zig's
+native link-time stripping does not emit a separate debug companion.
 
 Before deploying this mode, verify core collection for the actual service; an
 abort does not guarantee a saved core. Ubuntu may use Apport rather than
-systemd-coredump. Retain the exact matching unstripped executable and libraries
-for `gdb /path/to/voiced-debug /path/to/core`. Cores can contain audio, transcripts,
-and other process memory: restrict access and retention. The build does not
-change the host's collector configuration.
+systemd-coredump. Deploy the unstripped form when source-level core analysis is
+required. Cores can contain audio, transcripts, and other process memory:
+restrict access and retention. The build does not change the host's collector
+configuration.
 
 The `Binary Size Optimizations` section in `src/main.zig` owns the daemon's Zig
 root configuration. Unused `std.Io` networking is disabled in every build mode.
@@ -107,7 +122,6 @@ export VOICED_INSTANCE=test
 # In another terminal with the same VOICED_INSTANCE:
 ./zig-out/bin/voiced record -t
 ./zig-out/bin/voiced stop
-./zig-out/bin/voiced listen
 ./zig-out/bin/voiced status
 ./zig-out/bin/voiced cancel
 ./zig-out/bin/voiced kill
@@ -201,7 +215,7 @@ bundle at `$XDG_STATE_HOME/voiced/last-failed/` (default
   phase timings, model revision/checksums, compiler/build mode, threads, padding,
   prompt, suppression lists, and token limit.
 
-Metadata text format version 2 uses one `key=value` line per field, with dotted
+Metadata text format version 3 uses one `key=value` line per field, with dotted
 keys such as `evidence.decoder_ns`. Integers are decimal, booleans `true`/`false`,
 float evidence retains non-finite values, and token lists use spaces. String
 values have no surrounding quotes and are not trimmed. Backslash, double quote,
@@ -212,10 +226,10 @@ first `=`; equals signs and leading/trailing spaces in values are literal.
 distinguish unknown decoder evidence from actual zero values. Files end with a
 newline, and the offline text reader bounds each metadata/token file to 1 MiB.
 
-The replay script reads both this format and legacy version-1 JSON captures.
-Replacing a legacy capture removes the old JSON filenames too. Only the separate
-offline replay executable and comparison script emit JSON result reports; the
-daemon needs no JSON serializer or parser.
+All fingerprints use BLAKE3-256, including `source_blake3` and
+`packed_image_blake3`. Only the current capture format is supported. The separate
+offline replay executable and comparison script emit JSON result reports;
+failed-capture publication uses text.
 
 Directories are mode `0700`, files `0600`. Each failed attempt atomically replaces
 the previous complete bundle. An interrupted save can leave one additional
@@ -226,11 +240,13 @@ the chunk, audio duration, token count/limit, actual encoder positions,
 no-speech/average log probabilities, and separate phase timings when available.
 Unknown decoding evidence is explicitly marked unavailable in the saved metadata.
 
-The existing model worker writes the capture after reporting its error, borrowing
-its sealed audio and decoder buffers. Paths are resolved once at initialization;
+The transcription thread writes the diagnostic capture while borrowing its
+sealed audio and decoder buffers, then returns the result and original error.
+It journals the original diagnostic before disk work so a stalled save cannot
+hide the cause. Paths are resolved once at initialization;
 successful inference adds no disk work or per-chunk allocation. Diagnostic saving
 is best effort under the existing worker deadline: filesystem problems are logged
-independently, and a killed/crashed worker cannot produce this bundle. These are
+independently, and a daemon that exits during saving cannot complete this bundle. These are
 runtime/feature/text-conversion errors, not normally completed results rejected
 by the supervisor's speech-confidence policy. A missing model has no decoded
 chunk to capture. Saving never updates the accepted transcript or clipboard.
@@ -240,7 +256,7 @@ has no Python dependency. Set up these comparison tools from the repository root
 
 ```bash
 python3 -m venv .venv
-.venv/bin/python -m pip install numpy ctranslate2 faster-whisper
+.venv/bin/python -m pip install numpy ctranslate2 faster-whisper blake3
 ```
 
 Build and replay against already installed models (the replay downloads none):
@@ -264,7 +280,6 @@ Use an explicit capture path as the positional argument, or compare a fixture:
 
 ```bash
 .venv/bin/python zig/scripts/replay-transcription.py --audio test-fixtures/hello_world.wav
-VOICED_INSTANCE=test agent-run './test.sh --zig-replay'
 ```
 
 For a diagnostic run that does not copy or press keys:
@@ -297,14 +312,15 @@ capture and retains its valid published prefix for transcription.
 
 Capture requests realtime processing. Missing scheduler promotion or memory
 locking does not invalidate capture; deadlines still contain an unresponsive
-worker. The shared exchange is touched before capture and locked when permitted.
+worker. The shared exchange is touched once before threads start and locked
+when capture begins, when permitted.
 
 ## Lifecycle and output
 
 The supervisor is the only owner of session transitions, absolute deadlines,
-worker replacement, slot release, and final transcript acceptance. It processes
-one complete epoll batch before starting replacement workers, so old readiness
-notifications cannot affect a newly reused descriptor.
+slot release, and final transcript acceptance. Workers publish typed completion
+before the main loop can reuse their audio or text. Coalesced wakeups carry no
+independent ownership state.
 
 Commands use one fixed binary request/reply over a Unix `SOCK_SEQPACKET`
 connection at `$XDG_RUNTIME_DIR/voiced/control.sock`, or
@@ -312,7 +328,7 @@ connection at `$XDG_RUNTIME_DIR/voiced/control.sock`, or
 `0700`, the socket `0600`. The server allows 16 clients with a one-second
 connection deadline; the CLI has three-second socket I/O timeouts.
 
-Successful `listen`, `record`, `stop`, `cancel`, and `kill` commands are silent.
+Successful `record`, `stop`, `cancel`, and `kill` commands are silent.
 `status` prints one text line to stdout, for example:
 
 ```text
@@ -320,7 +336,7 @@ phase=idle model=warm session_id=3 model_keep_warm_seconds=300
 ```
 
 Status exposes `idle`, `capturing`, `stopping`, `transcribing`, or `delivering`,
-plus whether the model is absent, loading, warm, restarting, or unloading.
+plus whether the model is absent, loading, warm, or unloading.
 Toggles during stopping, transcription, or delivery are ignored and still exit
 successfully. Errors go to stderr with a nonzero exit code. An acknowledgement
 means the supervisor handled the command, not that recording, transcription,
@@ -340,7 +356,7 @@ use `MSG_TRUNC` to reject oversized records with apparently valid prefixes.
 | --- | --- | --- |
 | 0 | 4 | ASCII `VCDQ` |
 | 4 | 2 | Version: 1 |
-| 6 | 1 | Command: listen=1, record=2, stop=3, cancel=4, status=5, kill=6 |
+| 6 | 1 | Command: record=2, stop=3, cancel=4, status=5, kill=6; other values invalid |
 | 7 | 1 | Flags: bit 0 is toggle, valid only for record; other bits zero |
 
 | Reply offset | Bytes | Field |
@@ -352,7 +368,7 @@ use `MSG_TRUNC` to reject oversized records with apparently valid prefixes.
 | 8 | 8 | Session ID |
 | 16 | 8 | Model keep-warm seconds |
 | 24 | 1 | Phase: idle=1, capturing=2, stopping=3, transcribing=4, delivering=5 |
-| 25 | 1 | Model: absent=1, restarting=2, loading=3, warm=4, unloading=5 |
+| 25 | 1 | Model: absent=1, legacy restarting=2, loading=3, warm=4, unloading=5 |
 | 26 | 6 | Reserved: zero |
 
 Requests are 8 bytes; all replies are 32 bytes. Accepted and ignored replies carry
@@ -370,18 +386,22 @@ their own text format, independent of this control protocol.
 
 ### Recording and delivery
 
-The complete model process remains resident across successful recordings until
-its idle deadline. A retained worker owns weights, vocabulary, CPU threads,
-activation workspace, and decoder caches. Readiness follows initialization;
-there is no dummy inference. Cancellation discards the session and releases its
-model process. Normal shutdown stops and reaps workers before removing the
-control socket.
+The model runtime remains resident across successful recordings until its idle
+deadline. It owns mapped weights, vocabulary, compute threads, activation
+workspace, and decoder caches. Readiness follows initialization. Cancellation
+discards the session and unloads the runtime after inference acknowledges its
+stop. Unloading joins the compute pool before freeing its borrowed storage;
+the coordinator thread remains available. Normal service shutdown stops and
+joins both persistent threads before removing the control socket.
 
-Accepted nonempty text is borrowed directly by the native Wayland client.
-Selection publication has a two-second deadline. Data-control protocols are
-preferred; the core data-device fallback temporarily maps a transparent surface
-and waits for its destruction to reach the compositor before reporting
-acquisition. The connection and its transparent pixel buffer are reused.
+Accepted nonempty text is borrowed directly by the selected native clipboard
+client. Wayland is preferred when `WAYLAND_DISPLAY` is present; otherwise screen
+zero of a local X11 `DISPLAY` in `:N`, `:N.0`, `unix:N`, or `unix:N.0` form is
+used. Selection publication has a two-second deadline. On
+Wayland, data-control protocols are preferred; the core data-device fallback
+temporarily maps a transparent surface and waits for its destruction to reach
+the compositor before reporting acquisition. The connection and its transparent
+pixel buffer are reused.
 
 After acquisition, the supervisor waits `paste_settle_ms` (default 10 ms) and
 sends the configured chord through native Linux input events, with
@@ -413,15 +433,16 @@ no-speech results emit no transcription. A capture failure can still deliver a
 successfully transcribed valid prefix while reporting the capture error.
 
 Output adds no C bindings, clipboard helper process, input helper daemon, or
-service thread. Wayland clipboard, PipeWire capture, desktop notifications and
-journal logging are implemented directly in Zig. Desktop services and permission
-to use uinput are still required. Repository-level systemd installation remains
-separate work.
+service thread. Wayland and X11 clipboard protocols, PipeWire capture, desktop
+notifications and journal logging are implemented directly in Zig. Desktop
+services and permission to use uinput are still required. Repository-level
+systemd installation remains separate work.
 
 ## Native clipboard verification
 
-The optional `clipboard-check` target exercises the same native Wayland client
-used by `serve`. The service does not invoke wl-copy.
+The optional `clipboard-check` target exercises the same selected native
+clipboard backend used by `serve`. The service does not invoke `wl-copy`,
+`xclip`, or `xsel`.
 
 ```bash
 cd zig
@@ -429,27 +450,37 @@ zig build clipboard-check
 ./scripts/verify-clipboard.py
 ```
 
-The verifier opens a dedicated GTK text window and checks three copies/pastes,
-focus restoration, and restoration of the previous plain-text clipboard. It
+The bundled desktop verifier uses the Wayland path. It opens a dedicated GTK
+text window and checks three copies/pastes, focus restoration, and restoration
+of the previous plain-text clipboard. It
 writes `native.log` and `report.json` under a private `/tmp/voiced-native-clipboard-*`
 directory. Keep the window focused and release modifier keys. A clipboard with
 non-text formats is left unchanged; copy plain text before testing. The verifier
 uses Python/GTK and stock wl-clipboard for backup/restoration only. Use
 `--clipboard-only` to exercise GTK paste without opening uinput, and `--fallback`
 to force the temporary-surface path on a compositor with data-control support.
+The bounded X11 transport checks run without a desktop using
+`zig test src/x11_wire.zig -OReleaseSafe`; host X11 acceptance still requires a
+manual clipboard read from an Xorg session or through XWayland.
 
-`src/clipboard_wayland.zig` owns discovery, text generations and transfers;
-`src/wayland_wire.zig` handles the native socket and descriptor transport. The
-client prefers ext-data-control, then wlr-data-control, then core data-device
-with an xdg-shell surface and GNOME's GTK surface extension when available. It
-uses no C bindings, dynamic libraries, worker processes or extra threads.
-Text remains borrowed while offered or being transferred. Two generations and
-eight transfers bound retention; each stalled transfer expires after two seconds.
-The connection reserves 64 KiB for incoming frames and 4 KiB for outgoing
-requests. Phase-specific deadlines, pending publications and fallback surfaces
-live in a tagged union; completed phases retain none of their temporary state.
+`src/clipboard.zig` selects one backend for the session. On Wayland,
+`src/clipboard_wayland.zig` owns discovery, text generations and transfers while
+`src/wayland_wire.zig` handles the native socket and descriptor transport. It
+prefers ext-data-control, then wlr-data-control, then core data-device with an
+xdg-shell surface and GNOME's GTK surface extension when available. The
+connection reserves 64 KiB for incoming frames and 4 KiB for outgoing requests.
 Acquisition waits for the fallback surface's destruction to reach the compositor,
 but cannot guarantee the eventual focus target of a globally injected shortcut.
+
+On X11, `src/clipboard_x11.zig` owns a hidden InputOnly selection window and
+`src/x11_wire.zig` handles the local Unix socket, bounded `.Xauthority` parsing,
+and MIT-MAGIC-COOKIE-1 setup. It serves `TARGETS`, `TIMESTAMP`, `UTF8_STRING`,
+`TEXT`, UTF-8 plain-text aliases, and bounded `INCR` streams. `MULTIPLE`, legacy
+`STRING`, nonzero screens, remote TCP displays, and other `DISPLAY` transports
+are intentionally unsupported. Both backends use no C bindings, dynamic
+libraries, worker processes or extra threads. Text remains
+borrowed while offered or being transferred; two generations and eight transfers
+bound retention, and stalled transfers expire after two seconds.
 
 ## Desktop notifications
 
@@ -474,19 +505,18 @@ unrelated popup after a server restart. Failures retain protocol error names and
 messages or the transport error, phase, and native errno in logs. These failures
 do not stop recording or delivery.
 
-Run the checks without contacting the desktop:
+Run the checks without contacting the desktop. The Python verifier requires
+`blake3` in the optional environment above to fingerprint its executable:
 
 ```bash
 cd zig
 zig build notification-check
-agent-run 'zig test src/dbus_tests.zig -OReleaseSafe' 'python3 scripts/verify-notifications.py --self-test'
+agent-run 'zig test src/dbus_tests.zig -OReleaseSafe' '../.venv/bin/python scripts/verify-notifications.py --self-test'
 cd ..
-# From the repository root: real private D-Bus + GIO notification server.
-VOICED_INSTANCE=test agent-run './test.sh --zig-output'
 ```
 
-For visual verification, run `zig/scripts/verify-notifications.py` from your
-desktop terminal. It uses the optional `voiced-notification-check` executable to
+For visual verification, run `.venv/bin/python zig/scripts/verify-notifications.py`
+from your desktop terminal. It uses the optional `voiced-notification-check` executable to
 show two synthetic errors, replace the first with the second, and close the
 popup. It never records audio or changes the clipboard, configuration, or running
 service. A private directory under `/tmp/voiced-native-notifications-*` retains
@@ -532,13 +562,11 @@ events skip formatting, and expensive argument preparation must be guarded with
 A full or unavailable journal drops the event without blocking or falling back
 to stderr. `VOICED_DROPPED` on the next successfully submitted event counts local
 submission losses; it does not claim that journald persisted an accepted event.
-The socket is close-on-exec and each worker opens its own. Path-based sends allow
+All threads share the one nonblocking journal socket initialized at startup. Path-based sends allow
 subsequent messages to reach journald after it restarts without reconnect state.
 
-`./test.sh --zig-logging` tests native fields, multiline framing, truncation,
-early filtering, a deliberately full receiver, recovery loss counts, and public
-config/CLI behavior. Service integration tests supply a private datagram stderr
-socket, which the logger duplicates; neither test path writes to the host journal.
+For isolated service verification, supply a private datagram stderr socket,
+which the logger duplicates instead of writing to the host journal.
 
 ## Desktop error notifications
 
@@ -550,7 +578,7 @@ connection; `transcript_output=stdout` always disables it.
 
 Each service owns its `Error` tagged union and returns `Result { ok, err }`
 (`Result(T)` for operations with different success values). Capture errors retain
-valid audio and the complete native report, including a separate teardown error.
+valid audio and the complete native report, including the exact failed stage and cause.
 Transcription reports preserve the stage and exact Zig error name. Paste errors
 include the syscall errno, ioctl request/argument or chord/frame progress. Save
 errors retain the failing operation, write progress, and any temporary-file
@@ -563,8 +591,10 @@ full diagnostics before retaining only the notification category and delivery
 outcome. Mic ambiguity logs include the match count and candidate sources; use
 `microphone_node` **instead of** `microphone_serial` to select one input.
 
-Clipboard diagnostics retain typed transport and protocol errors, native errno,
-and the compositor's error object, code and message. Capture's bounded
+Clipboard diagnostics retain the selected backend, typed transport/protocol
+errors, and native errno. Wayland reports compositor objects, codes and messages;
+X11 reports authority/setup failures, response sequences, server opcodes and bad
+values. Capture's bounded
 source-list presentation can omit entries; the
 worker journals the complete observed candidate catalog on selection errors.
 For the full cause and affected recording, run:
@@ -590,12 +620,6 @@ session bus disables notifications until voiced restarts; a notification server
 can appear or restart on a live bus without restarting voiced. Shutdown attempts
 to close a known popup without waiting or flushing the bus. A timed-out Notify
 whose reply never arrives has no usable ID; its popup follows desktop expiration.
-
-`./test.sh --zig-output` tests the native client against a private D-Bus server
-(requires `dbus-daemon` and `/usr/bin/python3` with PyGObject/Gio). Setting
-`VOICED_ZIG_MODEL_TESTS=1` also checks notifications from real transcription,
-failed clipboard delivery, recovery, cancellation, and failed saving. These tests
-use private state and cannot notify your desktop.
 
 ## Recording metrics
 
@@ -627,11 +651,10 @@ in their names; byte quantities use `size` without another byte suffix:
 
 Recording computation totals include consumed no-speech chunks. They exclude
 model preparation, queueing, failed attempts, text assembly, and desktop delivery;
-they are neither end-to-end latency nor total computation including retries.
+they are not end-to-end latency.
 Capture-end audio duration covers all captured samples, which can exceed the
-processed prefix after a failure. A recovered mailbox may lack timings; its
-chunk and recording computation totals/speed then say `unavailable`. A speed
-with zero audio or computation duration is also `unavailable`. Discarded
+processed prefix after a failure. A speed with zero audio or computation
+duration is `unavailable`. Discarded
 recordings have `transcript_size=0`. Transcript contents are never diagnostics.
 
 Durations measure one named operation; elapsed fields measure from a named
@@ -657,15 +680,15 @@ reused after clipboard acquisition. No callback or per-token timers were added.
 With `recording_stop_origin=command`, the stop reference is the supervisor
 receiving the accepted stop/toggle command. Repeated stops do not reset it.
 With `recording_stop_origin=capture_end`, it is the supervisor observing the
-capture worker's final report, excluding its earlier stop decision and teardown.
+capture thread's final report; work before that observation is outside the elapsed
+measurement.
 Without either reference, origin and elapsed are `unavailable`. These timings
 exclude keybinding/CLI startup and application rendering after the paste shortcut.
 Each new recording resets the reference.
 
-Expected worker shutdowns are `debug`; unexpected exits are `error`, with
-`exit_code` or `signal` and `core_dumped`. An unexpected zero exit is still an
-error when work remained. Requested cancellation is `info`. Retrying a chunk is
-`warn` and names the recording, chunk, reason and attempt. No-speech evidence is
+Requested cancellation is `info`. Service errors retain their typed diagnostics
+at `error`; a missed cancellation or unload deadline is `critical` and exits the
+daemon. Thread crashes follow the configured panic/core-dump behavior. No-speech evidence is
 included in the chunk event instead of a duplicate rejection event.
 
 Expected startup refusals such as an already running instance are `error`.
@@ -706,18 +729,15 @@ server release and are retained in diagnostics. Source removal or identity
 change ends that recording; a new recording resolves the configured source
 again. Capture connects to `PIPEWIRE_REMOTE` (default `pipewire-0`) under
 `PIPEWIRE_RUNTIME_DIR`, falling back to `XDG_RUNTIME_DIR`. An absolute remote
-path is accepted. These environment values are resolved once per worker.
+path is accepted. These environment values are resolved once at service startup.
 
 `audio_policy.zig` owns the recording policy:
 
 - Physical slot capacity and forced boundary: 30 seconds.
 - Natural boundary: at least 20 seconds of audio, followed by 300 ms quiet.
-- Automatic listening stop: observed activity followed by 800 ms quiet.
 - Initial background calibration: 300 ms.
 
-Chunks are independent, without PCM overlap or previous-text prompting. If a
-natural boundary has already published the utterance, automatic stop abandons
-the private quiet confirmation tail instead of creating another silence chunk.
+Chunks are independent, without PCM overlap or previous-text prompting.
 Outside capacity-stop cases, activity and model confidence suppress normal
 no-speech results; disagreement is an explicit failure.
 
@@ -735,28 +755,31 @@ A notification distinguishes recording size, chunk size, and decoder token
 limits. Decoder-limit text is retained even when confidence is low: it may repeat
 or contain inaccuracies, so the notification asks you to check it. Both chunk
 limits are reported if reached together. Chunk/token limits still attempt the
-`last-failed/` diagnostic capture. A committed prefix remains recoverable if that
-save stalls or the worker exits. Explicit cancellation suppresses pending output
+`last-failed/` diagnostic capture before returning the prefix. A fatal restart
+during inference or diagnostic saving can lose the current recording. Explicit cancellation suppresses pending output
 and preserves the previous saved transcript. Start a new recording to continue;
 unprocessed audio after the cutoff is not resumed automatically.
 
 The supervisor requires the first callback within three seconds and progress
 at least every two seconds. Each inference has a ten-second deadline; model
-startup has fifteen seconds. Stop, cancellation, worker report/exit, and forced
-termination have separate bounded states. A committed mailbox result survives
-worker death; uncommitted work receives one retry. The audio owner alone closes
-its PipeWire stream. The parent uses pidfds and parent-death signaling to
-contain workers it cannot shut down cooperatively.
+startup has fifteen seconds. Stop, cancellation, model unload, and final thread
+shutdown each have a one-second acknowledgement deadline. Capture alone closes
+its PipeWire stream. A missed stop/unload deadline exits the whole daemon before
+cleanup can invalidate a worker borrow; systemd restarts the service. The current
+recording is not retried across a fatal restart.
 
 ## Model cache and runtime
 
 The worker verifies installed weights, converts them once, and atomically
 publishes a packed image under `$XDG_CACHE_HOME/voiced/models/`. Cache identity
 includes the model, pristine checksum, packing revision, and image format.
-BLAKE3-256 protects the cached payload. Private permissions, a builder lock,
+Cache envelope version 2 uses BLAKE3-256 for both the pinned source identity and
+the cached payload. Older cache entries are ignored and rebuilt from verified
+installed weights; existing model downloads remain usable. Private permissions, a builder lock,
 atomic replacement, and file/directory synchronization prevent partial cache
 publication. Unavailable caches fall back to verified pristine conversion;
-invalid pristine data fails explicitly.
+invalid pristine data fails explicitly. Preparation cancellation is checked
+between loading stages and while waiting for the builder lock.
 
 The caller supplies an address-stable runtime and its tensor arena:
 
@@ -769,16 +792,16 @@ defer runtime.deinit();
 Do not copy or move the runtime until `deinit` joins its workers. The caller
 then releases the arena and any heap storage used for the runtime itself.
 Transcription allocates nothing and returns untrimmed text in the supplied
-buffer. The supervisor trims only the assembled final transcript.
+buffer. The supervisor trims only the assembled final transcript. Model reloads
+allocate and release weights, vocabulary, and runtime storage; the service
+mailboxes and audio/transcript buffers are reused. Zig 0.16.0 uses its debug
+allocator in libc-free ReleaseSafe builds, so freed small allocations can
+retain bucket pages between reloads without retaining a loaded model.
 
 [The runtime guide](runtime/README.md) explains the native Whisper implementation.
 
-With `VOICED_INSTANCE=test`, run `./test.sh --zig-control` from the repository
-root for control checks, and `./test.sh --zig-logging` for the journal transport.
-Run `./test.sh --zig-output` for notifications, keyboard error handling,
-configuration, and private Wayland clipboard replacement/transfer checks. Set
-`VOICED_ZIG_MODEL_TESTS=1` to also exercise fixture audio through a private
-PipeWire graph, transcription, clipboard delivery, saved output, capture-worker
-reuse/recovery, and cancellation. These checks do not access your desktop or
-microphone. The desktop verifier above checks the native client against your
-compositor without restarting the installed service.
+The process-level integration harness was removed. Its control, logging,
+notification, capture, delivery, recovery, and cancellation scenarios remain in
+Git history for future porting. The standalone notification verifier above and
+runtime corpus checks remain available. Always use `VOICED_INSTANCE=test` and
+private runtime/state paths for automated service checks.

@@ -2,7 +2,7 @@
 //! a/b publish, s reports ownership/transfer state, p sends one optional paste,
 //! q exits. The caller drives this over pipes; stdout is a JSON event stream.
 const std = @import("std");
-const clipboard = @import("clipboard_wayland.zig");
+const clipboard = @import("clipboard.zig");
 const paste = @import("paste_keyboard.zig");
 const logging = @import("logging.zig");
 const linux = std.os.linux;
@@ -39,7 +39,13 @@ pub fn main(init: std.process.Init) !void {
     // Exercise initialization independently of zero-filled or previously used storage.
     @memset(std.mem.asBytes(&client), 0xa5);
     defer client.deinit();
-    switch (client.init(epoll_fd, 1, .{ .runtime_directory = init.environ_map.get("XDG_RUNTIME_DIR"), .display = init.environ_map.get("WAYLAND_DISPLAY") }, fallback, now())) {
+    switch (client.init(epoll_fd, 1, .{
+        .runtime_directory = init.environ_map.get("XDG_RUNTIME_DIR"),
+        .wayland_display = init.environ_map.get("WAYLAND_DISPLAY"),
+        .display = init.environ_map.get("DISPLAY"),
+        .xauthority = init.environ_map.get("XAUTHORITY"),
+        .home = init.environ_map.get("HOME"),
+    }, fallback, now())) {
         .ok => {},
         .err => |err| {
             reportError(err);
@@ -100,7 +106,7 @@ pub fn main(init: std.process.Init) !void {
                 },
                 's' => emit("{{\"event\":\"status\",\"owns_a\":{},\"owns_b\":{},\"borrowed_a\":{},\"borrowed_b\":{},\"completed\":{d},\"expired\":{d},\"rejected\":{d}}}\n", .{ client.owns(1), client.owns(2), client.isBorrowed(1), client.isBorrowed(2), client.transfers_completed, client.transfers_expired, client.transfers_rejected }),
                 'p' => if (keyboard) |*k| {
-                    if (k.pending != null or now() < k.usable_after_ns or client.phase != .ready) return error.PasteNotReady;
+                    if (k.pending != null or now() < k.usable_after_ns or !client.ready()) return error.PasteNotReady;
                     k.beginPaste(.@"ctrl+v", 4, now());
                 } else return error.PasteDisabled,
                 'q' => return,
@@ -116,10 +122,19 @@ fn now() u64 {
 }
 fn reportError(err: clipboard.Error) void {
     switch (err) {
-        .server => |detail| logging.scoped(.clipboard).err(.{}, "Wayland error: object={d}, code={d}, message={s}, truncated={}", .{ detail.object, detail.code, detail.message[0..detail.message_size], detail.truncated }),
+        .wayland => |detail| switch (detail) {
+            .server => |server| logging.scoped(.clipboard).err(.{}, "Wayland error: object={d}, code={d}, message={s}, truncated={}", .{ server.object, server.code, server.message[0..server.message_size], server.truncated }),
+            else => logging.scoped(.clipboard).err(.{}, "Wayland clipboard error: detail={any}", .{detail}),
+        },
+        .x11 => |detail| logging.scoped(.clipboard).err(.{}, "X11 clipboard error: detail={any}", .{detail}),
         else => logging.scoped(.clipboard).err(.{}, "Native clipboard error: detail={any}", .{err}),
     }
-    emit("{{\"event\":\"error\",\"kind\":\"{t}\"}}\n", .{std.meta.activeTag(err)});
+    const kind = switch (err) {
+        .wayland => |detail| @tagName(std.meta.activeTag(detail)),
+        .x11 => |detail| @tagName(std.meta.activeTag(detail)),
+        else => @tagName(std.meta.activeTag(err)),
+    };
+    emit("{{\"event\":\"error\",\"kind\":\"{s}\"}}\n", .{kind});
 }
 fn emit(comptime format: []const u8, args: anytype) void {
     var buffer: [1024]u8 = undefined;

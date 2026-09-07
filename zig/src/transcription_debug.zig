@@ -8,11 +8,11 @@ const builtin = @import("builtin");
 const inference = @import("inference");
 const linux = std.os.linux;
 
-/// Fixed diagnostic evidence shared with the supervisor. Availability flags
+/// Fixed diagnostic evidence shared with the supervisor. Availability fields
 /// distinguish an unknown decoder result from a real zero probability/count.
-pub const Evidence = extern struct {
-    chunk_available: u32 = 0,
-    decoding_available: u32 = 0,
+pub const Evidence = struct {
+    chunk_available: bool = false,
+    decoding_available: bool = false,
     chunk: u32 = 0,
     samples: u32 = 0,
     tokens: u32 = 0,
@@ -20,7 +20,6 @@ pub const Evidence = extern struct {
     encoder_positions: u32 = 0,
     no_speech_probability: f32 = 0,
     average_log_probability: f32 = 0,
-    reserved: u32 = 0,
     log_mel_ns: u64 = 0,
     encoder_ns: u64 = 0,
     cross_key_values_ns: u64 = 0,
@@ -32,7 +31,7 @@ pub const Evidence = extern struct {
         self.cross_key_values_ns = timings.cross_key_values_ns;
         self.decoder_ns = timings.decoder_ns;
         if (decoded) |value| {
-            self.decoding_available = 1;
+            self.decoding_available = true;
             self.tokens = @intCast(value.generated_tokens_count);
             self.encoder_positions = @intCast(value.encoder_positions_count);
             self.no_speech_probability = value.no_speech_probability;
@@ -42,7 +41,7 @@ pub const Evidence = extern struct {
 };
 
 pub const Metadata = struct {
-    format_version: u32 = 2,
+    format_version: u32 = 3,
     session_id: u64,
     captured_unix_seconds: i64,
     stage: []const u8,
@@ -51,8 +50,8 @@ pub const Metadata = struct {
     contains_activity: bool,
     model: []const u8,
     model_revision: []const u8,
-    source_sha256: []const u8,
-    packed_image_sha256: [64]u8,
+    source_blake3: []const u8,
+    packed_image_blake3: [64]u8,
     packed_image_format_version: u32 = inference.packed_model_image_format_version,
     packed_model_cache_version: u32 = inference.packed_model_cache_version,
     zig_version: []const u8 = builtin.zig_version_string,
@@ -139,7 +138,7 @@ pub fn save(io: std.Io, directory_path: []const u8, samples: []const f32, text: 
 
 pub fn imageDigest(model: *const inference.Model) [64]u8 {
     var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(model.packedImage(), &digest, .{});
+    std.crypto.hash.Blake3.hash(model.packedImage(), &digest, .{});
     return std.fmt.bytesToHex(digest, .lower);
 }
 
@@ -157,8 +156,7 @@ fn openPrivate(io: std.Io, parent: std.Io.Dir, path: []const u8) union(enum) { o
 }
 
 fn clearFiles(io: std.Io, dir: std.Io.Dir) !void {
-    // Also remove v1 names when replacing a JSON generation or reusing staging.
-    for ([_][]const u8{ "audio.wav", "generated.txt", "tokens.txt", "metadata.txt", "tokens.json", "metadata.json" }) |name| {
+    for ([_][]const u8{ "audio.wav", "generated.txt", "tokens.txt", "metadata.txt" }) |name| {
         dir.deleteFile(io, name) catch |err| if (err != error.FileNotFound) return err;
     }
 }
@@ -202,7 +200,7 @@ fn writeTokens(io: std.Io, dir: std.Io.Dir, tokens: []const inference.Token) !vo
 // end_available distinguishes null from an empty end string. Keep the schema in
 // sync with read_metadata in scripts/replay-transcription.py.
 fn writeMetadata(io: std.Io, dir: std.Io.Dir, metadata: Metadata) !void {
-    std.debug.assert(metadata.format_version == 2);
+    std.debug.assert(metadata.format_version == 3);
     const file = try dir.createFile(io, "metadata.txt", .{ .exclusive = true, .permissions = .fromMode(0o600) });
     defer file.close(io);
     var buffer: [4096]u8 = undefined;
@@ -218,26 +216,26 @@ fn writeMetadata(io: std.Io, dir: std.Io.Dir, metadata: Metadata) !void {
             "evidence.cross_key_values_ns={d}\nevidence.decoder_ns={d}\n",
         .{
             metadata.format_version,                                     metadata.session_id,                                           metadata.captured_unix_seconds,
-            std.zig.fmtString(metadata.stage),                           std.zig.fmtString(metadata.error_name),                        evidence.chunk_available,
-            evidence.decoding_available,                                 evidence.chunk,                                                evidence.samples,
+            std.zig.fmtString(metadata.stage),                           std.zig.fmtString(metadata.error_name),                        @intFromBool(evidence.chunk_available),
+            @intFromBool(evidence.decoding_available),                   evidence.chunk,                                                evidence.samples,
             evidence.tokens,                                             evidence.token_limit,                                          evidence.encoder_positions,
             // Widen before formatting so an f64 reader recovers the exact f32
             // evidence value, rather than only a decimal that rounds back to it.
             // Null precision is intentional: fixed log precision loses evidence.
-            decimal.fmt(@as(f64, evidence.no_speech_probability), null), decimal.fmt(@as(f64, evidence.average_log_probability), null), evidence.reserved,
+            decimal.fmt(@as(f64, evidence.no_speech_probability), null), decimal.fmt(@as(f64, evidence.average_log_probability), null), @as(u32, 0),
             evidence.log_mel_ns,                                         evidence.encoder_ns,                                           evidence.cross_key_values_ns,
             evidence.decoder_ns,
         },
     ) catch return writer.err.?;
     writer.interface.print(
-        "contains_activity={}\nmodel={f}\nmodel_revision={f}\nsource_sha256={f}\npacked_image_sha256={s}\n" ++
+        "contains_activity={}\nmodel={f}\nmodel_revision={f}\nsource_blake3={f}\npacked_image_blake3={s}\n" ++
             "packed_image_format_version={d}\npacked_model_cache_version={d}\nzig_version={f}\noptimize={f}\n" ++
             "model_encoder_threads={d}\nmodel_decoder_threads={d}\nmodel_encoder_padding_seconds={d}\n" ++
             "sample_rate={d}\nsample_format={f}\ntext_decode_complete={}\nend_available={}\nend={f}\n" ++
             "prompt={d} {d}\nbeam_size={d}\ntemperature_fallback={}\nsuppressed_tokens=",
         .{
             metadata.contains_activity,                std.zig.fmtString(metadata.model),         std.zig.fmtString(metadata.model_revision),
-            std.zig.fmtString(metadata.source_sha256), &metadata.packed_image_sha256,             metadata.packed_image_format_version,
+            std.zig.fmtString(metadata.source_blake3), &metadata.packed_image_blake3,             metadata.packed_image_format_version,
             metadata.packed_model_cache_version,       std.zig.fmtString(metadata.zig_version),   std.zig.fmtString(metadata.optimize),
             metadata.model_encoder_threads,            metadata.model_decoder_threads,            metadata.model_encoder_padding_seconds,
             metadata.sample_rate,                      std.zig.fmtString(metadata.sample_format), metadata.text_decode_complete,

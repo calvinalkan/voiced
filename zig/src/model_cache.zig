@@ -9,13 +9,12 @@ const log = logging.scoped(.model_cache);
 const inference = @import("inference");
 const models = @import("models");
 const linux = std.os.linux;
-const Sha256 = std.crypto.hash.sha2.Sha256;
 const Blake3 = std.crypto.hash.Blake3;
 
-// Cache ABI 1 stores the pinned source SHA-256 at 16..48 and a BLAKE3-256
+// Cache ABI 2 stores the pinned source BLAKE3-256 at 16..48 and a BLAKE3-256
 // digest of the complete packed image at 48..80. Version the envelope separately
 // from model packing so a different checksum algorithm cannot be misread.
-const cache_format_version: u32 = 1;
+const cache_format_version: u32 = 2;
 const cache_header_size: usize = 128;
 const cache_magic = "VOICEDC\x00";
 
@@ -35,18 +34,42 @@ pub const LoadedModel = struct {
     }
 };
 
+pub const Context = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    installed_models_root: []const u8,
+    cache_root: []const u8,
+};
+
+/// Resolve the environment-owned cache root once before starting workers.
+pub fn allocCacheRootPath(init: std.process.Init) ![]u8 {
+    const configured = init.environ_map.get("XDG_CACHE_HOME");
+    const root = if (configured != null and std.fs.path.isAbsolute(configured.?))
+        try init.gpa.dupe(u8, configured.?)
+    else
+        try std.fs.path.join(init.gpa, &.{ init.environ_map.get("HOME") orelse return error.HomeNotSet, ".cache" });
+    if (!std.fs.path.isAbsolute(root)) {
+        init.gpa.free(root);
+        return error.CacheHomeNotAbsolute;
+    }
+    return root;
+}
+
 /// `loadModel` loads one pinned model from a checksummed cache, or converts its
 /// verified installed weights on a miss. Cache failures are warnings, not a
 /// requirement for inference. Successful cache reads borrow file-backed pages;
 /// converted results retain no pristine source buffer.
-pub fn loadModel(init: std.process.Init, selected: models.Model) !LoadedModel {
-    const cache_started = std.Io.Clock.awake.now(init.io);
-    const allocator = init.gpa;
+/// Cancellation is cooperative between load stages and while waiting for the
+/// cache lock. The flag must remain alive until this call returns.
+pub fn loadModel(context: Context, selected: models.Model, cancellation: ?*const std.atomic.Value(bool)) !LoadedModel {
+    try checkCancellation(cancellation);
+    const cache_started = std.Io.Clock.awake.now(context.io);
+    const allocator = context.allocator;
     const source = selected.metadata().weights;
 
-    var source_digest: [Sha256.digest_length]u8 = undefined;
+    var source_digest: [Blake3.digest_length]u8 = undefined;
 
-    _ = try std.fmt.hexToBytes(&source_digest, source.sha256);
+    _ = try std.fmt.hexToBytes(&source_digest, source.blake3);
 
     const kind: inference.ModelKind = switch (selected) {
         .systran_base_en => .base_en,
@@ -55,18 +78,20 @@ pub fn loadModel(init: std.process.Init, selected: models.Model) !LoadedModel {
 
     // ── Resolve And Lock The Cache Entry ──
     // A directory lock survives atomic file replacement and is released on
-    // worker death. Readers recheck after acquiring it, so concurrent misses
+    // directory close. Readers recheck after acquiring it, so concurrent misses
     // do not each convert a large pristine model.
 
-    const directory = openCacheDirectory(init, selected) catch |err| unavailable: {
+    const directory = openCacheDirectory(context, selected, cancellation) catch |err| unavailable: {
+        if (err == error.Cancelled) return err;
         log.warn(.{}, "Model cache unavailable: error={s}\n", .{@errorName(err)});
         break :unavailable null;
     };
-    defer if (directory) |dir| dir.close(init.io);
+    defer if (directory) |dir| dir.close(context.io);
+    try checkCancellation(cancellation);
 
     if (directory) |dir| {
-        if (tryReadCached(init.io, dir, kind, source_digest)) |loaded| {
-            log.info(.{}, "Model cache loaded: model={s}, model_cache_load_duration_ms={f}", .{ selected.name(), decimal.fmt(@as(f64, @floatFromInt(cache_started.untilNow(init.io, .awake).nanoseconds)) / std.time.ns_per_ms, 3) });
+        if (tryReadCached(context.io, dir, kind, source_digest)) |loaded| {
+            log.info(.{}, "Model cache loaded: model={s}, model_cache_load_duration_ms={f}", .{ selected.name(), decimal.fmt(@as(f64, @floatFromInt(cache_started.untilNow(context.io, .awake).nanoseconds)) / std.time.ns_per_ms, 3) });
             return loaded;
         }
     }
@@ -75,47 +100,53 @@ pub fn loadModel(init: std.process.Init, selected: models.Model) !LoadedModel {
     // Unmap the source before inference workspace allocation. Keeping both
     // model representations for the worker's lifetime doubles retained data.
 
-    log.debug(.{}, "Model cache lookup completed: model={s}, cache_available={}, cache_hit=false, model_cache_lookup_duration_ms={f}", .{ selected.name(), directory != null, decimal.fmt(@as(f64, @floatFromInt(cache_started.untilNow(init.io, .awake).nanoseconds)) / std.time.ns_per_ms, 3) });
-    const conversion_started = std.Io.Clock.awake.now(init.io);
+    log.debug(.{}, "Model cache lookup completed: model={s}, cache_available={}, cache_hit=false, model_cache_lookup_duration_ms={f}", .{ selected.name(), directory != null, decimal.fmt(@as(f64, @floatFromInt(cache_started.untilNow(context.io, .awake).nanoseconds)) / std.time.ns_per_ms, 3) });
+    const conversion_started = std.Io.Clock.awake.now(context.io);
+    try checkCancellation(cancellation);
     var loaded: LoadedModel = block: {
-        const model_directory = try models.allocInstalledDirectoryPath(init, selected);
+        const model_directory = try models.allocInstalledDirectoryPath(allocator, context.installed_models_root, selected);
         defer allocator.free(model_directory);
 
         const path = try std.fs.path.join(allocator, &.{ model_directory, "model.bin" });
         defer allocator.free(path);
 
-        const file = try std.Io.Dir.cwd().openFile(init.io, path, .{ .mode = .read_only, .allow_directory = false });
-        defer file.close(init.io);
-        const stat = try file.stat(init.io);
+        const file = try std.Io.Dir.cwd().openFile(context.io, path, .{ .mode = .read_only, .allow_directory = false });
+        defer file.close(context.io);
+        const stat = try file.stat(context.io);
         if (stat.kind != .file or stat.size != source.size) {
             return error.InvalidPristineWeights;
         }
         const mapping = try std.posix.mmap(null, source.size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
         defer std.posix.munmap(mapping);
-        var digest: [Sha256.digest_length]u8 = undefined;
-        Sha256.hash(mapping, &digest, .{});
+        var digest: [Blake3.digest_length]u8 = undefined;
+        Blake3.hash(mapping, &digest, .{});
+        try checkCancellation(cancellation);
         if (!std.mem.eql(u8, &digest, &source_digest)) {
             return error.InvalidPristineWeights;
         }
         break :block .{ .model = try inference.Model.fromPristineWeights(allocator, kind, mapping) };
     };
     errdefer loaded.deinit();
-    log.info(.{}, "Model converted: model={s}, model_convert_duration_ms={f}", .{ selected.name(), decimal.fmt(@as(f64, @floatFromInt(conversion_started.untilNow(init.io, .awake).nanoseconds)) / std.time.ns_per_ms, 3) });
+    // A failed microphone can cancel preparation during conversion. Do not
+    // start a large cache write/fsync after the caller has abandoned this load.
+    try checkCancellation(cancellation);
+    log.info(.{}, "Model converted: model={s}, model_convert_duration_ms={f}", .{ selected.name(), decimal.fmt(@as(f64, @floatFromInt(conversion_started.untilNow(context.io, .awake).nanoseconds)) / std.time.ns_per_ms, 3) });
 
     // ── Publish One Complete Cache Entry ──
     // The envelope and image share one atomic rename; there is no separately
     // published checksum sidecar that could describe a different generation.
 
     if (directory) |dir| {
-        const publication_started = std.Io.Clock.awake.now(init.io);
-        saveCached(init.io, dir, loaded.model.packedImage(), source_digest) catch |err| {
+        const publication_started = std.Io.Clock.awake.now(context.io);
+        saveCached(context.io, dir, loaded.model.packedImage(), source_digest) catch |err| {
             log.warn(.{}, "Model cache save failed: error={s}\n", .{@errorName(err)});
             return loaded;
         };
-        log.debug(.{}, "Model cache published: model={s}, model_cache_publish_duration_ms={f}", .{ selected.name(), decimal.fmt(@as(f64, @floatFromInt(publication_started.untilNow(init.io, .awake).nanoseconds)) / std.time.ns_per_ms, 3) });
-        const remap_started = std.Io.Clock.awake.now(init.io);
-        if (tryReadCached(init.io, dir, kind, source_digest)) |mapped| {
-            log.debug(.{}, "Model cache remapped: model={s}, model_cache_remap_duration_ms={f}", .{ selected.name(), decimal.fmt(@as(f64, @floatFromInt(remap_started.untilNow(init.io, .awake).nanoseconds)) / std.time.ns_per_ms, 3) });
+        log.debug(.{}, "Model cache published: model={s}, model_cache_publish_duration_ms={f}", .{ selected.name(), decimal.fmt(@as(f64, @floatFromInt(publication_started.untilNow(context.io, .awake).nanoseconds)) / std.time.ns_per_ms, 3) });
+        try checkCancellation(cancellation);
+        const remap_started = std.Io.Clock.awake.now(context.io);
+        if (tryReadCached(context.io, dir, kind, source_digest)) |mapped| {
+            log.debug(.{}, "Model cache remapped: model={s}, model_cache_remap_duration_ms={f}", .{ selected.name(), decimal.fmt(@as(f64, @floatFromInt(remap_started.untilNow(context.io, .awake).nanoseconds)) / std.time.ns_per_ms, 3) });
             loaded.deinit();
             return mapped;
         }
@@ -123,52 +154,52 @@ pub fn loadModel(init: std.process.Init, selected: models.Model) !LoadedModel {
     return loaded;
 }
 
-/// `loadVocabulary` returns verified GPT-2 token spellings owned by `init.gpa`.
+/// `loadVocabulary` returns verified GPT-2 token spellings owned by the context allocator.
 /// Keep the bytes alive until the borrowing runtime has been deinitialized.
-pub fn loadVocabulary(init: std.process.Init, selected: models.Model) ![]u8 {
-    const directory = try models.allocInstalledDirectoryPath(init, selected);
-    defer init.gpa.free(directory);
+pub fn loadVocabulary(context: Context, selected: models.Model) ![]u8 {
+    const directory = try models.allocInstalledDirectoryPath(context.allocator, context.installed_models_root, selected);
+    defer context.allocator.free(directory);
 
-    const path = try std.fs.path.join(init.gpa, &.{ directory, "vocabulary.txt" });
-    defer init.gpa.free(path);
+    const path = try std.fs.path.join(context.allocator, &.{ directory, "vocabulary.txt" });
+    defer context.allocator.free(path);
 
-    const text = try std.Io.Dir.cwd().readFileAlloc(init.io, path, init.gpa, .limited(4 * 1024 * 1024));
-    errdefer init.gpa.free(text);
+    const text = try std.Io.Dir.cwd().readFileAlloc(context.io, path, context.allocator, .limited(4 * 1024 * 1024));
+    errdefer context.allocator.free(text);
 
-    var digest: [Sha256.digest_length]u8 = undefined;
-    Sha256.hash(text, &digest, .{});
+    var digest: [Blake3.digest_length]u8 = undefined;
+    Blake3.hash(text, &digest, .{});
 
     const hex = std.fmt.bytesToHex(digest, .lower);
-    if (!std.mem.eql(u8, &hex, models.vocabulary.sha256)) {
+    if (!std.mem.eql(u8, &hex, models.vocabulary.blake3)) {
         return error.InvalidVocabulary;
     }
 
     return text;
 }
 
-fn openCacheDirectory(init: std.process.Init, selected: models.Model) !std.Io.Dir {
-    const allocator = init.gpa;
-    const configured = init.environ_map.get("XDG_CACHE_HOME");
-    const root = if (configured != null and std.fs.path.isAbsolute(configured.?))
-        try allocator.dupe(u8, configured.?)
-    else
-        try std.fs.path.join(allocator, &.{ init.environ_map.get("HOME") orelse {
-            return error.HomeNotSet;
-        }, ".cache" });
-    defer allocator.free(root);
-    if (!std.fs.path.isAbsolute(root)) {
-        return error.CacheHomeNotAbsolute;
-    }
+fn checkCancellation(cancellation: ?*const std.atomic.Value(bool)) error{Cancelled}!void {
+    if (cancellation) |flag| if (flag.load(.acquire)) return error.Cancelled;
+}
+
+fn openCacheDirectory(context: Context, selected: models.Model, cancellation: ?*const std.atomic.Value(bool)) !std.Io.Dir {
+    const allocator = context.allocator;
     const revision = try std.fmt.allocPrint(allocator, "cache-{d}-packed-{d}-format-{d}", .{ cache_format_version, inference.packed_model_cache_version, inference.packed_model_image_format_version });
     defer allocator.free(revision);
-    const path = try std.fs.path.join(allocator, &.{ root, "voiced/models", selected.name(), selected.metadata().weights.sha256, revision });
+    const path = try std.fs.path.join(allocator, &.{ context.cache_root, "voiced/models", selected.name(), selected.metadata().weights.blake3, revision });
     defer allocator.free(path);
     // Locking and fsync require a readable directory descriptor, not O_PATH.
-    const directory = try std.Io.Dir.cwd().createDirPathOpen(init.io, path, .{ .permissions = .fromMode(0o700), .open_options = .{ .iterate = true, .follow_symlinks = false } });
-    errdefer directory.close(init.io);
+    const directory = try std.Io.Dir.cwd().createDirPathOpen(context.io, path, .{ .permissions = .fromMode(0o700), .open_options = .{ .iterate = true, .follow_symlinks = false } });
+    errdefer directory.close(context.io);
     try requirePrivateOwner(directory.handle);
     const lock: std.Io.File = .{ .handle = directory.handle, .flags = .{ .nonblocking = false } };
-    try lock.lock(init.io, .exclusive);
+    // Another service instance may be converting the same model. Keep that
+    // wait cancellable without interrupting unrelated threads' filesystem I/O.
+    if (cancellation != null) {
+        while (!try lock.tryLock(context.io, .exclusive)) {
+            try checkCancellation(cancellation);
+            try std.Io.sleep(context.io, .fromMilliseconds(10), .awake);
+        }
+    } else try lock.lock(context.io, .exclusive);
     return directory;
 }
 

@@ -1,12 +1,12 @@
 //! Installs verified Whisper checkpoints under the user's XDG data directory.
 //! Each checkpoint is assembled under a sibling temporary directory and is
-//! published only after both files pass their pinned size and SHA-256.
+//! published only after both files pass their pinned size and BLAKE3-256.
 
 const std = @import("std");
 const models = @import("models");
 const assert = std.debug.assert;
 const Io = std.Io;
-const Sha256 = std.crypto.hash.sha2.Sha256;
+const Blake3 = std.crypto.hash.Blake3;
 
 pub fn main(init: std.process.Init) !void {
     var arguments = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
@@ -18,6 +18,8 @@ pub fn main(init: std.process.Init) !void {
 
     var http_client: std.http.Client = .{ .allocator = init.gpa, .io = init.io };
     defer http_client.deinit();
+    const installed_models_root = try models.allocInstalledRootPath(init);
+    defer init.gpa.free(installed_models_root);
 
     // The runtime imports only the weights and GPT-2 vocabulary. Model shapes
     // and decoding policy are defined in Zig, not upstream JSON sidecars.
@@ -25,7 +27,7 @@ pub fn main(init: std.process.Init) !void {
     inline for (comptime std.meta.tags(models.Model)) |model| {
         const metadata = comptime model.metadata();
         const url = "https://huggingface.co/" ++ metadata.name ++ "/resolve/" ++ metadata.revision ++ "/";
-        try installCheckpoint(init, &http_client, .{
+        try installCheckpoint(init, installed_models_root, &http_client, .{
             .model = model,
             .files = &.{
                 .{
@@ -33,14 +35,14 @@ pub fn main(init: std.process.Init) !void {
                     .url = url ++ "model.bin",
                     .file_name = "model.bin",
                     .expected_size = metadata.weights.size,
-                    .expected_sha256 = metadata.weights.sha256,
+                    .expected_blake3 = metadata.weights.blake3,
                 },
                 .{
                     .display_name = metadata.name ++ " vocabulary",
                     .url = url ++ "vocabulary.txt",
                     .file_name = "vocabulary.txt",
                     .expected_size = models.vocabulary.size,
-                    .expected_sha256 = models.vocabulary.sha256,
+                    .expected_blake3 = models.vocabulary.blake3,
                 },
             },
         });
@@ -57,13 +59,13 @@ const Artifact = struct {
     url: []const u8,
     file_name: []const u8,
     expected_size: u64,
-    expected_sha256: []const u8,
+    expected_blake3: []const u8,
 };
 
-fn installCheckpoint(init: std.process.Init, http_client: *std.http.Client, checkpoint: Checkpoint) !void {
+fn installCheckpoint(init: std.process.Init, installed_models_root: []const u8, http_client: *std.http.Client, checkpoint: Checkpoint) !void {
     const io = init.io;
     const allocator = init.gpa;
-    const directory_path = try models.allocInstalledDirectoryPath(init, checkpoint.model);
+    const directory_path = try models.allocInstalledDirectoryPath(init.gpa, installed_models_root, checkpoint.model);
     defer allocator.free(directory_path);
 
     // ── Verify An Existing Installation ──
@@ -92,7 +94,7 @@ fn installCheckpoint(init: std.process.Init, http_client: *std.http.Client, chec
 
             var reader = file.readerStreaming(io, &.{});
             var buffer: [64 * 1024]u8 = undefined;
-            var hash = Sha256.init(.{});
+            var hash = Blake3.init(.{});
             var size: u64 = 0;
             while (true) {
                 const read_size = try reader.interface.readSliceShort(&buffer);
@@ -100,9 +102,11 @@ fn installCheckpoint(init: std.process.Init, http_client: *std.http.Client, chec
                 hash.update(buffer[0..read_size]);
                 size += read_size;
             }
-            const digest = std.fmt.bytesToHex(hash.finalResult(), .lower);
+            var digest_bytes: [Blake3.digest_length]u8 = undefined;
+            hash.final(&digest_bytes);
+            const digest = std.fmt.bytesToHex(digest_bytes, .lower);
             if (size != artifact.expected_size or
-                !std.mem.eql(u8, &digest, artifact.expected_sha256)) break false;
+                !std.mem.eql(u8, &digest, artifact.expected_blake3)) break false;
         } else true;
         if (complete) {
             std.debug.print("{s} already installed in {s}\n", .{ checkpoint.model.name(), directory_path });
@@ -131,7 +135,7 @@ fn installCheckpoint(init: std.process.Init, http_client: *std.http.Client, chec
     std.debug.print("Installed {s} in {s}\n", .{ checkpoint.model.name(), directory_path });
 }
 
-// The HTTP body streams through SHA-256 into an unpublished file; only the
+// The HTTP body streams through BLAKE3 into an unpublished file; only the
 // exact pinned size and digest allow its final name to become visible.
 fn downloadAndVerifyArtifact(
     io: Io,
@@ -143,7 +147,7 @@ fn downloadAndVerifyArtifact(
     assert(artifact.url.len > 0);
     assert(artifact.file_name.len > 0);
     assert(artifact.expected_size > 0);
-    assert(artifact.expected_sha256.len == Sha256.digest_length * 2);
+    assert(artifact.expected_blake3.len == Blake3.digest_length * 2);
 
     std.debug.print("Downloading {s}", .{artifact.display_name});
     var download_line_is_open = true;
@@ -190,7 +194,7 @@ fn downloadAndVerifyArtifact(
     var download_buffer: [64 * 1024]u8 = undefined;
     const response_body = response.reader(&response_transfer_buffer);
     var artifact_writer = artifact_file.file.writerStreaming(io, &.{});
-    var sha256_writer = artifact_writer.interface.hashed(Sha256.init(.{}), &.{});
+    var blake3_writer = artifact_writer.interface.hashed(Blake3.init(.{}), &.{});
     const expected_mib_tenths = artifact.expected_size * 10 / (1024 * 1024);
     var downloaded_size: u64 = 0;
     var progress_percent_reported: u8 = 0;
@@ -207,7 +211,7 @@ fn downloadAndVerifyArtifact(
             download_line_is_open = false;
             return error.DownloadSizeMismatch;
         }
-        try sha256_writer.writer.writeAll(download_buffer[0..read_size]);
+        try blake3_writer.writer.writeAll(download_buffer[0..read_size]);
         downloaded_size += read_size;
         const progress_percent: u8 = @intCast(@min(downloaded_size * 100 / artifact.expected_size, 100));
         if (progress_percent > progress_percent_reported) {
@@ -237,13 +241,13 @@ fn downloadAndVerifyArtifact(
         download_line_is_open = false;
         return error.DownloadSizeMismatch;
     }
-    var actual_sha256: [Sha256.digest_length]u8 = undefined;
-    sha256_writer.hasher.final(&actual_sha256);
-    const actual_sha256_hex = std.fmt.bytesToHex(actual_sha256, .lower);
-    if (!std.mem.eql(u8, &actual_sha256_hex, artifact.expected_sha256)) {
+    var actual_blake3: [Blake3.digest_length]u8 = undefined;
+    blake3_writer.hasher.final(&actual_blake3);
+    const actual_blake3_hex = std.fmt.bytesToHex(actual_blake3, .lower);
+    if (!std.mem.eql(u8, &actual_blake3_hex, artifact.expected_blake3)) {
         std.debug.print(
-            "\r\x1b[2Kerror: artifact SHA-256 mismatch\n  output: {s}\n  expected: {s}\n  actual: {s}\n",
-            .{ artifact.file_name, artifact.expected_sha256, &actual_sha256_hex },
+            "\r\x1b[2Kerror: artifact BLAKE3 mismatch\n  output: {s}\n  expected: {s}\n  actual: {s}\n",
+            .{ artifact.file_name, artifact.expected_blake3, &actual_blake3_hex },
         );
         download_line_is_open = false;
         return error.DownloadHashMismatch;

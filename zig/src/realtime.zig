@@ -1,4 +1,4 @@
-//! Best-effort realtime scheduling for the isolated capture worker. Acquire
+//! Best-effort realtime scheduling for the capture thread. Acquire
 //! before audio starts. The complete RTKit exchange has one 500 ms deadline;
 //! supervisor stop/cancel readiness interrupts it without consuming the command.
 const std = @import("std");
@@ -66,6 +66,9 @@ const Request = struct {
         const inherited = try std.posix.getrlimit(.RTTIME);
         // RTKit requires a finite CPU-time budget between blocking syscalls.
         // Match PipeWire's 200 ms cap and preserve any stricter inherited limit.
+        // RLIMIT_RTTIME is process-wide, but charges only realtime execution;
+        // only capture changes scheduler class. Exhaustion can kill the daemon,
+        // which is the same fatal-restart policy as a wedged capture thread.
         const maximum: u64 = @min(@as(u64, @intCast(time_limit)), 200000, inherited.max);
         try std.posix.setrlimit(.RTTIME, .{ .cur = @min(maximum, inherited.cur), .max = maximum });
         self.serial += 1;

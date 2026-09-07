@@ -6,7 +6,6 @@ Default: show, replace, and close two synthetic desktop error notifications.
 """
 import argparse
 import contextlib
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -346,6 +345,8 @@ def desktop_test(binary, root):
 
 
 def main():
+    from blake3 import blake3
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--binary", type=Path, default=Path(__file__).resolve().parents[1] / "zig-out/bin/voiced-notification-check")
@@ -353,7 +354,7 @@ def main():
     if not args.binary.is_file():
         parser.error("Build the check first: cd zig && zig build notification-check")
     root = Path(tempfile.mkdtemp(prefix="voiced-native-notifications-"))
-    report = dict(binary=str(args.binary.resolve()), binary_sha256=hashlib.sha256(args.binary.read_bytes()).hexdigest(), mode="private" if args.self_test else "desktop", ok=False)
+    report = dict(binary=str(args.binary.resolve()), binary_blake3=blake3(args.binary.read_bytes()).hexdigest(), mode="private" if args.self_test else "desktop", ok=False)
     print("Logs:", root, flush=True)
     try:
         report["checks"] = private_tests(args.binary, root) if args.self_test else desktop_test(args.binary, root)

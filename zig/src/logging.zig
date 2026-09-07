@@ -128,20 +128,6 @@ pub fn scoped(comptime component: @EnumLiteral()) type {
             emitKv(severity, @tagName(component), context, message, fields);
         }
 
-        /// A zero exit is still unexpected if the owner needed more work.
-        /// Requested termination can legitimately end through a signal.
-        pub fn processExited(context: Context, role: []const u8, information: linux.siginfo_t, expected: bool) void {
-            const exited = information.code == @intFromEnum(linux.CLD.EXITED);
-            const status = information.fields.common.second.sigchld.status;
-            const clean = if (exited) status == 0 else information.code == @intFromEnum(linux.CLD.KILLED) and status == @intFromEnum(linux.SIG.KILL);
-            const severity: Level = if (expected and clean) .debug else .err;
-            write(severity, context, "Worker exited: role={s}, pid={d}, expected={}, exit_kind={s}, exit_code={?d}, signal={?d}, core_dumped={}", .{
-                role,                                               information.fields.common.first.piduid.pid, expected,
-                if (exited) "exited" else "signaled",               if (exited) @as(?i32, status) else null,    if (exited) null else @as(?i32, status),
-                information.code == @intFromEnum(linux.CLD.DUMPED),
-            });
-        }
-
         pub fn critical(context: Context, comptime format: []const u8, args: anytype) void {
             emit(.critical, @tagName(component), context, format, args);
         }

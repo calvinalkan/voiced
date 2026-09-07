@@ -9,7 +9,7 @@ const invalid = std.math.maxInt(u32);
 const channels_max = 8;
 const buffers_max = 16;
 pub const samples_max = 16384;
-pub const Error = protocol.Error || error{ CatalogFull, CatalogTextFull, SourceNotFound, SourceAmbiguous, SourceDisconnected, SourceChanged, SourcePortsUnavailable, UnsupportedVersion, UnsupportedFormat, UnsupportedIO, InvalidBuffer, CorruptedBuffer, TimelineDiscontinuity, GraphError, WakeFailed, TooManyChannels, TooManyBuffers, TooManyMemories, TooManyPeers };
+pub const Error = protocol.Error || error{ CatalogFull, CatalogTextFull, SourceNotFound, SourceAmbiguous, SourceDisconnected, SourceChanged, SourcePortsUnavailable, UnsupportedVersion, UnsupportedFormat, UnsupportedIO, InvalidBuffer, CorruptedBuffer, TimelineDiscontinuity, GraphError, WakeFailed, TooManyChannels, TooManyBuffers, TooManyMemories, TooManyPeers, UnsupportedDefaultSourceMetadata, DefaultSourceNameInvalidUtf8, DefaultSourceNameTooLong };
 pub const Source = union(enum) { default, node_name: []const u8, device_serial: []const u8 };
 pub const Text = struct {
     bytes: [256]u8 = @splat(0),
@@ -264,14 +264,8 @@ pub const Client = struct {
                     const key = try r.next();
                     _ = try r.next();
                     const value = try r.next();
-                    if (key.kind == 8 and std.mem.eql(u8, std.mem.trimEnd(u8, key.body, "\x00"), "default.audio.source") and value.kind == 8 and value.body.len > 0) {
-                        // Parsing escaped JSON strings and scanner nesting uses
-                        // bounded scratch, recycled for every metadata event.
-                        var json_bytes: [4096]u8 = undefined;
-                        var json_storage = std.heap.FixedBufferAllocator.init(&json_bytes);
-                        const parsed = std.json.parseFromSlice(struct { name: []const u8 }, json_storage.allocator(), value.body[0 .. value.body.len - 1], .{ .ignore_unknown_fields = true }) catch return error.InvalidMessage;
-                        defer parsed.deinit();
-                        try self.default_source.set(parsed.value.name);
+                    if (key.kind == 8 and std.mem.eql(u8, std.mem.trimEnd(u8, key.body, "\x00"), "default.audio.source") and value.kind == 8 and value.body.len > 0 and self.source == .default) {
+                        self.default_source = try parseDefaultSource(value.body[0 .. value.body.len - 1]);
                     }
                     return true;
                 }
@@ -961,6 +955,26 @@ pub const Client = struct {
     }
 };
 
+fn parseDefaultSource(input: []const u8) Error!Text {
+    const prefix = "{\"name\":\"";
+    const suffix = "\"}";
+
+    // PERFORMANCE: Voiced needs only the node name from PipeWire's canonical
+    // `{"name":"..."}` metadata. This fixed envelope does not justify pulling
+    // a general JSON parser into the resident daemon. Reject noncanonical data
+    // rather than accepting a partial interpretation that could select the
+    // wrong microphone.
+    if (input.len < prefix.len + suffix.len or !std.mem.startsWith(u8, input, prefix) or !std.mem.endsWith(u8, input, suffix)) return error.UnsupportedDefaultSourceMetadata;
+    const name = input[prefix.len .. input.len - suffix.len];
+    var source: Text = .{};
+    if (name.len > source.bytes.len) return error.DefaultSourceNameTooLong;
+    if (!std.unicode.utf8ValidateSlice(name)) return error.DefaultSourceNameInvalidUtf8;
+    for (name) |byte| if (byte < ' ' or byte == '"' or byte == '\\') return error.UnsupportedDefaultSourceMetadata;
+
+    source.set(name) catch unreachable;
+    return source;
+}
+
 // The catalog stores only the fields meaningful for each interface. Public
 // Object/Identity values are transient expanded views used by selection and
 // diagnostics; their fixed strings are never repeated in every catalog slot.
@@ -1150,6 +1164,43 @@ pub fn now() u64 {
     var ts: linux.timespec = undefined;
     _ = linux.clock_gettime(.MONOTONIC, &ts);
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+test "default source metadata accepts the canonical envelope" {
+    for ([_]struct { input: []const u8, expected: []const u8 }{
+        .{ .input = "{\"name\":\"alsa_input.test\"}", .expected = "alsa_input.test" },
+        .{ .input = "{\"name\":\"microphone 🎙\"}", .expected = "microphone 🎙" },
+        .{ .input = "{\"name\":\"\"}", .expected = "" },
+    }) |case| {
+        const parsed = try parseDefaultSource(case.input);
+        try std.testing.expectEqualStrings(case.expected, parsed.get());
+    }
+}
+
+test "default source metadata rejects noncanonical envelopes" {
+    for ([_][]const u8{
+        "{\"name\":\"}",
+        " {\"name\":\"source\"}",
+        "{\"name\":\"source\"} ",
+        "{ \"name\": \"source\" }",
+        "{\"name\":\"source\",\"other\":true}",
+        "{\"name\":\"mic\\\\path\"}",
+        "{\"na\\u006de\":\"source\"}",
+        "{\"name\":\"source\\u0020name\"}",
+        "{\"name\":\"source\x1f\"}",
+    }) |input| {
+        try std.testing.expectError(error.UnsupportedDefaultSourceMetadata, parseDefaultSource(input));
+    }
+
+    try std.testing.expectError(error.DefaultSourceNameInvalidUtf8, parseDefaultSource("{\"name\":\"\xff\"}"));
+
+    const prefix = "{\"name\":\"";
+    const suffix = "\"}";
+    var oversized: [prefix.len + 257 + suffix.len]u8 = undefined;
+    @memcpy(oversized[0..prefix.len], prefix);
+    @memset(oversized[prefix.len..][0..257], 'a');
+    @memcpy(oversized[oversized.len - suffix.len ..], suffix);
+    try std.testing.expectError(error.DefaultSourceNameTooLong, parseDefaultSource(&oversized));
 }
 
 test "catalog text reuses full capacity on replacement and removal" {

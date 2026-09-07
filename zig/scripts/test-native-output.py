@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Private Wayland protocol and optional PipeWire→model→clipboard integration.
 
-Invoked by test.sh --zig-output, which supplies the private journal receiver.
+Protocol checks run directly. Model checks still depend on the removed
+integration harness's journal_fixture module.
 The fake compositor serves only this test; no desktop or uinput is accessed.
 """
 import array
@@ -226,8 +227,8 @@ def model_check(root, env):
     def children():
         return [int(value) for value in Path(f'/proc/{service.pid}/task/{service.pid}/children').read_text().split()]
 
-    def capture_pid():
-        return next((pid for pid in children() if Path(f'/proc/{pid}/comm').read_text().strip() == 'voiced-capture'), None)
+    def capture_tid():
+        return next((int(path.parent.name) for path in Path(f'/proc/{service.pid}/task').glob('*/comm') if path.read_text().strip() == 'voiced-capture'), None)
 
     try:
         bus = subprocess.Popen(['dbus-daemon', '--session', '--nofork', '--print-address'], stdout=subprocess.PIPE, text=True)
@@ -241,9 +242,9 @@ def model_check(root, env):
             service = subprocess.Popen([str(BINARY), 'serve', '--transcript-output', 'clipboard', '--notification-mode', 'off', '--model', 'Systran/faster-whisper-base.en', '--model-encoder-threads', '8', '--model-decoder-threads', '2', '--microphone-node', 'voiced-test-source'], env=env, stdout=subprocess.DEVNULL, stderr=log)
         processes.append(service)
         wait_for(lambda: 'Supervisor service ready' in log_path.read_text())
-        wait_for(lambda: capture_pid() is not None)
-        pid = capture_pid()
-        wait_for(lambda: len(list(Path(f'/proc/{pid}/fd').iterdir())) == 7)
+        wait_for(lambda: capture_tid() is not None)
+        pid = capture_tid()
+        idle_descriptors = len(list(Path(f'/proc/{service.pid}/fd').iterdir()))
         saved = root / 'state/voiced-test/transcript.txt'
         for ordinal in range(1, 5):
             if ordinal == 3:
@@ -273,7 +274,7 @@ def model_check(root, env):
             event = 'Transcript save error' if ordinal == 3 else 'Transcript saved'
             wait_for(lambda: f'{event}: recording_ordinal={ordinal},' in log_path.read_text())
             assert 'phase=idle' in cli('status')
-            assert capture_pid() == pid
+            assert capture_tid() == pid
             text = server.text()
             assert 'hello' in text.lower(), text
             if ordinal == 3:
@@ -290,8 +291,10 @@ def model_check(root, env):
                 previous.rename(saved)
             else:
                 assert saved.read_text() == text
-            assert len(list(Path(f'/proc/{pid}/fd').iterdir())) == 7
-            assert len(children()) == 2
+            # Model mappings close their source descriptors; each capture must
+            # return to the same shared descriptor budget and spawn no process.
+            assert len(list(Path(f'/proc/{service.pid}/fd').iterdir())) == idle_descriptors
+            assert not children()
             if ordinal == 1:
                 # The next delivery reconstructs Client in the same union
                 # storage after a real disconnect, not fresh process memory.
@@ -302,8 +305,6 @@ def model_check(root, env):
                     assert field in failure['MESSAGE'], failure
                 (root / 'wayland-test').unlink()
                 server = Compositor(root)
-        os.kill(pid, 9)
-        wait_for(lambda: capture_pid() is not None and capture_pid() != pid)
         assert server.text() == text
         cli('record')
         wait_for(lambda: 'Capture started: recording_ordinal=5,' in log_path.read_text())
@@ -312,7 +313,7 @@ def model_check(root, env):
         assert saved.read_text() == text
         cli('kill')
         assert service.wait(timeout=4) == 0
-        print('Native capture/model/clipboard/save: repeated delivery, clipboard reconnect, save-error diagnostics/recovery, worker reuse and cancellation passed.')
+        print('Native capture/model/clipboard/save: repeated delivery, clipboard reconnect, save-error diagnostics/recovery, thread reuse and cancellation passed.')
     finally:
         for process in reversed(processes):
             stop(process)

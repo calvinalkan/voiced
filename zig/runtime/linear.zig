@@ -10,7 +10,8 @@ const std = @import("std");
 const attention = @import("attention.zig");
 const normalization = @import("normalization.zig");
 const vnni_weight = @import("vnni_weight.zig");
-const Lane = @import("executor.zig").Lane;
+const executor_module = @import("executor.zig");
+const Lane = executor_module.Lane;
 const QuantizedWeight = vnni_weight.QuantizedWeight;
 const assert = std.debug.assert;
 
@@ -863,7 +864,7 @@ test "normalized FFN residual matches materialized normalization and separate pr
     var reference_scratch: [rows_per_tile * ffn_width]u8 = undefined;
     const standalone_lane: Lane = .{ .index = 0, .count = 1, .barrier = undefined };
     for ([_]usize{ 1, 4, 8 }) |workers_count| {
-        var executor: @import("executor.zig").Executor = undefined;
+        var executor: executor_module.Executor = undefined;
         try executor.init(std.testing.io, workers_count);
         defer executor.deinit();
         const float_scratch = try allocator.alloc(f32, workers_count * ffn_rows_per_tile * ffn_width);
@@ -961,7 +962,7 @@ test "square row projections and residuals preserve results across tile boundari
             for (initial_values, &expected) |value, *projected| projected.* = value + projected.*;
         }
         for ([_]usize{ 1, 4, 8 }) |workers_count| {
-            var executor: @import("executor.zig").Executor = undefined;
+            var executor: executor_module.Executor = undefined;
             try executor.init(std.testing.io, workers_count);
             defer executor.deinit();
             const quantized_scratch = try allocator.alloc(u8, workers_count * rows_per_tile * width);

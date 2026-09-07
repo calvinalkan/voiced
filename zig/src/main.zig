@@ -1,11 +1,11 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const logging = @import("logging.zig");
 const log = logging.scoped(.service);
-const audio_process = @import("audio_process.zig");
 const control_socket = @import("control_socket.zig");
 const service_config = @import("service_config.zig");
 const supervisor = @import("supervisor.zig");
-const transcription_process = @import("transcription_process.zig");
+const worker = @import("worker.zig");
 const stderr = std.debug.print;
 
 // ─── Binary Size Optimizations ────────────────────────────────────────────────
@@ -77,9 +77,52 @@ fn panicWithoutTrace(message: []const u8, first_trace_addr: ?usize) noreturn {
     std.process.abort();
 }
 
+// ─── Process Initialization ──────────────────────────────────────────────────
+
+// PERFORMANCE: The full `std.process.Init` selects DebugAllocator for a
+// libc-free ReleaseSafe program, retaining its diagnostics and allocation
+// metadata in the resident daemon. Our process needs only the facilities below;
+// Debug restores the diagnostic allocator while release modes use the
+// thread-safe SMP allocator.
+var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+
+pub fn main(minimal: std.process.Init.Minimal) u8 {
+    const gpa = switch (builtin.mode) {
+        .Debug => debug_allocator.allocator(),
+        .ReleaseSafe, .ReleaseFast, .ReleaseSmall => std.heap.smp_allocator,
+    };
+    defer if (builtin.mode == .Debug) {
+        _ = debug_allocator.deinit();
+    };
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    var threaded = std.Io.Threaded.init(gpa, .{
+        .argv0 = .init(minimal.args),
+        .environ = minimal.environ,
+    });
+    defer threaded.deinit();
+
+    var environ_map = std.process.Environ.createMap(minimal.environ, gpa) catch |err| {
+        stderr("voiced: could not read environment ({s}).\n", .{@errorName(err)});
+        return 1;
+    };
+    defer environ_map.deinit();
+
+    return runCommandLine(.{
+        .minimal = minimal,
+        .arena = &arena,
+        .gpa = gpa,
+        .io = threaded.io(),
+        .environ_map = &environ_map,
+        .preopens = .empty,
+    });
+}
+
 // ─── Command Dispatch ─────────────────────────────────────────────────────────
 
-pub fn main(init: std.process.Init) u8 {
+fn runCommandLine(init: std.process.Init) u8 {
     // ── Parse Before Acting ──
     //
     // No socket, microphone, or worker is opened until the complete command is
@@ -105,7 +148,6 @@ pub fn main(init: std.process.Init) u8 {
             error.InvalidValue => stderr("voiced: invalid value '{s}' for '{s}'; expected {s}.\n", .{ diagnostic.value, diagnostic.argument, diagnostic.expected }),
             error.OptionTakesNoValue => stderr("voiced: option '{s}' does not take a value; use 'voiced record --toggle'.\n", .{diagnostic.argument}),
             error.InvalidConfigLine => stderr("voiced: expected key=value.\n", .{}),
-            error.InvalidInternalRole => stderr("voiced: invalid internal worker invocation; use 'voiced serve' to start the daemon.\n", .{}),
             else => stderr("voiced: could not load configuration ({s}).\n", .{@errorName(err)}),
         }
 
@@ -157,7 +199,6 @@ pub fn main(init: std.process.Init) u8 {
             const client_command = std.meta.stringToEnum(@FieldType(control_socket.Request, "cmd"), command).?;
 
             const description = switch (client_command) {
-                .listen => "Start recording and stop automatically after speech followed by silence.",
                 .stop => "Stop recording and finish transcribing the captured audio.",
                 .cancel => "Cancel the current recording and discard its transcription.",
                 .status => "Show daemon, recording, and model status as text.",
@@ -187,55 +228,23 @@ pub fn main(init: std.process.Init) u8 {
 
     // ── Execute The Validated Command ──
     //
-    // Worker invocations are private re-executions of this binary. Their argv
-    // carries the role, control FD, parent PID, and logging level. Shared
-    // descriptors and model/capture settings arrive in the first seqpacket.
-    if (invocation == .serve or invocation == .worker) {
-        const configured_level = if (invocation == .serve) invocation.serve.log_level else invocation.worker.log_level;
-        const errno = logging.init(configured_level);
+    if (invocation == .serve) {
+        const errno = logging.init(invocation.serve.log_level);
         if (errno != .SUCCESS) {
-            // This is still CLI startup, before service deadlines or threads.
             stderr("voiced: could not initialize logging (errno={f}).\n", .{logging.fmtErrno(errno)});
             return 1;
         }
     }
     defer logging.deinit();
-    const process_name: ?[:0]const u8 = switch (invocation) {
-        .serve => "voiced",
-        .worker => |worker| switch (worker.role) {
-            .@"audio-pipewire" => "voiced-capture",
-            .@"transcription-model" => "voiced-asr",
-        },
-        else => null,
-    };
-    if (process_name) |name| {
-        const linux = std.os.linux;
-        std.debug.assert(name.len <= 15);
-        const result = linux.prctl(@intFromEnum(linux.PR.SET_NAME), @intFromPtr(name.ptr), 0, 0, 0);
-        if (linux.errno(result) != .SUCCESS) log.warn(.{}, "Process name unavailable: operation=prctl_set_name, errno={f}", .{logging.fmtErrno(linux.errno(result))});
-    }
-
-    if (invocation == .worker) log.debug(.{}, "Worker starting: role={s}, log_level={s}", .{ @tagName(invocation.worker.role), logging.levelName(invocation.worker.log_level) });
+    if (invocation == .serve) worker.name("voiced");
 
     const execution = switch (invocation) {
         .serve => |options| supervisor.runService(init, options),
         .client => |request| control_socket.sendRequest(init, request),
-        .worker => |worker| switch (worker.role) {
-            .@"audio-pipewire" => audio_process.PipeWireWorker.run(worker.socket, worker.supervisor_pid, .{
-                .runtime_directory = init.environ_map.get("PIPEWIRE_RUNTIME_DIR") orelse init.environ_map.get("XDG_RUNTIME_DIR"),
-                .remote = init.environ_map.get("PIPEWIRE_REMOTE") orelse "pipewire-0",
-                .system_bus_address = init.environ_map.get("DBUS_SYSTEM_BUS_ADDRESS") orelse "unix:path=/run/dbus/system_bus_socket",
-            }),
-            .@"transcription-model" => transcription_process.runModelWorker(init, worker.socket, worker.supervisor_pid),
-        },
         .usage, .help => unreachable,
     };
 
     execution catch |err| {
-        if (invocation == .worker) {
-            log.err(.{}, "Worker stopped: role={s}, detail=\"{f}\"", .{ @tagName(invocation.worker.role), std.zig.fmtString(@errorName(err)) });
-            return 1;
-        }
         if (invocation == .serve) {
             switch (err) {
                 error.DaemonAlreadyRunning, error.RuntimeDirectoryNotSet, error.RuntimeDirectoryNotAbsolute, error.InvalidInstance, error.UnsafeRuntimeDirectory, error.UnsafeControlSocket, error.SocketPathTooLong => log.err(.{}, "Service startup refused: error={s}", .{@errorName(err)}),
@@ -268,12 +277,6 @@ const Invocation = union(enum) {
     help: []const u8,
     serve: supervisor.ServiceOptions,
     client: control_socket.Request,
-    worker: struct {
-        role: enum { @"audio-pipewire", @"transcription-model" },
-        socket: std.posix.fd_t,
-        supervisor_pid: std.os.linux.pid_t,
-        log_level: logging.Level,
-    },
 };
 
 const ArgumentDiagnostic = service_config.Diagnostic;
@@ -284,29 +287,6 @@ fn parseCommand(init: std.process.Init, arguments: []const [:0]const u8, diagnos
     }
 
     const command = arguments[0];
-
-    // Private worker argv must never be interpreted as public help or commands.
-    if (std.mem.eql(u8, command, "--internal-role")) {
-        if (arguments.len != 5) {
-            return error.InvalidInternalRole;
-        }
-
-        const role = std.meta.stringToEnum(@FieldType(@FieldType(Invocation, "worker"), "role"), arguments[1]) orelse {
-            return error.InvalidInternalRole;
-        };
-
-        const socket = std.fmt.parseInt(std.posix.fd_t, arguments[2], 10) catch {
-            return error.InvalidInternalRole;
-        };
-        const parent_pid = std.fmt.parseInt(std.os.linux.pid_t, arguments[3], 10) catch {
-            return error.InvalidInternalRole;
-        };
-        if (socket < 0 or parent_pid <= 1) {
-            return error.InvalidInternalRole;
-        }
-
-        return .{ .worker = .{ .role = role, .socket = socket, .supervisor_pid = parent_pid, .log_level = logging.parseLevel(arguments[4]) orelse return error.InvalidInternalRole } };
-    }
 
     // Scan help before validating other flags, but respect `--` as the end of
     // options. An explicit `--microphone-node=--help` remains a value, not a help request.
@@ -426,14 +406,12 @@ const general_help =
     \\Examples:
     \\  voiced serve                 Start the daemon in one terminal.
     \\  voiced record --toggle       Start or stop recording in another.
-    \\  voiced listen                Record until speech is followed by silence.
     \\  voiced status                Inspect recording and model status.
     \\
     \\Usage: voiced <command> [options]
     \\
     \\Commands:
     \\  serve    Run the daemon in the foreground.
-    \\  listen   Record with automatic silence stopping.
     \\  record   Record manually; -t or --toggle toggles recording.
     \\  stop     Stop recording and finish transcription.
     \\  cancel   Discard the current recording.
@@ -446,11 +424,14 @@ const general_help =
     \\
     \\Run 'voiced help serve' or 'voiced <command> --help' for details.
     \\Only status prints to stdout; successful actions are silent. Errors go to stderr.
-    \\The daemon copies final text through Wayland and sends a paste shortcut.
+    \\The daemon copies final text through native Wayland or X11 and sends a paste shortcut.
     \\Use 'voiced serve --transcript-output stdout' for diagnostic transcript output.
     \\
     \\Environment:
-    \\  XDG_RUNTIME_DIR Your user session's absolute runtime directory.
+    \\  XDG_RUNTIME_DIR User session runtime directory and Wayland socket location.
+    \\  WAYLAND_DISPLAY Preferred native Wayland display when set.
+    \\  DISPLAY         Local X11 fallback when WAYLAND_DISPLAY is unset.
+    \\  XAUTHORITY      Optional X11 authority file (defaults to ~/.Xauthority).
     \\  VOICED_INSTANCE Optional isolated instance name; use the same value
     \\                  for the daemon and its clients (e.g. 'test').
     \\
@@ -500,8 +481,9 @@ const serve_help =
     \\are accepted. Idle retention accepts 0 through 4294967295 seconds.
     \\
     \\The service opens no microphone or model until a recording is requested.
-    \\Desktop output requires Wayland and access to /dev/uinput. If the keyboard
-    \\is unavailable, copying still works. Clipboard mode sends no shortcut;
+    \\Desktop output requires Wayland or a local X11 display and access to /dev/uinput.
+    \\Wayland is preferred when both displays are present. If the keyboard is
+    \\unavailable, copying still works. Clipboard mode sends no shortcut;
     \\stdout mode writes final text without contacting the desktop.
     \\Run 'voiced record -t' in another terminal to start recording.
     \\Use the same VOICED_INSTANCE in both terminals. Ctrl-C stops the daemon.

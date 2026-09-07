@@ -1,13 +1,7 @@
-//! Owns bounded recordings and the service's idle model lifetime. The event
-//! loop is the only lifecycle owner: workers
-//! publish bytes and reports, but only this file chooses finish, discard, retry,
-//! slot release, and final transcript acceptance.
-//!
-//! The implementation deliberately has no worker or deadline incarnation. A
-//! replacement starts only after the complete returned epoll batch is consumed,
-//! so stale events from the old descriptors have no replacement to affect.
-//! Timer events likewise ask the supervisor to evaluate current absolute
-//! deadlines; they do not identify an earlier deadline instance.
+//! The main thread owns recording lifecycle, deadlines, commands and desktop
+//! delivery. Capture and transcription return typed results through fixed
+//! mailboxes; only this loop releases their borrowed slots or starts another job.
+//! An unacknowledged stop is fatal to the daemon, never permission to reuse data.
 
 const std = @import("std");
 const decimal = @import("decimal.zig");
@@ -16,48 +10,42 @@ const log = logging.scoped(.supervisor);
 const notifications = @import("notifications.zig");
 const transcript_file = @import("transcript_file.zig");
 const audio_exchange = @import("audio_exchange.zig");
-const audio_process = @import("audio_process.zig");
+const capture_module = @import("capture.zig");
+const model_cache = @import("model_cache.zig");
 const models = @import("models");
 const control_socket = @import("control_socket.zig");
-const clipboard_wayland = @import("clipboard_wayland.zig");
+const clipboard_module = @import("clipboard.zig");
 const paste_keyboard = @import("paste_keyboard.zig");
-const transcription_process = @import("transcription_process.zig");
+const transcription_module = @import("transcription.zig");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 
 const AudioExchange = audio_exchange.AudioExchange;
-const TranscriptExchange = transcription_process.TranscriptExchange;
 
 const epoll_events_count_max: u32 = 16;
 
-pub const ModelOptions = struct {
-    model: models.Model = models.default,
-    inference_threads_count: u32 = 4,
-    decoder_threads_count: ?u32 = null,
-    encoder_trailing_padding: @FieldType(transcription_process.ModelLaunchOptions, "encoder_trailing_padding") = .seconds_10,
-};
+pub const ModelOptions = transcription_module.ModelOptions;
 
 pub const recording_duration_seconds_default: u16 = 60 * 60;
 pub const recording_duration_seconds_limit: u16 = std.math.maxInt(u16);
 
 comptime {
-    // The configured duration remains a u16, while the audio launch protocol
+    // The configured duration remains a u16, while the capture job
     // carries its corresponding 16 kHz sample target in a u32.
     assert(@as(u64, recording_duration_seconds_limit) *
-        audio_process.sample_rate_hz <= std.math.maxInt(u32));
+        capture_module.sample_rate_hz <= std.math.maxInt(u32));
 }
 
 pub const CaptureOptions = struct {
-    source: audio_process.Source = .default,
+    source: capture_module.Source = .default,
     recording_seconds: u16 = recording_duration_seconds_default,
-    automatic_stop: audio_process.AutomaticStop = .disabled,
     transcription: ModelOptions = .{},
 };
 
 pub const ServiceOptions = struct {
     log_level: logging.Level = .info,
     capture: CaptureOptions = .{},
-    /// Zero releases the complete model process after every recording; otherwise
+    /// Zero releases the model runtime and compute pool after every recording; otherwise
     /// the runtime, worker group, weights, and workspace survive this idle window.
     model_keep_warm_seconds: u32 = 300,
     output: enum { desktop, clipboard, stdout } = .desktop,
@@ -68,30 +56,23 @@ pub const ServiceOptions = struct {
 };
 
 const EventSource = enum(u64) {
-    audio_publication = 1,
-    audio_packet = 2,
-    audio_exit = 3,
-    transcription_packet = 4,
-    transcription_exit = 5,
-    deadline = 6,
-    service_signal = 7,
-    control_listener = 8,
-    control_client = 9,
-    clipboard = 10,
-    notification_bus = 11,
+    worker_notification = 1,
+    deadline,
+    service_signal,
+    control_listener,
+    control_client,
+    clipboard,
+    notification_bus,
 };
 
-const FinishReason = enum {
+const FinishReason = union(enum) {
     audio_completed,
-    audio_automatic_stop,
-    audio_stopped,
-    pipeline_full,
-    audio_failed_with_valid_prefix,
+    audio_stopped: ?notifications.Problem,
+    pipeline_full: notifications.Problem,
+    audio_failed_with_valid_prefix: notifications.Problem,
 };
 
 const TranscriptionRejection = struct {
-    model: models.Model,
-    publication_ordinal: u32,
     samples_count: u32,
     contains_activity: bool,
     no_speech_probability: f32,
@@ -101,9 +82,8 @@ const TranscriptionRejection = struct {
 const AbortReason = union(enum) {
     service_signal,
     user_cancelled,
-    audio_failed,
-    transcription_failed,
-    exchange_corrupt: enum { audio_slot, timeline, mailbox },
+    audio_failed: notifications.Problem,
+    transcription_failed: notifications.Problem,
     deadline: enum { recording, model_load, transcription },
     transcript_limit: enum { recording_size, chunk_size, decoder_tokens, chunk_size_and_decoder_tokens },
     speech_detection_conflict: TranscriptionRejection,
@@ -111,7 +91,7 @@ const AbortReason = union(enum) {
 };
 
 const SessionPhase = union(enum) {
-    idle: ?u64,
+    idle,
     active,
     finishing: FinishReason,
     delivering: struct {
@@ -124,145 +104,70 @@ const SessionPhase = union(enum) {
     aborting: AbortReason,
 };
 
-const ChildProcess = struct {
-    socket: ?std.posix.fd_t,
-    pid_fd: std.posix.fd_t,
-};
-
-// A role operation and its deadline are one fact; changing the operation also
-// replaces the deadline that owns its progress or termination.
-const AudioProgress = struct {
-    callbacks_count: u64,
-    deadline_monotonic_ns: u64,
-};
-
-const PipeWireAudioOperation = union(enum) {
-    initializing: u64,
+// Deadlines belong to operations, never to a second parallel state machine.
+const AudioProgress = struct { callbacks_count: u64, deadline_monotonic_ns: u64 };
+const CaptureOperation = union(enum) {
     idle,
     starting: u64,
     capturing: AudioProgress,
     stopping: u64,
     canceling: u64,
-    terminating: u64,
 
-    fn deadlineMonotonicNs(operation: PipeWireAudioOperation) ?u64 {
+    fn deadlineMonotonicNs(operation: CaptureOperation) ?u64 {
         return switch (operation) {
             .idle => null,
             .capturing => |progress| progress.deadline_monotonic_ns,
-            inline else => |deadline_monotonic_ns| deadline_monotonic_ns,
+            inline else => |deadline| deadline,
         };
     }
 };
-
-const PipeWireAudioProcess = struct {
-    process: ChildProcess,
-    operation: PipeWireAudioOperation,
-};
-
 const SessionAudio = struct {
-    options: CaptureOptions,
-    process: ?PipeWireAudioProcess,
-    // Full worker diagnostics are journaled before retaining presentation state.
-    problem: ?notifications.Problem = null,
+    worker: *capture_module.Worker,
+    operation: CaptureOperation = .idle,
 };
-
-const TranscriptionWork = struct {
-    slot_index: audio_exchange.SlotIndex,
-    publication_ordinal: u32,
-};
-
-const WorkAttempt = union(enum) {
-    first: TranscriptionWork,
-    retry: TranscriptionWork,
-
-    fn work(attempt: WorkAttempt) TranscriptionWork {
-        return switch (attempt) {
-            inline else => |value| value,
-        };
-    }
-};
-
-const StartingTranscription = struct {
-    deadline_monotonic_ns: u64,
-    retry_work: ?TranscriptionWork,
-};
-
-const PendingTranscription = struct {
-    deadline_monotonic_ns: u64,
-    work: WorkAttempt,
-};
-
-const TranscriptionOperation = union(enum) {
-    starting: StartingTranscription,
-    idle: ?TranscriptionWork,
-    busy: PendingTranscription,
-
-    // Normal shutdown preserves accepted text; forced termination during
-    // startup or inference discards it. Keep those operations distinct while
-    // still storing each operation and its deadline as one tagged value.
-    shutdown_sent: u64,
-    exiting: u64,
-    terminating: u64,
-
-    fn deadlineMonotonicNs(operation: TranscriptionOperation) ?u64 {
-        return switch (operation) {
-            .idle => null,
-            .starting => |starting| starting.deadline_monotonic_ns,
-            .busy => |pending| pending.deadline_monotonic_ns,
-            inline else => |deadline_monotonic_ns| deadline_monotonic_ns,
-        };
-    }
-};
-
-const TranscriptionProcess = struct {
-    process: ChildProcess,
-    operation: TranscriptionOperation,
-};
-
 const TranscriptionState = union(enum) {
     absent,
-    running: TranscriptionProcess,
-    restart_pending: TranscriptionWork,
+    starting: u64,
+    idle: ?u64,
+    busy: struct { deadline_monotonic_ns: u64, slot_index: audio_exchange.SlotIndex },
+    stopping: u64,
+
+    fn deadlineMonotonicNs(state: TranscriptionState) ?u64 {
+        return switch (state) {
+            .absent => null,
+            .idle => |deadline| deadline,
+            .busy => |work| work.deadline_monotonic_ns,
+            inline else => |deadline| deadline,
+        };
+    }
 };
 
 const TranscriptProgress = struct {
-    next_publication_ordinal: u32,
     accepted_chunks_count: u32,
     no_speech_chunks_count: u32,
     processed_samples_count: u64 = 0,
-    // A recovered mailbox has text but may have no timing notification. A
-    // partial timing sum cannot describe the whole recording's realtime speed.
-    compute_duration_ns: ?u64 = 0,
-    bytes: []u8,
+    compute_duration_ns: u64 = 0,
+    storage_index: u1,
     bytes_count: u32,
 };
 
-const SharedMapping = struct {
-    bytes: []align(std.heap.page_size_min) u8,
-
-    fn pointer(mapping: SharedMapping, comptime T: type) *T {
-        assert(mapping.bytes.len == @sizeOf(T));
-        return @ptrCast(@alignCast(mapping.bytes.ptr));
-    }
-
-    fn unmap(mapping: SharedMapping) void {
-        std.posix.munmap(mapping.bytes);
-    }
+const KeyboardState = union(enum) {
+    disabled,
+    unavailable: notifications.Problem,
+    ready: paste_keyboard.Keyboard,
 };
 
 const Supervisor = struct {
     io: std.Io,
-    environment: [*:null]const ?[*:0]const u8,
+    options: *const ServiceOptions,
     audio: SessionAudio,
 
     epoll_fd: std.posix.fd_t,
 
-    audio_exchange_fd: std.posix.fd_t,
     audio_exchange: *AudioExchange,
-    transcript_exchange_fd: std.posix.fd_t,
-    transcript_exchange: *TranscriptExchange,
 
     transcription: TranscriptionState,
+    model_worker: *transcription_module.Worker,
     phase: SessionPhase,
     session_deadline_monotonic_ns: u64,
 
@@ -273,46 +178,35 @@ const Supervisor = struct {
         monotonic_ns: u64,
         origin: enum { command, capture_end },
     } = null,
-    // The active transcript borrows one of these slices. Wayland sources and
+    // The active transcript borrows one of these slices. Clipboard sources and
     // transfers retain the others; availability is derived from those owners.
-    transcript_storage: [2][]u8,
-    clipboard: union(enum) { disconnected, connected: clipboard_wayland.Client } = .disconnected,
-    clipboard_environment: clipboard_wayland.Environment,
-    keyboard: ?paste_keyboard.Keyboard = null,
+    transcript_storage: []u8,
+    clipboard: union(enum) { disconnected, connected: clipboard_module.Client } = .disconnected,
+    clipboard_environment: clipboard_module.Environment,
+    keyboard: KeyboardState = .disabled,
     notifications: notifications.Client = .{},
-    transcription_problem: ?notifications.Problem = null,
-    paste_problem: ?notifications.Problem = null,
     service: struct {
         control: *control_socket.Server,
         transcript_directory: ?[]const u8,
-        model_keep_warm_seconds: u32,
-        output: @FieldType(ServiceOptions, "output"),
-        paste_key: paste_keyboard.Chord,
-        paste_settle_ms: u16,
-        paste_key_gap_ms: u16,
         shutdown_requested: bool = false,
-        pending_recording: ?struct { automatic_stop: audio_process.AutomaticStop, requested_monotonic_ns: u64 } = null,
+        pending_recording: ?u64 = null,
     },
 };
 
 /// `runService` accepts fixed-record commands on the instance's control socket.
 /// Capture and model loading start together on the first recording.
-/// Successful recordings retain the entire model process for the idle window;
-/// discarded recordings terminate it before another recording can reset shared
+/// Successful recordings retain the resident runtime for the idle window;
+/// discarded recordings unload it before another recording can reset shared
 /// storage. Native clipboard ownership and transfers borrow the completed
-/// transcript and can outlive this recording and its model process.
+/// transcript and can outlive this recording and its model runtime.
 pub fn runService(init: std.process.Init, options: ServiceOptions) !void {
-    const configuration = options.capture;
+    const configuration = &options.capture;
 
     // ── Own Signals And Event Sources ──
 
     var previous_pipe_action: linux.Sigaction = undefined;
     try checkSyscall("sigaction", linux.sigaction(.PIPE, &.{ .handler = .{ .handler = linux.SIG.IGN }, .mask = linux.sigemptyset(), .flags = 0 }, &previous_pipe_action));
     defer logCleanupSyscall("sigaction", linux.sigaction(.PIPE, &previous_pipe_action, null));
-    var previous_child_action: linux.Sigaction = undefined;
-    try checkSyscall("sigaction", linux.sigaction(.CHLD, &.{ .handler = .{ .handler = linux.SIG.DFL }, .mask = linux.sigemptyset(), .flags = 0 }, &previous_child_action));
-    defer logCleanupSyscall("sigaction", linux.sigaction(.CHLD, &previous_child_action, null));
-
     var signal_mask = std.posix.sigemptyset();
     std.posix.sigaddset(&signal_mask, .TERM);
     std.posix.sigaddset(&signal_mask, .INT);
@@ -333,35 +227,24 @@ pub fn runService(init: std.process.Init, options: ServiceOptions) !void {
         .NONBLOCK = true,
     }));
     defer closeDescriptor(timer_fd);
-    const publication_event_fd = try descriptorFromResult("eventfd", linux.eventfd(
+    const worker_event_fd = try descriptorFromResult("eventfd", linux.eventfd(
         0,
         linux.EFD.CLOEXEC | linux.EFD.NONBLOCK,
     ));
-    defer closeDescriptor(publication_event_fd);
+    defer closeDescriptor(worker_event_fd);
 
-    const audio_exchange_fd = try createSharedMemory(
-        "voiced-supervisor-audio",
-        @sizeOf(AudioExchange),
-    );
-    defer closeDescriptor(audio_exchange_fd);
-    const audio_mapping = try mapSharedMemory(audio_exchange_fd, AudioExchange);
-    defer audio_mapping.unmap();
-    audio_exchange.initialize(audio_mapping.pointer(AudioExchange), 1);
-
-    const transcript_exchange_fd = try createSharedMemory(
-        "voiced-supervisor-transcript",
-        @sizeOf(TranscriptExchange),
-    );
-    defer closeDescriptor(transcript_exchange_fd);
-    const transcript_mapping = try mapSharedMemory(
-        transcript_exchange_fd,
-        TranscriptExchange,
-    );
-    defer transcript_mapping.unmap();
-    transcription_process.initializeExchange(
-        transcript_mapping.pointer(TranscriptExchange),
-        1,
-    );
+    const audio_storage = try std.heap.page_allocator.create(AudioExchange);
+    defer std.heap.page_allocator.destroy(audio_storage);
+    // Fault in writable PCM pages once, before any thread can borrow them.
+    // Retouching arbitrary exchange bytes during capture setup would race the
+    // supervisor's atomic metadata reads, even when storing the same byte back.
+    const audio_bytes = std.mem.asBytes(audio_storage);
+    var audio_offset: usize = 0;
+    while (audio_offset < audio_bytes.len) : (audio_offset += std.heap.page_size_min) {
+        const byte: *volatile u8 = &audio_bytes[audio_offset];
+        byte.* = 0;
+    }
+    audio_exchange.initialize(audio_storage);
 
     // The exchange retains only three PCM slots regardless of session length.
     // Text is the one session-sized value: reserve 64 UTF-8 bytes per configured
@@ -371,7 +254,7 @@ pub fn runService(init: std.process.Init, options: ServiceOptions) !void {
     // the result reserve lets any one valid mailbox publication fit.
     // Accepted text that exceeds the fixed budget ends the session explicitly
     // instead of growing memory or silently truncating output.
-    const transcript_bytes_capacity = sessionTranscriptBytesCapacity(configuration);
+    const transcript_bytes_capacity = sessionTranscriptBytesCapacity(configuration.*);
     const transcript_bytes = try init.gpa.alloc(u8, transcript_bytes_capacity * @as(usize, if (options.output == .stdout) 1 else 2));
     defer init.gpa.free(transcript_bytes);
 
@@ -383,48 +266,77 @@ pub fn runService(init: std.process.Init, options: ServiceOptions) !void {
     );
     defer control.deinit(init.io);
 
-    const transcript_directory = if (options.output == .stdout) null else transcript_file.allocDirectoryPath(
+    // Resolve the one state directory once. Desktop transcript saving and the
+    // transcription worker's bounded last-failure capture borrow the same path.
+    const state_directory = transcript_file.allocDirectoryPath(
         init.gpa,
         init.environ_map.get("XDG_STATE_HOME"),
         init.environ_map.get("HOME"),
         init.environ_map.get("VOICED_INSTANCE") orelse "",
-    ) catch |err| path: {
-        log.err(.{}, "Transcript saving unavailable: error={s}", .{@errorName(err)});
-        break :path null;
+    ) catch |err| unavailable: {
+        log.err(.{}, "State storage unavailable: error={s}; transcript saving and failed-transcription capture disabled", .{@errorName(err)});
+        break :unavailable null;
     };
-    defer if (transcript_directory) |path| init.gpa.free(path);
+    defer if (state_directory) |path| init.gpa.free(path);
+
+    const installed_models_root = try models.allocInstalledRootPath(init);
+    defer init.gpa.free(installed_models_root);
+    const model_cache_root = try model_cache.allocCacheRootPath(init);
+    defer init.gpa.free(model_cache_root);
+    var capture_worker: capture_module.Worker = .{
+        .mailbox = undefined,
+        .exchange = audio_storage,
+        .environment = .{
+            .runtime_directory = init.environ_map.get("PIPEWIRE_RUNTIME_DIR") orelse init.environ_map.get("XDG_RUNTIME_DIR"),
+            .remote = init.environ_map.get("PIPEWIRE_REMOTE") orelse "pipewire-0",
+            .system_bus_address = init.environ_map.get("DBUS_SYSTEM_BUS_ADDRESS") orelse "unix:path=/run/dbus/system_bus_socket",
+        },
+    };
+    try capture_worker.mailbox.init(worker_event_fd);
+    defer capture_worker.mailbox.deinit();
+    var model_worker: transcription_module.Worker = .{
+        .mailbox = undefined,
+        .context = .{
+            .io = init.io,
+            .allocator = init.gpa,
+            .installed_models_root = installed_models_root,
+            .cache_root = model_cache_root,
+        },
+        .audio = audio_storage,
+        .capture_directory = state_directory,
+    };
+    try model_worker.mailbox.init(worker_event_fd);
+    defer model_worker.mailbox.deinit();
 
     var supervisor: Supervisor = .{
         // initEmpty below establishes all notification metadata without the
         // buffer-containing aggregate template; see notifications.Client.initEmpty.
         .notifications = undefined,
         .io = init.io,
-        .environment = init.minimal.environ.block.slice.ptr,
-        .audio = .{ .options = configuration, .process = null },
+        .options = &options,
+        .audio = .{ .worker = &capture_worker },
         .epoll_fd = epoll_fd,
-        .audio_exchange_fd = audio_exchange_fd,
-        .audio_exchange = audio_mapping.pointer(AudioExchange),
-        .transcript_exchange_fd = transcript_exchange_fd,
-        .transcript_exchange = transcript_mapping.pointer(TranscriptExchange),
+        .audio_exchange = audio_storage,
+        .model_worker = &model_worker,
         .transcription = .absent,
-        .transcript_storage = .{ transcript_bytes[0..transcript_bytes_capacity], if (options.output == .stdout) &.{} else transcript_bytes[transcript_bytes_capacity..] },
-        .clipboard_environment = .{ .runtime_directory = init.environ_map.get("XDG_RUNTIME_DIR"), .display = init.environ_map.get("WAYLAND_DISPLAY") },
-        .phase = .{ .idle = null },
-        .session_deadline_monotonic_ns = sessionDeadline(configuration),
+        .transcript_storage = transcript_bytes,
+        .clipboard_environment = .{
+            .runtime_directory = init.environ_map.get("XDG_RUNTIME_DIR"),
+            .wayland_display = init.environ_map.get("WAYLAND_DISPLAY"),
+            .display = init.environ_map.get("DISPLAY"),
+            .xauthority = init.environ_map.get("XAUTHORITY"),
+            .home = init.environ_map.get("HOME"),
+        },
+        .phase = .idle,
+        .session_deadline_monotonic_ns = sessionDeadline(configuration.*),
         .service = .{
             .control = &control,
-            .transcript_directory = transcript_directory,
-            .model_keep_warm_seconds = options.model_keep_warm_seconds,
-            .output = options.output,
-            .paste_key = options.paste_key,
-            .paste_settle_ms = options.paste_settle_ms,
-            .paste_key_gap_ms = options.paste_key_gap_ms,
+            .transcript_directory = if (options.output == .stdout) null else state_directory,
         },
         .transcript = .{
-            .next_publication_ordinal = 0,
             .accepted_chunks_count = 0,
             .no_speech_chunks_count = 0,
-            .bytes = transcript_bytes[0..transcript_bytes_capacity],
+            .storage_index = 0,
             .bytes_count = 0,
         },
     };
@@ -432,7 +344,7 @@ pub fn runService(init: std.process.Init, options: ServiceOptions) !void {
     // Initialize even when notifications are off: cleanup still uses the client.
     supervisor.notifications.initEmpty();
 
-    try register(epoll_fd, publication_event_fd, .audio_publication);
+    try register(epoll_fd, worker_event_fd, .worker_notification);
     try register(epoll_fd, timer_fd, .deadline);
     try register(epoll_fd, signal_fd, .service_signal);
 
@@ -471,34 +383,29 @@ pub fn runService(init: std.process.Init, options: ServiceOptions) !void {
         std.zig.fmtString(microphone.value),
     });
     log.info(.{}, "Supervisor service ready\n", .{});
-    // Error cleanup owns descriptor closure as well as bounded reaping. A
-    // worker stuck in uninterruptible kernel work must not prevent service exit;
-    // its own memfd mappings remain valid after the supervisor unmaps its views.
     defer {
-        if (supervisor.keyboard) |*keyboard| keyboard.deinit();
-        if (supervisor.audio.process) |*process| {
-            forceStopAndReap(&process.process) catch |err| log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Worker cleanup failed: role=audio, error={s}", .{@errorName(err)});
-        }
-        if (supervisor.transcription == .running) {
-            const process = &supervisor.transcription.running.process;
-            forceStopAndReap(process) catch |err| log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Worker cleanup failed: role=transcription, error={s}", .{@errorName(err)});
-        }
+        if (supervisor.keyboard == .ready) supervisor.keyboard.ready.deinit();
         closeClipboard(&supervisor);
     }
 
     if (options.output == .desktop) openPasteKeyboard(&supervisor);
     if (options.output != .stdout) openClipboard(&supervisor);
-    try initializeAudio(&supervisor, publication_event_fd);
+    const capture_thread = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, capture_module.Worker.run, .{&capture_worker});
+    // Once threads can borrow this frame, an unrecoverable supervisor error must
+    // exit the process before any defer frees their storage. Linux terminates
+    // every thread; systemd Restart=on-failure supplies the fresh daemon.
+    errdefer |err| {
+        log.critical(.{ .recording_ordinal = supervisor.recording_ordinal }, "Supervisor stopped: error={s}; exiting with worker storage retained", .{@errorName(err)});
+        linux.exit_group(1);
+    }
+    const model_thread = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, transcription_module.Worker.run, .{&model_worker});
 
-    // Every iteration consumes one complete readiness snapshot. Worker
-    // replacement happens only in the final maintenance paragraph, after no old
-    // event from this snapshot can be applied to the replacement.
     while (true) {
         if (supervisor.service.shutdown_requested and supervisor.phase == .idle and
-            supervisor.transcription == .absent and supervisor.audio.process == null and
+            supervisor.transcription == .absent and supervisor.audio.operation == .idle and
             !supervisor.service.control.hasPendingReplies())
         {
-            return;
+            break;
         }
         supervisor.notifications.advance(epoll_fd, @intFromEnum(EventSource.notification_bus));
         try armNearestDeadline(&supervisor, timer_fd);
@@ -510,31 +417,20 @@ pub fn runService(init: std.process.Init, options: ServiceOptions) !void {
         assert(events_count > 0);
 
         for (events[0..events_count]) |event| {
-            if (eventSource(event) != .audio_publication) continue;
-            _ = try readEventCounter(publication_event_fd);
+            if (eventSource(event) != .worker_notification) continue;
+            _ = try readEventCounter(worker_event_fd);
         }
 
-        // Final packets and process exit frequently arrive in one batch. Drain
-        // role sockets first; pidfd readiness never means the packet is lost.
-        for (events[0..events_count]) |event| {
-            switch (eventSource(event)) {
-                .audio_packet => if (supervisor.audio.process != null)
-                    try drainAudioPackets(&supervisor),
-                .transcription_packet => if (supervisor.transcription == .running)
-                    try drainTranscriptionPackets(&supervisor),
-                else => {},
-            }
-        }
+        // Completion releases each worker's borrows before dispatch can reuse
+        // audio or transcript storage. Wake counts carry no independent state.
+        try drainAudioResult(&supervisor);
+        try drainTranscriptionResult(&supervisor);
         try dispatchPublishedAudio(&supervisor);
 
         try observePipeWireProgress(&supervisor);
 
         for (events[0..events_count]) |event| {
             switch (eventSource(event)) {
-                .audio_exit => if (supervisor.audio.process != null)
-                    try reapAudio(&supervisor),
-                .transcription_exit => if (supervisor.transcription == .running)
-                    try reapTranscription(&supervisor),
                 .deadline => {
                     _ = try readEventCounter(timer_fd);
                     try applyExpiredDeadlines(&supervisor);
@@ -544,8 +440,7 @@ pub fn runService(init: std.process.Init, options: ServiceOptions) !void {
                     supervisor.service.shutdown_requested = true;
                     supervisor.service.pending_recording = null;
                     if (supervisor.phase == .idle) {
-                        supervisor.phase.idle = null;
-                        try requestTranscriptionShutdown(&supervisor);
+                        requestTranscriptionShutdown(&supervisor);
                     } else {
                         try beginAbort(&supervisor, .service_signal);
                     }
@@ -574,7 +469,7 @@ pub fn runService(init: std.process.Init, options: ServiceOptions) !void {
         }
 
         // Shared counts remain authoritative when eventfd increments coalesce or
-        // when a worker publishes text and dies before sending its report.
+        // when a worker finishes between draining the wake counter and its mailbox.
         try dispatchPublishedAudio(&supervisor);
         try maintainWorkersAndSession(&supervisor);
         // Finish and start desktop delivery before the next epoll wait. A ready
@@ -585,50 +480,56 @@ pub fn runService(init: std.process.Init, options: ServiceOptions) !void {
             if (supervisor.phase != .delivering) enterIdle(&supervisor);
         }
         try advanceOutput(&supervisor);
-        if (supervisor.audio.process == null and !supervisor.service.shutdown_requested)
-            try initializeAudio(&supervisor, publication_event_fd);
-        if (supervisor.service.shutdown_requested and supervisor.audio.process != null and supervisor.audio.process.?.operation == .idle) {
-            try signalChild(&supervisor.audio.process.?.process);
-            supervisor.audio.process.?.operation = .{ .terminating = monotonicNanoseconds() + std.time.ns_per_s };
-        }
         {
             const service = &supervisor.service;
             if (service.pending_recording != null and supervisor.phase == .idle and availableTranscript(&supervisor) != null and
-                supervisor.audio.process != null and supervisor.audio.process.?.operation == .idle and
-                (supervisor.transcription == .absent or (supervisor.transcription == .running and supervisor.transcription.running.operation == .idle)))
+                supervisor.audio.operation == .idle and
+                (supervisor.transcription == .absent or supervisor.transcription == .idle))
             {
-                const pending = service.pending_recording.?;
-                supervisor.recording_requested_monotonic_ns = pending.requested_monotonic_ns;
-                const automatic_stop = pending.automatic_stop;
+                supervisor.recording_requested_monotonic_ns = service.pending_recording.?;
                 service.pending_recording = null;
-                assert(!audioProcessExists(&supervisor));
+                assert(!captureActive(&supervisor));
                 // PCM payload is not cleared. Reset logical lengths only when
                 // capture acknowledged idle and the model awaits a command.
                 supervisor.recording_ordinal += 1;
                 supervisor.notifications.resetSuppression();
                 supervisor.recording_stop = null;
-                supervisor.audio.problem = null;
-                supervisor.transcription_problem = null;
-                audio_exchange.initialize(supervisor.audio_exchange, supervisor.recording_ordinal);
-                transcription_process.initializeExchange(supervisor.transcript_exchange, supervisor.recording_ordinal);
-                supervisor.transcript = .{ .next_publication_ordinal = 0, .accepted_chunks_count = 0, .no_speech_chunks_count = 0, .bytes = supervisor.transcript_storage[availableTranscript(&supervisor).?], .bytes_count = 0 };
-                supervisor.audio.options.automatic_stop = automatic_stop;
+                audio_exchange.initialize(supervisor.audio_exchange);
+                supervisor.transcript = .{ .accepted_chunks_count = 0, .no_speech_chunks_count = 0, .storage_index = availableTranscript(&supervisor).?, .bytes_count = 0 };
                 supervisor.phase = .active;
-                supervisor.session_deadline_monotonic_ns = sessionDeadline(configuration);
+                if (supervisor.transcription == .idle) supervisor.transcription.idle = null;
+                supervisor.session_deadline_monotonic_ns = sessionDeadline(configuration.*);
                 log.info(.{ .recording_ordinal = supervisor.recording_ordinal }, "Recording requested: recording_ordinal={d}", .{supervisor.recording_ordinal});
-                if (supervisor.transcription == .absent) supervisor.transcription = .{ .running = try startTranscription(&supervisor, null) };
-                try startAudio(&supervisor);
+                if (supervisor.transcription == .absent) startTranscription(&supervisor);
+                startAudio(&supervisor);
             }
         }
     }
+    capture_worker.mailbox.shutdown();
+    model_worker.mailbox.shutdown();
+    const join_deadline = monotonicNanoseconds() + std.time.ns_per_s;
+    while (!capture_worker.mailbox.exited() or !model_worker.mailbox.exited()) {
+        const remaining = join_deadline -| monotonicNanoseconds();
+        if (remaining == 0) return error.WorkerJoinDeadlineExceeded;
+        var fd = [_]linux.pollfd{.{ .fd = worker_event_fd, .events = linux.POLL.IN, .revents = 0 }};
+        const result = linux.poll(&fd, 1, @intCast((remaining + std.time.ns_per_ms - 1) / std.time.ns_per_ms));
+        if (linux.errno(result) == .INTR) continue;
+        try checkSyscall("worker_join_poll", result);
+        _ = try readEventCounter(worker_event_fd);
+    }
+    capture_thread.join();
+    model_thread.join();
 }
 
-fn dispatchControl(supervisor: *Supervisor, client_index: usize, request: control_socket.Request) !void {
+// PERFORMANCE: Keep request dispatch out of `runService`. Inlining this
+// user-paced branch and response path expands the event loop's ReleaseSafe
+// machine code; one call per control request is outside capture and inference.
+noinline fn dispatchControl(supervisor: *Supervisor, client_index: usize, request: control_socket.Request) !void {
     const request_received_monotonic_ns = monotonicNanoseconds();
     const service = &supervisor.service;
     var ignored = false;
     switch (request.cmd) {
-        .record, .listen => {
+        .record => {
             if (service.shutdown_requested or supervisor.phase == .finishing or supervisor.phase == .delivering or supervisor.phase == .aborting) {
                 ignored = true;
             } else if (supervisor.phase == .active) {
@@ -637,7 +538,7 @@ fn dispatchControl(supervisor: *Supervisor, client_index: usize, request: contro
                 if (request.toggle) service.pending_recording = null else ignored = true;
             } else {
                 assert(supervisor.phase == .idle);
-                service.pending_recording = .{ .automatic_stop = if (request.cmd == .listen) .after_quiet else .disabled, .requested_monotonic_ns = request_received_monotonic_ns };
+                service.pending_recording = request_received_monotonic_ns;
             }
         },
         .stop => {
@@ -652,8 +553,7 @@ fn dispatchControl(supervisor: *Supervisor, client_index: usize, request: contro
             service.shutdown_requested = true;
             service.pending_recording = null;
             if (supervisor.phase == .idle) {
-                supervisor.phase.idle = null;
-                try requestTranscriptionShutdown(supervisor);
+                requestTranscriptionShutdown(supervisor);
             } else try beginAbort(supervisor, .service_signal);
         },
         .status => {},
@@ -662,25 +562,22 @@ fn dispatchControl(supervisor: *Supervisor, client_index: usize, request: contro
     const phase: control_socket.Phase = switch (supervisor.phase) {
         .idle => if (service.pending_recording != null) .capturing else .idle,
         .active => .capturing,
-        .finishing => if (audioProcessExists(supervisor)) .stopping else .transcribing,
+        .finishing => if (captureActive(supervisor)) .stopping else .transcribing,
         .delivering => .delivering,
         .aborting => .stopping,
     };
     const model_state: control_socket.ModelState = switch (supervisor.transcription) {
         .absent => .absent,
-        .restart_pending => .restarting,
-        .running => |running| switch (running.operation) {
-            .starting => .loading,
-            .idle, .busy => .warm,
-            .shutdown_sent, .exiting, .terminating => .unloading,
-        },
+        .starting => .loading,
+        .idle, .busy => .warm,
+        .stopping => .unloading,
     };
     service.control.respond(client_index, .{
         .ignored = ignored,
         .phase = phase,
         .model = model_state,
-        .session_id = supervisor.audio_exchange.session_id,
-        .model_keep_warm_seconds = service.model_keep_warm_seconds,
+        .session_id = supervisor.recording_ordinal,
+        .model_keep_warm_seconds = supervisor.options.model_keep_warm_seconds,
     });
 }
 
@@ -689,38 +586,20 @@ fn requestAudioFinish(supervisor: *Supervisor, request_received_monotonic_ns: u6
     assert(supervisor.recording_stop == null);
     supervisor.recording_stop = .{ .monotonic_ns = request_received_monotonic_ns, .origin = .command };
     log.info(.{ .recording_ordinal = supervisor.recording_ordinal }, "Recording stop requested: recording_ordinal={d}, recording_stop_origin=command", .{supervisor.recording_ordinal});
-    supervisor.phase = .{ .finishing = .audio_stopped };
-    const audio = if (supervisor.audio.process) |*process| process else {
-        return;
-    };
-    switch (audio.operation) {
+    supervisor.phase = .{ .finishing = .{ .audio_stopped = null } };
+    switch (supervisor.audio.operation) {
         .starting, .capturing => {
-            if (audio.process.socket) |socket| {
-                audio_process.sendControl(socket, .stop) catch |err| switch (err) {
-                    error.AudioControlPeerClosed => {
-                        unregisterSocket(supervisor.epoll_fd, &audio.process);
-                        try signalChild(&audio.process);
-                        audio.operation = .{ .terminating = monotonicNanoseconds() + std.time.ns_per_s };
-                        return;
-                    },
-                    else => {
-                        return err;
-                    },
-                };
-                audio.operation = .{ .stopping = monotonicNanoseconds() + std.time.ns_per_s };
-            } else {
-                try signalChild(&audio.process);
-                audio.operation = .{ .terminating = monotonicNanoseconds() + std.time.ns_per_s };
-            }
+            supervisor.audio.worker.requestStop(.stop);
+            supervisor.audio.operation = .{ .stopping = monotonicNanoseconds() + std.time.ns_per_s };
         },
-        .idle, .initializing, .stopping, .canceling, .terminating => {},
+        .idle, .stopping, .canceling => {},
     }
 }
 
 fn sessionTranscriptBytesCapacity(configuration: CaptureOptions) usize {
     const bytes_per_recording_second_max: u64 = 64;
     const result_bytes_reserve: u64 =
-        transcription_process.result_bytes_capacity;
+        transcription_module.result_bytes_capacity;
 
     const bytes_capacity = @as(u64, configuration.recording_seconds) *
         bytes_per_recording_second_max + result_bytes_reserve;
@@ -729,242 +608,102 @@ fn sessionTranscriptBytesCapacity(configuration: CaptureOptions) usize {
     return @intCast(bytes_capacity);
 }
 
-fn initializeAudio(supervisor: *Supervisor, publication_event_fd: std.posix.fd_t) !void {
-    var process = try startChild(supervisor, .audio_packet, .audio_exit, "audio-pipewire");
-    errdefer forceStopAndReap(&process) catch |err| log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Worker launch cleanup failed: error={s}", .{@errorName(err)});
-    try audio_process.PipeWireWorker.initialize(process.socket.?, supervisor.audio_exchange_fd, publication_event_fd);
-    supervisor.audio.process = .{ .process = process, .operation = .{ .initializing = monotonicNanoseconds() + 3 * std.time.ns_per_s } };
-}
-
-fn startAudio(supervisor: *Supervisor) !void {
+fn startAudio(supervisor: *Supervisor) void {
     const audio = &supervisor.audio;
-    assert(audio.process.?.operation == .idle);
-    const options = audio.options;
-    try audio_process.PipeWireWorker.sendLaunch(audio.process.?.process.socket.?, .{
-        .session_id = supervisor.audio_exchange.session_id,
-        .source = options.source,
-        .recording_samples_target = @as(u32, options.recording_seconds) * audio_process.sample_rate_hz,
-        .automatic_stop = options.automatic_stop,
+    assert(audio.operation == .idle);
+    audio.worker.start(.{
+        .source = supervisor.options.capture.source,
+        .recording_samples_target = @as(u32, supervisor.options.capture.recording_seconds) * capture_module.sample_rate_hz,
     });
-    audio.process.?.operation = .{ .starting = monotonicNanoseconds() + 3 * std.time.ns_per_s };
+    audio.operation = .{ .starting = monotonicNanoseconds() + 3 * std.time.ns_per_s };
 }
 
-fn startTranscription(
-    supervisor: *Supervisor,
-    retry_work: ?TranscriptionWork,
-) !TranscriptionProcess {
-    const model = supervisor.audio.options.transcription;
-    var process = try startChild(
-        supervisor,
-        .transcription_packet,
-        .transcription_exit,
-        "transcription-model",
-    );
-    errdefer forceStopAndReap(&process) catch |err| log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Worker launch cleanup failed: error={s}", .{@errorName(err)});
-
-    // A replacement loads the same model and receives the exact retained slot;
-    // it does not reconnect capture or advance the publication ordinal.
-    try transcription_process.sendModelLaunch(
-        process.socket.?,
-        supervisor.audio_exchange_fd,
-        supervisor.transcript_exchange_fd,
-        .{
-            .session_id = supervisor.audio_exchange.session_id,
-            .model = model.model,
-            .inference_threads_count = model.inference_threads_count,
-            .decoder_threads_count = model.decoder_threads_count,
-            .encoder_trailing_padding = model.encoder_trailing_padding,
-        },
-    );
-
-    const startup_duration_ns = 15 * std.time.ns_per_s;
-    const started_monotonic_ns = monotonicNanoseconds();
-    return .{
-        .process = process,
-        .operation = .{ .starting = .{
-            .deadline_monotonic_ns = started_monotonic_ns + startup_duration_ns,
-            .retry_work = retry_work,
-        } },
-    };
+fn startTranscription(supervisor: *Supervisor) void {
+    assert(supervisor.transcription == .absent);
+    supervisor.model_worker.submit(.{ .prepare = .{
+        .recording_ordinal = supervisor.recording_ordinal,
+        .model = supervisor.options.capture.transcription,
+    } });
+    supervisor.transcription = .{ .starting = monotonicNanoseconds() + 15 * std.time.ns_per_s };
 }
 
-fn startChild(
-    supervisor: *Supervisor,
-    socket_source: EventSource,
-    pid_source: EventSource,
-    internal_role: [:0]const u8,
-) !ChildProcess {
-    var sockets: [2]std.posix.fd_t = undefined;
-    try checkSyscall("socketpair", linux.socketpair(
-        linux.AF.UNIX,
-        linux.SOCK.SEQPACKET,
-        0,
-        &sockets,
-    ));
-    const supervisor_socket = sockets[0];
-    const worker_socket = sockets[1];
-    var worker_socket_is_owned = true;
-    errdefer closeDescriptor(supervisor_socket);
-    errdefer if (worker_socket_is_owned) closeDescriptor(worker_socket);
-    try setCloseOnExec(supervisor_socket);
-
-    var worker_socket_text_buffer: [32]u8 = undefined;
-    const worker_socket_text = try std.fmt.bufPrintZ(&worker_socket_text_buffer, "{d}", .{worker_socket});
-    var supervisor_pid_text_buffer: [32]u8 = undefined;
-    const parent_pid = linux.getpid();
-    const supervisor_pid_text = try std.fmt.bufPrintZ(&supervisor_pid_text_buffer, "{d}", .{parent_pid});
-    var level_buffer: [16]u8 = undefined;
-    const level = try std.fmt.bufPrintZ(&level_buffer, "{s}", .{logging.levelName(logging.level())});
-    const argv = [_:null]?[*:0]const u8{ "/proc/self/exe", "--internal-role", internal_role.ptr, worker_socket_text.ptr, supervisor_pid_text.ptr, level.ptr };
-
-    // The supervisor has one thread. After fork the child uses only bounded
-    // diagnostics and Linux syscalls before exec; no allocator or Io state is
-    // touched. Generic process spawning builds a temporary allocation arena.
-    const fork_result = linux.fork();
-    try checkSyscall("fork", fork_result);
-    if (fork_result == 0) {
-        _ = linux.close(supervisor_socket);
-        const death_signal = linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @intFromEnum(linux.SIG.KILL), 0, 0, 0);
-        if (linux.errno(death_signal) != .SUCCESS or linux.getppid() != parent_pid) linux.exit_group(127);
-        const exec_result = linux.execve("/proc/self/exe", &argv, supervisor.environment);
-        log.err(.{}, "Worker exec error: role={s}, errno={t}", .{ internal_role, linux.errno(exec_result) });
-        linux.exit_group(127);
-    }
-    const pid: linux.pid_t = @intCast(fork_result);
-    errdefer {
-        _ = linux.kill(pid, .KILL);
-        var status: u32 = 0;
-        _ = linux.wait4(pid, &status, linux.W.NOHANG, null);
-    }
-    closeDescriptor(worker_socket);
-    worker_socket_is_owned = false;
-
-    const pid_fd = try descriptorFromResult("pidfd_open", linux.pidfd_open(pid, 0));
-    errdefer closeDescriptor(pid_fd);
-    try register(supervisor.epoll_fd, supervisor_socket, socket_source);
-    errdefer unregister(supervisor.epoll_fd, supervisor_socket);
-    try register(supervisor.epoll_fd, pid_fd, pid_source);
-    errdefer unregister(supervisor.epoll_fd, pid_fd);
-
-    return .{
-        .socket = supervisor_socket,
-        .pid_fd = pid_fd,
-    };
-}
-
-fn drainAudioPackets(supervisor: *Supervisor) !void {
-    const session_audio = &supervisor.audio;
-    const options = session_audio.options;
-    const audio = &session_audio.process.?;
-    if (audio.operation == .initializing) {
-        if (try audio_process.PipeWireWorker.receiveReady(audio.process.socket.?)) audio.operation = .idle;
-        return;
-    }
-    while (audio_process.PipeWireWorker.receiveReportNonblocking(
-        audio.process.socket.?,
-        supervisor.audio_exchange,
-        @as(u32, options.recording_seconds) * audio_process.sample_rate_hz,
-        options.automatic_stop,
-    )) |received| {
-        const worker_report = received orelse {
-            unregisterSocket(supervisor.epoll_fd, &audio.process);
-            return;
-        };
-        // Only a valid final report acknowledges released shared views. A
-        // malformed report must never make a still-writing worker look idle.
-        if (worker_report == .err and worker_report.err == .invalid_report) {
-            log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Worker report corrupt: recording_ordinal={d}, role=audio", .{supervisor.recording_ordinal});
-            try signalChild(&audio.process);
-            audio.operation = .{ .terminating = monotonicNanoseconds() + std.time.ns_per_s };
-            try beginAbort(supervisor, .{ .exchange_corrupt = .audio_slot });
-            return;
-        }
-        // Report receipt acknowledges that capture released every shared view.
-        audio.operation = .idle;
-
-        const capture = switch (worker_report) {
-            .ok => |capture| capture,
-            .err => |err| capture: {
-                supervisor.audio.problem = audioProblem(err);
+fn drainAudioResult(supervisor: *Supervisor) !void {
+    while (supervisor.audio.worker.mailbox.receive()) |worker_report| {
+        supervisor.audio.operation = .idle;
+        switch (worker_report) {
+            .ok => |success| {
+                observeCaptureEnd(supervisor);
+                logCaptureReport(supervisor.recording_ordinal, @tagName(success.end), &success.report, null);
+                switch (success.end) {
+                    .completed => if (supervisor.phase == .active) {
+                        supervisor.phase = .{ .finishing = .audio_completed };
+                    },
+                    .stopped => if (supervisor.phase == .active) {
+                        supervisor.phase = .{ .finishing = .{ .audio_stopped = null } };
+                    },
+                    .cancelled => assert(supervisor.phase == .aborting or supervisor.phase == .finishing),
+                }
+            },
+            .err => |err| {
+                const problem = audioProblem(err);
                 log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Audio service error: recording_ordinal={d}, kind={t}", .{ supervisor.recording_ordinal, std.meta.activeTag(err) });
                 switch (err) {
                     .source_not_found, .source_ambiguous, .setup => |detail| {
-                        log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Capture setup error: recording_ordinal={d}, kind={t}, stage={t}, domain={t}, code={d}, pipewire_server_version=\"{f}\", client_node_version_advertised={d}, client_node_version_selected={d}, detail=\"{f}\"", .{ supervisor.recording_ordinal, std.meta.activeTag(err), detail.stage, detail.domain, detail.code, std.zig.fmtString(detail.pipewire_version[0..detail.pipewire_version_size]), detail.client_node_version_advertised, detail.client_node_version_selected, std.zig.fmtString(detail.message[0..detail.message_size]) });
-                        if (err == .source_ambiguous) log.err(.{}, "Microphone selection: sources_expected_count=1; replace microphone_serial with a microphone_node from the candidate list", .{});
-                        try beginAbort(supervisor, .audio_failed);
+                        const cause = captureFailureCause(detail.cause);
+                        log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Capture setup error: recording_ordinal={d}, kind={t}, stage={t}, error_domain={s}, error_code={d}, pipewire_server_version=\"{f}\", client_node_version_advertised={d}, client_node_version_selected={d}, detail=\"{f}\"", .{ supervisor.recording_ordinal, std.meta.activeTag(err), detail.stage, cause.domain, cause.code, std.zig.fmtString(detail.pipewire_version[0..detail.pipewire_version_size]), detail.client_node_version_advertised, detail.client_node_version_selected, std.zig.fmtString(detail.message[0..detail.message_size]) });
+                        if (std.meta.activeTag(err) == .source_ambiguous) log.err(.{}, "Microphone selection: sources_expected_count=1; replace microphone_serial with a microphone_node from the candidate list", .{});
+                        try beginAbort(supervisor, .{ .audio_failed = problem });
                         continue;
                     },
-                    .invalid_report => {
-                        log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Worker report corrupt: recording_ordinal={d}, role=audio", .{supervisor.recording_ordinal});
-                        try beginAbort(supervisor, .{ .exchange_corrupt = .audio_slot });
-                        continue;
+                    .source_connection_lost,
+                    .source_changed,
+                    .pipeline_full,
+                    .unexpected_format,
+                    .timeline_discontinuity,
+                    .stream_error,
+                    .stream_disconnected,
+                    .invalid_buffer,
+                    .corrupted_buffer,
+                    => |runtime| {
+                        observeCaptureEnd(supervisor);
+                        logCaptureReport(supervisor.recording_ordinal, @tagName(std.meta.activeTag(err)), &runtime.report, &runtime.detail);
+                        if (supervisor.phase == .active) {
+                            if (std.meta.activeTag(err) == .pipeline_full) {
+                                supervisor.phase = .{ .finishing = .{ .pipeline_full = problem } };
+                            } else if (runtime.report.published_samples_count == 0) {
+                                try beginAbort(supervisor, .{ .audio_failed = problem });
+                            } else {
+                                // PipeWire reports preserve every complete block before a
+                                // disconnect, malformed buffer, or timeline failure. Drain
+                                // and transcribe that valid prefix, but retain the failure
+                                // outcome so policy cannot mistake it for completion.
+                                supervisor.phase = .{ .finishing = .{ .audio_failed_with_valid_prefix = problem } };
+                            }
+                        } else if (supervisor.phase == .finishing and supervisor.phase.finishing == .audio_stopped) {
+                            supervisor.phase.finishing.audio_stopped = problem;
+                        }
                     },
-                    .source_connection_lost, .source_changed, .source_observation, .pipeline_full, .capture, .teardown => |report| break :capture report,
-                }
-            },
-        };
-        if (supervisor.recording_stop == null and supervisor.phase == .active) {
-            // Automatic and source-driven stops occur inside capture.
-            // This baseline observes its final report, not that earlier
-            // decision; it must not masquerade as command-to-done time.
-            supervisor.recording_stop = .{ .monotonic_ns = monotonicNanoseconds(), .origin = .capture_end };
-            log.info(.{ .recording_ordinal = supervisor.recording_ordinal }, "Recording stop observed: recording_ordinal={d}, recording_stop_origin=capture_end", .{supervisor.recording_ordinal});
-        }
-        const timeline_validation = switch (audio_exchange.acquireTimelineValidation(
-            supervisor.audio_exchange,
-        )) {
-            .published => |value| value,
-            .unpublished, .corrupt => {
-                log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Audio exchange corrupt: recording_ordinal={d}, field=timeline", .{supervisor.recording_ordinal});
-                try beginAbort(supervisor, .{ .exchange_corrupt = .timeline });
-                continue;
-            },
-        };
-        if ((capture.timeline_validation == .header_only) != (timeline_validation == .header_only)) {
-            log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Audio exchange corrupt: recording_ordinal={d}, field=timeline", .{supervisor.recording_ordinal});
-            try beginAbort(supervisor, .{ .exchange_corrupt = .timeline });
-            continue;
-        }
-        logCaptureReport(supervisor.recording_ordinal, &capture);
-        switch (capture.end) {
-            .completed => if (supervisor.phase == .active) {
-                supervisor.phase = .{ .finishing = .audio_completed };
-            },
-            .automatic_stop => if (supervisor.phase == .active) {
-                supervisor.phase = .{ .finishing = .audio_automatic_stop };
-            },
-            .stopped => if (supervisor.phase == .active) {
-                supervisor.phase = .{ .finishing = .audio_stopped };
-            },
-            .cancelled => assert(supervisor.phase == .aborting),
-            .failed => |failure| if (supervisor.phase == .active) {
-                if (failure.outcome == .pipeline_full) {
-                    supervisor.phase = .{ .finishing = .pipeline_full };
-                } else if (capture.published_samples_count == 0) {
-                    try beginAbort(supervisor, .audio_failed);
-                } else {
-                    // PipeWire reports preserve every complete block before a
-                    // disconnect, malformed buffer, or timeline failure. Drain
-                    // and transcribe that valid prefix, but retain the failure
-                    // outcome so policy cannot mistake it for completion.
-                    supervisor.phase = .{
-                        .finishing = .audio_failed_with_valid_prefix,
-                    };
                 }
             },
         }
     }
 }
 
+fn observeCaptureEnd(supervisor: *Supervisor) void {
+    if (supervisor.recording_stop != null or supervisor.phase != .active) return;
+    // Automatic and source-driven stops occur inside capture. This observer
+    // must not masquerade as command-to-done time.
+    supervisor.recording_stop = .{ .monotonic_ns = monotonicNanoseconds(), .origin = .capture_end };
+    log.info(.{ .recording_ordinal = supervisor.recording_ordinal }, "Recording stop observed: recording_ordinal={d}, recording_stop_origin=capture_end", .{supervisor.recording_ordinal});
+}
+
 fn observePipeWireProgress(supervisor: *Supervisor) !void {
-    const audio = if (supervisor.audio.process) |*value| value else {
-        return;
-    };
+    const audio = &supervisor.audio;
     const capture_is_starting = audio.operation == .starting;
     const callbacks_count_previous = switch (audio.operation) {
         .starting => 0,
         .capturing => |progress| progress.callbacks_count,
-        .initializing, .idle, .stopping, .canceling, .terminating => {
+        .idle, .stopping, .canceling => {
             return;
         },
     };
@@ -982,23 +721,6 @@ fn observePipeWireProgress(supervisor: *Supervisor) !void {
             supervisor.recording_ordinal,
             decimal.fmt(@as(f64, @floatFromInt(monotonicNanoseconds() - supervisor.recording_requested_monotonic_ns)) / std.time.ns_per_ms, 3),
         });
-        const timeline_validation = switch (audio_exchange.acquireTimelineValidation(
-            supervisor.audio_exchange,
-        )) {
-            .published => |value| value,
-            .unpublished, .corrupt => {
-                log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Audio exchange corrupt: recording_ordinal={d}, field=timeline", .{supervisor.recording_ordinal});
-                try beginAbort(supervisor, .{ .exchange_corrupt = .timeline });
-                return;
-            },
-        };
-        if (timeline_validation == .header_only) {
-            log.warn(
-                .{ .recording_ordinal = supervisor.recording_ordinal },
-                "Capture timeline validation limited: recording_ordinal={d}, validation=header_only; some dropped audio intervals cannot be detected",
-                .{supervisor.recording_ordinal},
-            );
-        }
     }
 
     audio.operation = .{ .capturing = .{
@@ -1008,205 +730,75 @@ fn observePipeWireProgress(supervisor: *Supervisor) !void {
     } };
 }
 
-fn drainTranscriptionPackets(supervisor: *Supervisor) !void {
-    const transcription = &supervisor.transcription.running;
-    while (transcription_process.receiveReportNonblocking(
-        transcription.process.socket.?,
-    )) |received| {
-        const report = received orelse {
-            unregisterSocket(supervisor.epoll_fd, &transcription.process);
-            if (transcription.operation == .idle) transcription.operation = .{ .exiting = monotonicNanoseconds() + std.time.ns_per_s };
-            return;
-        };
-        const event = switch (report) {
-            .ok => |event| event,
-            .err => |err| {
-                supervisor.transcription_problem = switch (err) {
-                    .model_load => .model_load_failed,
-                    .feature_extraction, .inference, .text_decode => .transcription_failed,
-                    .exchange => .exchange_corrupt,
-                };
-                if (err == .exchange) try beginAbort(supervisor, .{ .exchange_corrupt = .audio_slot });
-                if (logging.enabled(.err)) switch (err) {
-                    .model_load, .feature_extraction, .inference, .text_decode, .exchange => |detail| {
-                        const context: logging.Context = .{ .recording_ordinal = supervisor.recording_ordinal };
-                        log.kv(.err, context, "Transcription error", &.{
-                            .{ "recording_ordinal", .{ .u = supervisor.recording_ordinal } },
-                            .{ "model", .{ .str = supervisor.audio.options.transcription.model.name() } },
-                            .{ "stage", .{ .str = @tagName(err) } },
-                            .{ "detail", .{ .str = detail.messageBytes() } },
-                        });
-                        const evidence = detail.evidence;
-                        if (evidence.chunk_available == 1) {
-                            log.kv(.err, context, "Transcription error evidence", &.{
-                                .{ "recording_ordinal", .{ .u = supervisor.recording_ordinal } },
-                                .{ "chunk_ordinal", .{ .u = evidence.chunk } },
-                                .{ "audio_samples_count", .{ .u = evidence.samples } },
-                                .{ "audio_duration_seconds", .{ .f = .{ .value = @as(f64, @floatFromInt(evidence.samples)) / 16000, .digits = 3 } } },
-                                .{ "tokens_count_max", .{ .u = evidence.token_limit } },
-                                .{ "features_duration_ms", .{ .f = .{ .value = @as(f64, @floatFromInt(evidence.log_mel_ns)) / std.time.ns_per_ms, .digits = 3 } } },
-                                .{ "encoder_duration_ms", .{ .f = .{ .value = @as(f64, @floatFromInt(evidence.encoder_ns)) / std.time.ns_per_ms, .digits = 3 } } },
-                                .{ "cross_key_values_duration_ms", .{ .f = .{ .value = @as(f64, @floatFromInt(evidence.cross_key_values_ns)) / std.time.ns_per_ms, .digits = 3 } } },
-                                .{ "decoder_duration_ms", .{ .f = .{ .value = @as(f64, @floatFromInt(evidence.decoder_ns)) / std.time.ns_per_ms, .digits = 3 } } },
-                            });
-                            if (evidence.decoding_available == 1) log.kv(.err, context, "Decoder error evidence", &.{
-                                .{ "recording_ordinal", .{ .u = supervisor.recording_ordinal } },
-                                .{ "chunk_ordinal", .{ .u = evidence.chunk } },
-                                .{ "tokens_count", .{ .u = evidence.tokens } },
-                                .{ "tokens_count_max", .{ .u = evidence.token_limit } },
-                                .{ "encoder_positions_count", .{ .u = evidence.encoder_positions } },
-                                .{ "no_speech_probability", .{ .f32 = .{ .value = evidence.no_speech_probability, .digits = 6 } } },
-                                .{ "average_log_probability", .{ .f32 = .{ .value = evidence.average_log_probability, .digits = 6 } } },
-                            });
-                        }
-                    },
-                };
-                // The original diagnostic is retained in the journal. Reaping
-                // still owns the bounded retry and the eventual session outcome.
-                continue;
-            },
-        };
-        switch (event) {
-            .ready => |ready| switch (transcription.operation) {
-                .starting => |starting| {
-                    if (ready.model_prepare_duration_ns > 0) {
-                        log.info(
-                            .{ .recording_ordinal = supervisor.recording_ordinal },
-                            "Model prepared: recording_ordinal={d}, model_prepare_duration_ms={f}\n",
-                            .{ supervisor.recording_ordinal, decimal.fmt(@as(f64, @floatFromInt(ready.model_prepare_duration_ns)) / std.time.ns_per_ms, 3) },
-                        );
-                    }
-                    transcription.operation = .{ .idle = starting.retry_work };
-                },
-                .terminating => {},
-                .idle, .busy, .shutdown_sent, .exiting => unreachable,
+fn drainTranscriptionResult(supervisor: *Supervisor) !void {
+    const report = supervisor.model_worker.mailbox.receive() orelse return;
+    switch (report) {
+        .err => |err| {
+            supervisor.transcription = if (err == .model_load) .absent else .{ .idle = null };
+            try beginAbort(supervisor, .{ .transcription_failed = transcriptionProblem(err) });
+        },
+        .ok => |event| switch (event) {
+            .ready => |ready| {
+                assert(supervisor.transcription == .starting or supervisor.transcription == .stopping);
+                supervisor.transcription = .{ .idle = null };
+                log.info(.{ .recording_ordinal = supervisor.recording_ordinal }, "Model prepared: recording_ordinal={d}, model_prepare_duration_ms={f}", .{ supervisor.recording_ordinal, decimal.fmt(@as(f64, @floatFromInt(ready.model_prepare_duration_ns)) / std.time.ns_per_ms, 3) });
             },
             .result => |result| {
-                if (supervisor.phase == .aborting or
-                    transcription.operation == .terminating)
-                {
-                    // Cancellation owns the mailbox terminal state. A result
-                    // packet already queued before termination cannot revive it.
-                    continue;
-                }
-                assert(transcription.operation == .busy);
-                const work = transcription.operation.busy.work.work();
-                assert(result.publication_ordinal == work.publication_ordinal);
-                try consumeTranscript(supervisor, work, result);
+                const previous = supervisor.transcription;
+                supervisor.transcription = .{ .idle = null };
                 if (supervisor.phase != .aborting) {
-                    transcription.operation = .{ .idle = null };
+                    assert(previous == .busy);
+                    try consumeTranscript(supervisor, previous.busy.slot_index, result);
                 }
+            },
+            .cancelled => {
+                assert(supervisor.transcription == .stopping);
+                supervisor.transcription = .{ .idle = null };
             },
             .stopped => {
-                assert(transcription.operation == .shutdown_sent or
-                    transcription.operation == .terminating);
-                transcription.operation = .{
-                    .exiting = monotonicNanoseconds() + std.time.ns_per_s,
-                };
+                assert(supervisor.transcription == .stopping);
+                supervisor.transcription = .absent;
             },
-        }
+        },
     }
+}
+
+fn transcriptionProblem(err: transcription_module.Error) notifications.Problem {
+    return switch (err) {
+        .model_load => .model_load_failed,
+        .feature_extraction, .inference, .text_decode => .transcription_failed,
+    };
 }
 
 fn dispatchPublishedAudio(supervisor: *Supervisor) !void {
-    if (supervisor.phase == .aborting or supervisor.phase == .idle or supervisor.phase == .delivering) {
-        return;
-    }
-    if (supervisor.transcription != .running) {
-        return;
-    }
-    const transcription = &supervisor.transcription.running;
-    const retry_work = switch (transcription.operation) {
-        .idle => |work| work,
-        else => {
-            return;
-        },
-    };
-    const socket = transcription.process.socket orelse {
-        return;
-    };
-
-    const work_attempt: WorkAttempt = if (retry_work) |work|
-        .{ .retry = work }
-    else fresh: {
-        const pending = switch (nextPublishedAudio(supervisor)) {
-            .none => return,
-            .pending => |value| value,
-            .corrupt => {
-                log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Audio exchange corrupt: recording_ordinal={d}, field=audio_slot", .{supervisor.recording_ordinal});
-                try beginAbort(supervisor, .{ .exchange_corrupt = .audio_slot });
-                return;
-            },
-        };
-        break :fresh .{ .first = .{
-            .slot_index = pending.index,
-            .publication_ordinal = pending.publication.publication_ordinal,
-        } };
-    };
-    const work = work_attempt.work();
-    const inference_duration_ns = 10 * std.time.ns_per_s;
-    transcription.operation = .{ .busy = .{
-        .deadline_monotonic_ns = monotonicNanoseconds() + inference_duration_ns,
-        .work = work_attempt,
+    if (supervisor.phase != .active and supervisor.phase != .finishing) return;
+    if (supervisor.transcription != .idle) return;
+    const chunk_ordinal = processedChunksCount(&supervisor.transcript);
+    const slot_index = nextPublishedAudio(supervisor) orelse return;
+    supervisor.model_worker.submit(.{ .transcribe = .{
+        .recording_ordinal = supervisor.recording_ordinal,
+        .chunk_ordinal = chunk_ordinal,
+        .slot_index = slot_index,
+    } });
+    supervisor.transcription = .{ .busy = .{
+        .deadline_monotonic_ns = monotonicNanoseconds() + 10 * std.time.ns_per_s,
+        .slot_index = slot_index,
     } };
-    transcription_process.sendCommand(
-        socket,
-        .{ .transcribe = work.slot_index },
-    ) catch |send_error| switch (send_error) {
-        error.TranscriptionPeerClosed => {
-            unregisterSocket(supervisor.epoll_fd, &transcription.process);
-            return;
-        },
-        else => {
-            return send_error;
-        },
-    };
 }
 
-fn consumeTranscript(supervisor: *Supervisor, work: TranscriptionWork, timings: ?transcription_process.ResultReport) !void {
-    const slot = &supervisor.audio_exchange.slots[work.slot_index.arrayIndex()];
-    const publication = switch (audio_exchange.acquireSlot(slot)) {
-        .published => |value| value,
-        .empty, .corrupt => {
-            log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Audio exchange corrupt: recording_ordinal={d}, field=audio_slot, chunk_ordinal={d}", .{ supervisor.recording_ordinal, work.publication_ordinal });
-            try beginAbort(supervisor, .{ .exchange_corrupt = .audio_slot });
-            return;
-        },
-    };
+fn consumeTranscript(supervisor: *Supervisor, slot_index: audio_exchange.SlotIndex, timings: transcription_module.ResultReport) !void {
+    const slot = &supervisor.audio_exchange.slots[slot_index.arrayIndex()];
+    const result = timings.transcript;
+    const transcript_bytes = transcriptBytes(supervisor);
+    const chunk_ordinal = processedChunksCount(&supervisor.transcript);
+    assert(audio_exchange.acquireSlot(slot) != null);
 
-    const result = switch (transcription_process.acquireResult(
-        supervisor.transcript_exchange,
-    )) {
-        .committed => |value| value,
-        .none, .corrupt => {
-            log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Audio exchange corrupt: recording_ordinal={d}, field=mailbox, chunk_ordinal={d}", .{ supervisor.recording_ordinal, work.publication_ordinal });
-            try beginAbort(supervisor, .{ .exchange_corrupt = .mailbox });
-            return;
-        },
-    };
-    if (publication.publication_ordinal != work.publication_ordinal or
-        result.publication_ordinal != work.publication_ordinal or
-        result.publication_ordinal != supervisor.transcript.next_publication_ordinal or
-        result.samples_count != publication.samples_count or
-        result.contains_activity != publication.contains_activity)
-    {
-        log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Audio exchange corrupt: recording_ordinal={d}, field=mailbox, chunk_ordinal={d}", .{ supervisor.recording_ordinal, work.publication_ordinal });
-        try beginAbort(supervisor, .{ .exchange_corrupt = .mailbox });
-        return;
-    }
-
-    const disposition = transcription_process.classifyResult(result);
-    assert(supervisor.transcript.bytes_count <= supervisor.transcript.bytes.len);
-    const output_fits = result.bytes.len <= supervisor.transcript.bytes.len - supervisor.transcript.bytes_count;
-    const compute_duration_ns = if (timings) |measured|
-        measured.features_duration_ns + measured.inference_duration_ns
-    else
-        null;
+    const disposition = transcription_module.classifyResult(result);
+    assert(supervisor.transcript.bytes_count <= transcript_bytes.len);
+    const output_fits = result.bytes.len <= transcript_bytes.len - supervisor.transcript.bytes_count;
+    const compute_duration_ns = timings.features_duration_ns + timings.inference_duration_ns;
     supervisor.transcript.processed_samples_count += result.samples_count;
-    supervisor.transcript.compute_duration_ns = if (supervisor.transcript.compute_duration_ns != null and compute_duration_ns != null)
-        supervisor.transcript.compute_duration_ns.? + compute_duration_ns.?
-    else
-        null;
+    supervisor.transcript.compute_duration_ns += compute_duration_ns;
 
     if (logging.enabled(.info)) {
         var features_buffer: [32]u8 = undefined;
@@ -1220,11 +812,11 @@ fn consumeTranscript(supervisor: *Supervisor, work: TranscriptionWork, timings: 
                 "transcript_size={d}, disposition={s}, chunk_limit={t}, recording_size_exceeded={}, activity_observed={}, text_empty={}, no_speech_probability={f}, no_speech_inactive_probability_min={f}, average_log_probability={f}\n",
             .{
                 supervisor.recording_ordinal,
-                result.publication_ordinal,
-                decimal.fmt(@as(f64, @floatFromInt(result.samples_count)) / audio_process.sample_rate_hz, 3),
+                chunk_ordinal,
+                decimal.fmt(@as(f64, @floatFromInt(result.samples_count)) / capture_module.sample_rate_hz, 3),
                 result.samples_count,
-                formatDurationMilliseconds(&features_buffer, if (timings) |measured| measured.features_duration_ns else null),
-                formatDurationMilliseconds(&inference_buffer, if (timings) |measured| measured.inference_duration_ns else null),
+                formatDurationMilliseconds(&features_buffer, timings.features_duration_ns),
+                formatDurationMilliseconds(&inference_buffer, timings.inference_duration_ns),
                 formatDurationMilliseconds(&processing_buffer, compute_duration_ns),
                 formatComputeSpeedRatio(&speed_buffer, result.samples_count, compute_duration_ns),
                 result.bytes.len,
@@ -1234,20 +826,20 @@ fn consumeTranscript(supervisor: *Supervisor, work: TranscriptionWork, timings: 
                 result.contains_activity,
                 std.mem.trim(u8, result.bytes, " \t\r\n").len == 0,
                 decimal.fmt(result.no_speech_probability, 6),
-                decimal.fmt(transcription_process.no_activity_no_speech_probability_reject_min, 2),
+                decimal.fmt(transcription_module.no_activity_no_speech_probability_reject_min, 2),
                 decimal.fmt(result.average_log_probability, 6),
             },
         );
     }
     switch (disposition) {
         .accepted, .partial => {
-            const available = supervisor.transcript.bytes.len - supervisor.transcript.bytes_count;
-            const text = if (output_fits) result.bytes else transcription_process.utf8Prefix(result.bytes[0..available]);
+            const available = transcript_bytes.len - supervisor.transcript.bytes_count;
+            const text = if (output_fits) result.bytes else transcription_module.utf8Prefix(result.bytes[0..available]);
             if (!output_fits) log.warn(.{ .recording_ordinal = supervisor.recording_ordinal }, "Transcript capacity reached: recording_ordinal={d}, chunk_ordinal={d}, transcript_size_max={d}, transcript_committed_size={d}, chunk_transcript_size={d}, chunk_retained_size={d}", .{
-                supervisor.recording_ordinal,      result.publication_ordinal, supervisor.transcript.bytes.len,
-                supervisor.transcript.bytes_count, result.bytes.len,           text.len,
+                supervisor.recording_ordinal,      chunk_ordinal,    transcript_bytes.len,
+                supervisor.transcript.bytes_count, result.bytes.len, text.len,
             });
-            @memcpy(supervisor.transcript.bytes[supervisor.transcript.bytes_count..][0..text.len], text);
+            @memcpy(transcript_bytes[supervisor.transcript.bytes_count..][0..text.len], text);
             supervisor.transcript.bytes_count += @intCast(text.len);
             supervisor.transcript.accepted_chunks_count += 1;
         },
@@ -1255,16 +847,12 @@ fn consumeTranscript(supervisor: *Supervisor, work: TranscriptionWork, timings: 
             supervisor.transcript.no_speech_chunks_count += 1;
         },
         .speech_detection_conflict, .speech_unrecognized => {
-            const selected_model = supervisor.audio.options.transcription.model;
             const rejection: TranscriptionRejection = .{
-                .model = selected_model,
-                .publication_ordinal = result.publication_ordinal,
                 .samples_count = result.samples_count,
                 .contains_activity = result.contains_activity,
                 .no_speech_probability = result.no_speech_probability,
                 .average_log_probability = result.average_log_probability,
             };
-            transcription_process.releaseResult(supervisor.transcript_exchange);
             try beginAbort(supervisor, switch (disposition) {
                 .speech_detection_conflict => .{
                     .speech_detection_conflict = rejection,
@@ -1275,14 +863,8 @@ fn consumeTranscript(supervisor: *Supervisor, work: TranscriptionWork, timings: 
             return;
         },
     }
-    supervisor.transcript.next_publication_ordinal += 1;
-
-    transcription_process.releaseResult(supervisor.transcript_exchange);
     if (result.limit != .none or (disposition == .accepted and !output_fits)) {
-        // Keep the audio slot sealed: deadline recovery can reach here while
-        // diagnostic capture still reads it. Cancellation is asynchronous, so
-        // releasing it first could let capture overwrite those borrowed samples.
-        // Stop further work, retaining all copied text until delivery finishes.
+        // Stop further work while retaining copied text until delivery finishes.
         // Prefer the decoder warning if both chunk and recording limits apply;
         // the chunk event and capacity event preserve every limit in the journal.
         try beginAbort(supervisor, .{ .transcript_limit = switch (result.limit) {
@@ -1294,192 +876,43 @@ fn consumeTranscript(supervisor: *Supervisor, work: TranscriptionWork, timings: 
     } else audio_exchange.releaseConsumedSlot(slot);
 }
 
-fn nextPublishedAudio(supervisor: *Supervisor) union(enum) {
-    none,
-    pending: audio_exchange.PublishedSlotRef,
-    corrupt,
-} {
-    for (&supervisor.audio_exchange.slots, 0..) |*slot, slot_index| {
-        const publication = switch (audio_exchange.acquireSlot(slot)) {
-            .empty => continue,
-            .published => |value| value,
-            .corrupt => return .corrupt,
-        };
-        if (publication.publication_ordinal !=
-            supervisor.transcript.next_publication_ordinal) continue;
-        return .{ .pending = .{
-            .index = audio_exchange.SlotIndex.fromArrayIndex(slot_index),
-            .publication = publication,
-        } };
-    }
-    return .none;
-}
-
-fn reapAudio(supervisor: *Supervisor) !void {
-    if (supervisor.audio.process.?.process.socket != null) {
-        try drainAudioPackets(supervisor);
-    }
-
-    var audio = supervisor.audio.process.?;
-    unregisterChild(supervisor.epoll_fd, &audio.process);
-    const audio_exit = try reapChild(&audio.process);
-    log.processExited(.{ .recording_ordinal = supervisor.recording_ordinal }, "audio", audio_exit, switch (audio.operation) {
-        .terminating => true,
-        else => false,
-    });
-    closeDescriptor(audio.process.pid_fd);
-    supervisor.audio.process = null;
-
-    if (supervisor.phase == .active) {
-        try finishValidAudioPrefixOrDiscard(supervisor);
-    }
-}
-
-fn reapTranscription(supervisor: *Supervisor) !void {
-    assert(supervisor.transcription == .running);
-    if (supervisor.transcription.running.process.socket != null) {
-        try drainTranscriptionPackets(supervisor);
-    }
-    var transcription = supervisor.transcription.running;
-    unregisterChild(supervisor.epoll_fd, &transcription.process);
-    const transcription_exit = try reapChild(&transcription.process);
-    log.processExited(.{ .recording_ordinal = supervisor.recording_ordinal }, "transcription", transcription_exit, switch (transcription.operation) {
-        .shutdown_sent, .exiting, .terminating => true,
-        else => false,
-    });
-    closeDescriptor(transcription.process.pid_fd);
-
-    if (supervisor.phase == .aborting or supervisor.phase == .idle or supervisor.phase == .delivering or
-        transcription.operation == .shutdown_sent or transcription.operation == .exiting or
-        transcription.operation == .terminating)
-    {
-        supervisor.transcription = .absent;
-        return;
-    }
-
-    if (transcription.operation != .busy) {
-        supervisor.transcription = .absent;
-        try beginAbort(supervisor, .transcription_failed);
-        return;
-    }
-    const failed_work = transcription.operation.busy.work;
-    switch (transcription_process.acquireResult(supervisor.transcript_exchange)) {
-        .committed => {
-            // Confidence rejection can discard the session. Publish the reaped
-            // state first so that path cannot signal an already-closed pidfd.
-            supervisor.transcription = .absent;
-            try consumeTranscript(supervisor, failed_work.work(), null);
-        },
-        .corrupt => {
-            supervisor.transcription = .absent;
-            log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Audio exchange corrupt: recording_ordinal={d}, field=mailbox", .{supervisor.recording_ordinal});
-            try beginAbort(supervisor, .{ .exchange_corrupt = .mailbox });
-        },
-        .none => switch (failed_work) {
-            .retry => {
-                supervisor.transcription = .absent;
-                try beginAbort(supervisor, .transcription_failed);
-            },
-            .first => |work| supervisor.transcription = .{ .restart_pending = work },
-        },
-    }
+fn nextPublishedAudio(supervisor: *Supervisor) ?audio_exchange.SlotIndex {
+    const index = audio_exchange.SlotIndex.fromPublicationOrdinal(
+        processedChunksCount(&supervisor.transcript),
+    );
+    return if (audio_exchange.acquireSlot(
+        &supervisor.audio_exchange.slots[index.arrayIndex()],
+    ) != null) index else null;
 }
 
 fn maintainWorkersAndSession(supervisor: *Supervisor) !void {
-    if (supervisor.phase == .aborting or supervisor.phase == .idle or supervisor.phase == .delivering) {
+    if (supervisor.phase == .aborting) {
+        requestTranscriptionShutdown(supervisor);
         return;
     }
-
-    // A retained retry has its own state while no process exists. Starting the
-    // replacement here prevents events from the reaped process's epoll batch
-    // from being applied to its successor.
-    if (supervisor.transcription == .restart_pending) {
-        const work = supervisor.transcription.restart_pending;
-        log.warn(.{ .recording_ordinal = supervisor.recording_ordinal }, "Transcription retry: recording_ordinal={d}, chunk_ordinal={d}, reason=worker_exited_without_result, attempt=2, attempts_count_max=2", .{ supervisor.recording_ordinal, work.publication_ordinal });
-        supervisor.transcription = .{
-            .running = try startTranscription(supervisor, work),
-        };
+    if (supervisor.phase != .active and supervisor.phase != .finishing) return;
+    const count = publishedSlots(supervisor);
+    if (supervisor.transcription == .absent and count > 0) {
+        startTranscription(supervisor);
         return;
     }
-    switch (publishedSlots(supervisor)) {
-        .corrupt => {
-            log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Audio exchange corrupt: recording_ordinal={d}, field=audio_slot", .{supervisor.recording_ordinal});
-            try beginAbort(supervisor, .{ .exchange_corrupt = .audio_slot });
-            return;
-        },
-        .count => |count| {
-            if (supervisor.transcription == .absent and count > 0) {
-                supervisor.transcription = .{
-                    .running = try startTranscription(supervisor, null),
-                };
-                return;
-            }
-            if (supervisor.phase != .finishing) {
-                return;
-            }
-            if (audioProcessExists(supervisor)) {
-                return;
-            }
-            if (count != 0) {
-                return;
-            }
-        },
-    }
-    if (!supervisor.service.shutdown_requested and
-        supervisor.service.model_keep_warm_seconds > 0)
-    {
-        return;
-    }
-    try requestTranscriptionShutdown(supervisor);
+    if (supervisor.phase == .finishing and !captureActive(supervisor) and count == 0 and
+        (supervisor.service.shutdown_requested or supervisor.options.model_keep_warm_seconds == 0))
+        requestTranscriptionShutdown(supervisor);
 }
 
-fn requestTranscriptionShutdown(supervisor: *Supervisor) !void {
-    assert(!audioProcessExists(supervisor));
-    if (supervisor.transcription != .running) {
-        return;
-    }
-    const transcription = &supervisor.transcription.running;
-    if (transcription.operation != .idle) {
-        return;
-    }
-    const socket = transcription.process.socket orelse {
-        try signalChild(&transcription.process);
-        transcription.operation = .{ .terminating = monotonicNanoseconds() + std.time.ns_per_s };
-        return;
-    };
-    transcription.operation = .{
-        .shutdown_sent = monotonicNanoseconds() + std.time.ns_per_s,
-    };
-    transcription_process.sendCommand(
-        socket,
-        .shutdown,
-    ) catch |send_error| switch (send_error) {
-        error.TranscriptionPeerClosed => {
-            unregisterSocket(supervisor.epoll_fd, &transcription.process);
-            return;
-        },
-        else => {
-            return send_error;
-        },
-    };
+fn requestTranscriptionShutdown(supervisor: *Supervisor) void {
+    if (supervisor.transcription != .idle) return;
+    supervisor.model_worker.submit(.unload);
+    supervisor.transcription = .{ .stopping = monotonicNanoseconds() + std.time.ns_per_s };
 }
 
-fn finishValidAudioPrefixOrDiscard(supervisor: *Supervisor) !void {
+fn finishValidAudioPrefixOrDiscard(supervisor: *Supervisor, problem: notifications.Problem) !void {
     assert(supervisor.phase == .active);
 
-    switch (publishedSlots(supervisor)) {
-        .corrupt => {
-            log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Audio exchange corrupt: recording_ordinal={d}, field=audio_slot", .{supervisor.recording_ordinal});
-            try beginAbort(supervisor, .{ .exchange_corrupt = .audio_slot });
-        },
-        .count => |count| if (supervisor.transcript.next_publication_ordinal > 0 or count > 0) {
-            supervisor.phase = .{
-                .finishing = .audio_failed_with_valid_prefix,
-            };
-        } else {
-            try beginAbort(supervisor, .audio_failed);
-        },
-    }
+    if (processedChunksCount(&supervisor.transcript) > 0 or publishedSlots(supervisor) > 0) {
+        supervisor.phase = .{ .finishing = .{ .audio_failed_with_valid_prefix = problem } };
+    } else try beginAbort(supervisor, .{ .audio_failed = problem });
 }
 
 fn beginAbort(supervisor: *Supervisor, reason: AbortReason) !void {
@@ -1487,10 +920,10 @@ fn beginAbort(supervisor: *Supervisor, reason: AbortReason) !void {
         // Accepted text may already be on the clipboard or pasted. Cancellation
         // stops further output; it cannot undo those external effects.
         cancelDelivery(supervisor);
-        // Closing Wayland also closes every transfer before text can be reused.
+        // Closing the clipboard also closes every transfer before text can be reused.
         // Explicit cancellation preserves the previous saved transcript.
         if (reason == .user_cancelled or reason == .service_signal) supervisor.transcript.bytes_count = 0;
-        if (supervisor.service.shutdown_requested) try requestTranscriptionShutdown(supervisor);
+        if (supervisor.service.shutdown_requested) requestTranscriptionShutdown(supervisor);
         return;
     }
     if (supervisor.phase == .aborting) {
@@ -1499,166 +932,61 @@ fn beginAbort(supervisor: *Supervisor, reason: AbortReason) !void {
         return;
     }
     supervisor.phase = .{ .aborting = reason };
-    transcription_process.requestCancellation(supervisor.transcript_exchange);
-
-    if (supervisor.audio.process) |*audio| {
-        try requestAudioDiscard(supervisor, audio);
-    }
+    supervisor.model_worker.requestCancellation();
+    requestAudioDiscard(supervisor);
     switch (supervisor.transcription) {
-        .absent => {},
-        .restart_pending => supervisor.transcription = .absent,
-        .running => |*transcription| {
-            try signalChild(&transcription.process);
-            transcription.operation = .{
-                .terminating = monotonicNanoseconds() + std.time.ns_per_s,
-            };
-        },
+        .starting, .busy => supervisor.transcription = .{ .stopping = monotonicNanoseconds() + std.time.ns_per_s },
+        .idle => requestTranscriptionShutdown(supervisor),
+        .absent, .stopping => {},
     }
 }
 
-fn requestAudioDiscard(supervisor: *Supervisor, audio: *PipeWireAudioProcess) !void {
-    switch (audio.operation) {
-        .idle, .initializing, .canceling, .terminating => {},
+fn requestAudioDiscard(supervisor: *Supervisor) void {
+    switch (supervisor.audio.operation) {
+        .idle, .canceling => {},
         .starting, .capturing, .stopping => {
-            if (audio.process.socket) |socket| {
-                audio_process.sendControl(socket, .cancel) catch |send_error| switch (send_error) {
-                    error.AudioControlPeerClosed => {
-                        unregisterSocket(supervisor.epoll_fd, &audio.process);
-                        try signalChild(&audio.process);
-                        audio.operation = .{
-                            .terminating = monotonicNanoseconds() + std.time.ns_per_s,
-                        };
-                        return;
-                    },
-                    else => {
-                        return send_error;
-                    },
-                };
-                audio.operation = .{
-                    .canceling = monotonicNanoseconds() + std.time.ns_per_s,
-                };
-            } else {
-                try signalChild(&audio.process);
-                audio.operation = .{
-                    .terminating = monotonicNanoseconds() + std.time.ns_per_s,
-                };
-            }
+            supervisor.audio.worker.requestStop(.cancel);
+            supervisor.audio.operation = .{ .canceling = monotonicNanoseconds() + std.time.ns_per_s };
         },
     }
 }
 
-fn applyExpiredDeadlines(supervisor: *Supervisor) !void {
-    const now_monotonic_ns = monotonicNanoseconds();
-    if (supervisor.phase == .idle) {
-        if (supervisor.phase.idle) |deadline| {
-            if (now_monotonic_ns >= deadline and supervisor.service.pending_recording == null) {
-                supervisor.phase.idle = null;
-                try requestTranscriptionShutdown(supervisor);
-            }
-        }
-    } else if (supervisor.phase != .aborting and supervisor.phase != .delivering and now_monotonic_ns >= supervisor.session_deadline_monotonic_ns) {
-        if (supervisor.transcription == .running and supervisor.transcription.running.operation == .busy) {
-            switch (transcription_process.acquireResult(supervisor.transcript_exchange)) {
-                .committed => |result| if (result.limit != .none) try consumeTranscript(supervisor, supervisor.transcription.running.operation.busy.work.work(), null),
-                .none => {},
-                .corrupt => {
-                    log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Audio exchange corrupt: recording_ordinal={d}, field=mailbox", .{supervisor.recording_ordinal});
-                    try beginAbort(supervisor, .{ .exchange_corrupt = .mailbox });
-                    return;
-                },
-            }
-        }
+// PERFORMANCE: Keep deadline policy out of `runService`. Inlining this
+// error-heavy state machine expands the event loop's ReleaseSafe machine code;
+// one call after a timer expiration is negligible beside the wake and actions.
+noinline fn applyExpiredDeadlines(supervisor: *Supervisor) !void {
+    const now = monotonicNanoseconds();
+    if (supervisor.phase != .idle and supervisor.phase != .aborting and supervisor.phase != .delivering and now >= supervisor.session_deadline_monotonic_ns) {
         try beginAbort(supervisor, .{ .deadline = .recording });
     }
-    if (supervisor.audio.process) |*audio| {
-        try applyAudioDeadline(supervisor, audio, now_monotonic_ns);
-    }
-    if (supervisor.transcription == .running) {
-        const transcription = &supervisor.transcription.running;
-        if (transcription.operation.deadlineMonotonicNs()) |deadline_monotonic_ns| {
-            if (now_monotonic_ns >= deadline_monotonic_ns) {
-                switch (transcription.operation) {
-                    .starting, .busy => {
-                        if (transcription.operation == .busy) {
-                            switch (transcription_process.acquireResult(supervisor.transcript_exchange)) {
-                                .committed => |result| if (result.limit != .none) {
-                                    log.warn(.{ .recording_ordinal = supervisor.recording_ordinal }, "Limited transcription recovered at deadline: recording_ordinal={d}, chunk_ordinal={d}", .{ supervisor.recording_ordinal, result.publication_ordinal });
-                                    try consumeTranscript(supervisor, transcription.operation.busy.work.work(), null);
-                                    // Abort waits for both workers before any storage is reused.
-                                    return;
-                                },
-                                .none => {},
-                                .corrupt => {
-                                    log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Audio exchange corrupt: recording_ordinal={d}, field=mailbox", .{supervisor.recording_ordinal});
-                                    try beginAbort(supervisor, .{ .exchange_corrupt = .mailbox });
-                                    return;
-                                },
-                            }
-                        }
-                        const stage = std.meta.activeTag(transcription.operation);
-                        log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Transcription deadline exceeded: recording_ordinal={d}, stage={t}, deadline_monotonic_ns={d}, observed_monotonic_ns={d}", .{
-                            supervisor.recording_ordinal, stage, deadline_monotonic_ns, now_monotonic_ns,
-                        });
-                        try signalChild(&transcription.process);
-                        transcription.operation = .{
-                            .terminating = now_monotonic_ns + std.time.ns_per_s,
-                        };
-                        try beginAbort(supervisor, .{ .deadline = if (stage == .starting) .model_load else .transcription });
-                    },
-                    .shutdown_sent, .exiting => {
-                        assert(supervisor.phase != .active);
-                        try signalChild(&transcription.process);
-                        transcription.operation = .{
-                            .terminating = now_monotonic_ns + std.time.ns_per_s,
-                        };
-                    },
-                    .terminating => {
-                        return error.TranscriptionWorkerExitDeadlineExceeded;
-                    },
-                    .idle => unreachable,
-                }
+    if (supervisor.audio.operation.deadlineMonotonicNs()) |deadline| {
+        if (now >= deadline) {
+            log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Capture deadline exceeded: recording_ordinal={d}, stage={t}", .{ supervisor.recording_ordinal, std.meta.activeTag(supervisor.audio.operation) });
+            switch (supervisor.audio.operation) {
+                .starting, .capturing => {
+                    const problem: notifications.Problem = if (supervisor.audio.operation == .starting) .audio_start_timed_out else .audio_stalled;
+                    requestAudioDiscard(supervisor);
+                    if (supervisor.phase == .active) try finishValidAudioPrefixOrDiscard(supervisor, problem);
+                },
+                .stopping, .canceling => return error.CaptureCancellationDeadlineExceeded,
+                .idle => unreachable,
             }
         }
     }
-}
-
-fn applyAudioDeadline(
-    supervisor: *Supervisor,
-    audio: *PipeWireAudioProcess,
-    now_monotonic_ns: u64,
-) !void {
-    const deadline_monotonic_ns = audio.operation.deadlineMonotonicNs() orelse return;
-    if (now_monotonic_ns < deadline_monotonic_ns) {
-        return;
-    }
-
-    const target: []const u8 = switch (supervisor.audio.options.source) {
-        .default => "default source",
-        .node_name, .device_serial => |text| text,
-    };
-    log.warn(.{ .recording_ordinal = supervisor.recording_ordinal }, "Audio worker deadline exceeded: recording_ordinal={d}, stage={s}, target=\"{f}\", audio_callbacks_count={d}, audio_samples_count={d}, deadline_monotonic_ns={d}, observed_monotonic_ns={d}", .{ supervisor.recording_ordinal, @tagName(audio.operation), std.zig.fmtString(target), audio_exchange.acquireAudioCallbacksCount(supervisor.audio_exchange), audio_exchange.acquireAudioSamplesCount(supervisor.audio_exchange), deadline_monotonic_ns, now_monotonic_ns });
-    switch (audio.operation) {
-        .initializing, .starting, .capturing => {
-            supervisor.audio.problem = if (audio.operation == .starting) .audio_start_timed_out else .audio_stalled;
-            try signalChild(&audio.process);
-            audio.operation = .{
-                .terminating = now_monotonic_ns + std.time.ns_per_s,
-            };
-            if (supervisor.phase == .active) {
-                try finishValidAudioPrefixOrDiscard(supervisor);
-            }
-        },
-        .stopping, .canceling => {
-            assert(supervisor.phase != .active);
-            try signalChild(&audio.process);
-            audio.operation = .{
-                .terminating = now_monotonic_ns + std.time.ns_per_s,
-            };
-        },
-        .idle => unreachable,
-        .terminating => {
-            return error.AudioWorkerExitDeadlineExceeded;
-        },
+    if (supervisor.transcription.deadlineMonotonicNs()) |deadline| {
+        if (now >= deadline) switch (supervisor.transcription) {
+            .starting, .busy => {
+                const loading = supervisor.transcription == .starting;
+                log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Transcription deadline exceeded: recording_ordinal={d}, stage={t}", .{ supervisor.recording_ordinal, std.meta.activeTag(supervisor.transcription) });
+                try beginAbort(supervisor, .{ .deadline = if (loading) .model_load else .transcription });
+            },
+            .stopping => return error.TranscriptionStopDeadlineExceeded,
+            .idle => |warm_deadline| {
+                assert(warm_deadline != null);
+                if (supervisor.service.pending_recording == null) requestTranscriptionShutdown(supervisor);
+            },
+            .absent => unreachable,
+        };
     }
 }
 
@@ -1667,8 +995,7 @@ fn armNearestDeadline(
     timer_fd: std.posix.fd_t,
 ) !void {
     var nearest_deadline_monotonic_ns: u64 = switch (supervisor.phase) {
-        .idle => |deadline| deadline orelse std.math.maxInt(u64),
-        .aborting, .delivering => std.math.maxInt(u64),
+        .idle, .aborting, .delivering => std.math.maxInt(u64),
         else => supervisor.session_deadline_monotonic_ns,
     };
     nearest_deadline_monotonic_ns = @min(nearest_deadline_monotonic_ns, supervisor.notifications.deadline_monotonic_ns);
@@ -1679,21 +1006,12 @@ fn armNearestDeadline(
         nearest_deadline_monotonic_ns = @min(nearest_deadline_monotonic_ns, supervisor.clipboard.connected.deadline());
     if (supervisor.phase == .delivering and supervisor.phase.delivering.paste == .settling)
         nearest_deadline_monotonic_ns = @min(nearest_deadline_monotonic_ns, supervisor.phase.delivering.paste.settling);
-    if (supervisor.keyboard) |*keyboard| {
+    if (supervisor.keyboard == .ready) {
+        const keyboard = &supervisor.keyboard.ready;
         if (keyboard.deadlineMonotonicNs()) |deadline| nearest_deadline_monotonic_ns = @min(nearest_deadline_monotonic_ns, deadline);
     }
-    if (supervisor.audio.process) |audio| {
-        if (audio.operation.deadlineMonotonicNs()) |deadline| nearest_deadline_monotonic_ns = @min(nearest_deadline_monotonic_ns, deadline);
-    }
-    if (supervisor.transcription == .running) {
-        const transcription = supervisor.transcription.running;
-        if (transcription.operation.deadlineMonotonicNs()) |deadline_monotonic_ns| {
-            nearest_deadline_monotonic_ns = @min(
-                nearest_deadline_monotonic_ns,
-                deadline_monotonic_ns,
-            );
-        }
-    }
+    if (supervisor.audio.operation.deadlineMonotonicNs()) |deadline| nearest_deadline_monotonic_ns = @min(nearest_deadline_monotonic_ns, deadline);
+    if (supervisor.transcription.deadlineMonotonicNs()) |deadline| nearest_deadline_monotonic_ns = @min(nearest_deadline_monotonic_ns, deadline);
 
     const now_monotonic_ns = monotonicNanoseconds();
     const remaining_ns = nearest_deadline_monotonic_ns -| now_monotonic_ns;
@@ -1718,22 +1036,15 @@ fn armNearestDeadline(
 }
 
 fn sessionIsComplete(supervisor: *Supervisor) bool {
-    if (supervisor.phase == .active or supervisor.phase == .idle or supervisor.phase == .delivering or audioProcessExists(supervisor)) {
+    if (supervisor.phase == .active or supervisor.phase == .idle or supervisor.phase == .delivering or captureActive(supervisor)) {
         return false;
     }
     if (supervisor.transcription == .absent) {
-        return switch (publishedSlots(supervisor)) {
-            .count => |count| count == 0 or supervisor.phase == .aborting,
-            .corrupt => supervisor.phase == .aborting,
-        };
+        return publishedSlots(supervisor) == 0 or supervisor.phase == .aborting;
     }
     return supervisor.phase == .finishing and
-        !supervisor.service.shutdown_requested and supervisor.service.model_keep_warm_seconds > 0 and
-        supervisor.transcription == .running and supervisor.transcription.running.operation == .idle and
-        supervisor.transcription.running.operation.idle == null and switch (publishedSlots(supervisor)) {
-        .count => |count| count == 0,
-        .corrupt => false,
-    };
+        !supervisor.service.shutdown_requested and supervisor.options.model_keep_warm_seconds > 0 and
+        supervisor.transcription == .idle and publishedSlots(supervisor) == 0;
 }
 
 fn finishSession(supervisor: *Supervisor) !void {
@@ -1743,24 +1054,22 @@ fn finishSession(supervisor: *Supervisor) !void {
     var speed_buffer: [32]u8 = undefined;
     var stop_buffer: [32]u8 = undefined;
     const stop_origin = if (supervisor.recording_stop) |stop| @tagName(stop.origin) else "unavailable";
-    const audio_seconds = @as(f64, @floatFromInt(supervisor.transcript.processed_samples_count)) / audio_process.sample_rate_hz;
+    const audio_seconds = @as(f64, @floatFromInt(supervisor.transcript.processed_samples_count)) / capture_module.sample_rate_hz;
     const processing = formatDurationMilliseconds(&processing_buffer, supervisor.transcript.compute_duration_ns);
     const realtime_speed = formatComputeSpeedRatio(&speed_buffer, supervisor.transcript.processed_samples_count, supervisor.transcript.compute_duration_ns);
 
     switch (supervisor.phase) {
         .active, .idle, .delivering => unreachable,
         .finishing => |reason| {
-            assert(switch (publishedSlots(supervisor)) {
-                .count => |count| count == 0,
-                .corrupt => false,
-            });
+            assert(publishedSlots(supervisor) == 0);
             const outcome = if (supervisor.transcript.accepted_chunks_count == 0 and supervisor.transcript.no_speech_chunks_count > 0)
                 "no_speech"
             else
-                @tagName(reason);
+                @tagName(std.meta.activeTag(reason));
             try finishTranscription(supervisor, outcome, switch (reason) {
-                .audio_failed_with_valid_prefix, .pipeline_full => supervisor.audio.problem orelse .recording_incomplete,
-                else => supervisor.audio.problem,
+                .audio_failed_with_valid_prefix, .pipeline_full => |problem| problem,
+                .audio_stopped => |problem| problem,
+                .audio_completed => null,
             }, false);
         },
         .aborting => |reason| {
@@ -1773,7 +1082,7 @@ fn finishSession(supervisor: *Supervisor) !void {
                 }, true);
                 return;
             }
-            // No process can still publish into cancelled storage. The next
+            // Neither thread can still publish into cancelled storage. The next
             // service recording resets both exchanges before either role starts.
             log.write(if (reason == .user_cancelled or reason == .service_signal) .info else .warn, .{ .recording_ordinal = supervisor.recording_ordinal }, "Recording discarded: recording_ordinal={d}, reason={s}, audio_duration_seconds={f}, transcription_compute_duration_ms={s}, transcription_compute_speed_ratio={s}, transcript_size=0, recording_stop_origin={s}, recording_stop_elapsed_ms={s}", .{
                 supervisor.recording_ordinal, @tagName(std.meta.activeTag(reason)),                             decimal.fmt(audio_seconds, 3), processing, realtime_speed,
@@ -1781,9 +1090,7 @@ fn finishSession(supervisor: *Supervisor) !void {
             });
             switch (reason) {
                 .service_signal, .user_cancelled => {},
-                .audio_failed => supervisor.notifications.show(supervisor.audio.problem orelse .microphone_failed),
-                .transcription_failed => supervisor.notifications.show(supervisor.transcription_problem orelse .transcription_failed),
-                .exchange_corrupt => supervisor.notifications.show(.exchange_corrupt),
+                .audio_failed, .transcription_failed => |problem| supervisor.notifications.show(problem),
                 .deadline => |stage| supervisor.notifications.show(switch (stage) {
                     .recording => .recording_timed_out,
                     .model_load => .model_load_timed_out,
@@ -1803,13 +1110,13 @@ fn finishSession(supervisor: *Supervisor) !void {
                             "average_log_probability={f}\n",
                         .{
                             supervisor.recording_ordinal,
-                            rejection.model.name(),
-                            rejection.publication_ordinal,
+                            supervisor.options.capture.transcription.model.name(),
+                            processedChunksCount(&supervisor.transcript),
                             rejection.samples_count,
                             rejection.contains_activity,
                             decimal.fmt(rejection.no_speech_probability, 6),
-                            decimal.fmt(transcription_process.no_activity_no_speech_probability_reject_min, 2),
-                            decimal.fmt(transcription_process.active_no_speech_probability_conflict_min, 2),
+                            decimal.fmt(transcription_module.no_activity_no_speech_probability_reject_min, 2),
+                            decimal.fmt(transcription_module.active_no_speech_probability_conflict_min, 2),
                             decimal.fmt(rejection.average_log_probability, 6),
                         },
                     );
@@ -1819,7 +1126,6 @@ fn finishSession(supervisor: *Supervisor) !void {
                 .user_cancelled,
                 .audio_failed,
                 .transcription_failed,
-                .exchange_corrupt,
                 .deadline,
                 => {},
             }
@@ -1835,13 +1141,13 @@ fn finishTranscription(supervisor: *Supervisor, outcome_name: []const u8, proble
     var speed_buffer: [32]u8 = undefined;
     var stop_buffer: [32]u8 = undefined;
     const stop_origin = if (supervisor.recording_stop) |stop| @tagName(stop.origin) else "unavailable";
-    const audio_seconds = @as(f64, @floatFromInt(supervisor.transcript.processed_samples_count)) / audio_process.sample_rate_hz;
+    const audio_seconds = @as(f64, @floatFromInt(supervisor.transcript.processed_samples_count)) / capture_module.sample_rate_hz;
     const processing = formatDurationMilliseconds(&processing_buffer, supervisor.transcript.compute_duration_ns);
     const realtime_speed = formatComputeSpeedRatio(&speed_buffer, supervisor.transcript.processed_samples_count, supervisor.transcript.compute_duration_ns);
 
     const transcript = std.mem.trim(
         u8,
-        supervisor.transcript.bytes[0..supervisor.transcript.bytes_count],
+        transcriptBytes(supervisor)[0..supervisor.transcript.bytes_count],
         " \t\r\n",
     );
     log.write(if (limited) .warn else .info, .{ .recording_ordinal = supervisor.recording_ordinal }, "Transcription complete: recording_ordinal={d}, outcome={s}, chunks_accepted_count={d}, chunks_no_speech_count={d}, chunks_count={d}, audio_duration_seconds={f}, transcription_compute_duration_ms={s}, transcription_compute_speed_ratio={s}, transcript_size={d}, recording_stop_origin={s}, recording_stop_elapsed_ms={s}", .{
@@ -1849,7 +1155,7 @@ fn finishTranscription(supervisor: *Supervisor, outcome_name: []const u8, proble
         outcome_name,
         supervisor.transcript.accepted_chunks_count,
         supervisor.transcript.no_speech_chunks_count,
-        supervisor.transcript.next_publication_ordinal,
+        processedChunksCount(&supervisor.transcript),
         decimal.fmt(audio_seconds, 3),
         processing,
         realtime_speed,
@@ -1862,7 +1168,7 @@ fn finishTranscription(supervisor: *Supervisor, outcome_name: []const u8, proble
         if (problem) |cause| supervisor.notifications.show(cause);
         return;
     }
-    if (supervisor.service.output == .stdout) {
+    if (supervisor.options.output == .stdout) {
         try printOutput(supervisor.io, transcript);
         log.info(.{ .recording_ordinal = supervisor.recording_ordinal }, "Transcript written: recording_ordinal={d}, transcript_size={d}, recording_stop_origin={s}, recording_stop_elapsed_ms={s}", .{
             supervisor.recording_ordinal, transcript.len, stop_origin, formatRecordingStopElapsedMilliseconds(&stop_buffer, supervisor),
@@ -1879,7 +1185,7 @@ fn formatDurationMilliseconds(buffer: *[32]u8, elapsed_ns: ?u64) []const u8 {
 fn formatComputeSpeedRatio(buffer: *[32]u8, samples_count: u64, compute_duration_ns: ?u64) []const u8 {
     const elapsed_ns = compute_duration_ns orelse return "unavailable";
     if (elapsed_ns == 0 or samples_count == 0) return "unavailable";
-    const audio_seconds = @as(f64, @floatFromInt(samples_count)) / audio_process.sample_rate_hz;
+    const audio_seconds = @as(f64, @floatFromInt(samples_count)) / capture_module.sample_rate_hz;
     const processing_seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
     return std.fmt.bufPrint(buffer, "{f}", .{decimal.fmt(audio_seconds / processing_seconds, 2)}) catch unreachable;
 }
@@ -1892,7 +1198,7 @@ fn printOutput(io: std.Io, transcript: []const u8) !void {
 }
 
 fn beginDelivery(supervisor: *Supervisor, problem: ?notifications.Problem) void {
-    if (supervisor.service.output == .desktop and supervisor.keyboard == null) openPasteKeyboard(supervisor);
+    if (supervisor.options.output == .desktop and supervisor.keyboard != .ready) openPasteKeyboard(supervisor);
     supervisor.phase = .{ .delivering = .{ .boundary_monotonic_ns = monotonicNanoseconds(), .problem = problem } };
     if (supervisor.clipboard == .disconnected) openClipboard(supervisor);
 }
@@ -1909,35 +1215,43 @@ fn advanceOutput(supervisor: *Supervisor) !void {
     const now_ns = monotonicNanoseconds();
     var stop_buffer: [32]u8 = undefined;
     const stop_origin = if (supervisor.recording_stop) |stop| @tagName(stop.origin) else "unavailable";
-    const text = std.mem.trim(u8, supervisor.transcript.bytes[0..supervisor.transcript.bytes_count], " \t\r\n");
+    const text = std.mem.trim(u8, transcriptBytes(supervisor)[0..supervisor.transcript.bytes_count], " \t\r\n");
     if (supervisor.service.shutdown_requested) closeClipboard(supervisor);
     if (supervisor.clipboard == .connected) {
         const event = switch (supervisor.clipboard.connected.advance(now_ns)) {
             .ok => |event| event,
             .err => |err| failed: {
                 clipboardError(supervisor, err);
-                break :failed clipboard_wayland.Event.none;
+                break :failed clipboard_module.Event.none;
             },
         };
         if (event == .acquired and supervisor.phase == .delivering) {
             const delivery = &supervisor.phase.delivering;
             assert(event.acquired == transcriptId(supervisor));
-            log.info(.{ .recording_ordinal = supervisor.recording_ordinal }, "Clipboard acquired: recording_ordinal={d}, transcript_size={d}, recording_stop_origin={s}, recording_stop_elapsed_ms={s}, clipboard_acquire_duration_ms={f}", .{
-                supervisor.recording_ordinal,                                                                          text.len, stop_origin, formatRecordingStopElapsedMilliseconds(&stop_buffer, supervisor),
+            log.info(.{ .recording_ordinal = supervisor.recording_ordinal }, "Clipboard acquired: recording_ordinal={d}, transcript_size={d}, recording_stop_origin={s}, recording_stop_elapsed_ms={s}, clipboard_backend={s}, clipboard_mode={s}, clipboard_acquire_duration_ms={f}", .{
+                supervisor.recording_ordinal,
+                text.len,
+                stop_origin,
+                formatRecordingStopElapsedMilliseconds(&stop_buffer, supervisor),
+                supervisor.clipboard.connected.backendName(),
+                @tagName(supervisor.clipboard.connected.mode),
                 decimal.fmt(@as(f64, @floatFromInt(now_ns - delivery.boundary_monotonic_ns)) / std.time.ns_per_ms, 3),
             });
             delivery.boundary_monotonic_ns = now_ns;
-            if (supervisor.service.output == .desktop and supervisor.keyboard == null)
-                delivery.problem = supervisor.paste_problem orelse .paste_failed;
-            delivery.paste = if (supervisor.service.output == .desktop and supervisor.keyboard != null)
-                .{ .settling = @max(now_ns + @as(u64, supervisor.service.paste_settle_ms) * std.time.ns_per_ms, supervisor.keyboard.?.usable_after_ns) }
+            if (supervisor.options.output == .desktop and supervisor.keyboard != .ready)
+                delivery.problem = switch (supervisor.keyboard) {
+                    .unavailable => |problem| problem,
+                    .disabled, .ready => .paste_failed,
+                };
+            delivery.paste = if (supervisor.options.output == .desktop and supervisor.keyboard == .ready)
+                .{ .settling = @max(now_ns + @as(u64, supervisor.options.paste_settle_ms) * std.time.ns_per_ms, supervisor.keyboard.ready.usable_after_ns) }
             else
                 .done;
         }
     }
     if (supervisor.phase != .delivering) return;
     const delivery = &supervisor.phase.delivering;
-    if (supervisor.clipboard == .connected and delivery.paste == .waiting and supervisor.clipboard.connected.phase == .ready) {
+    if (supervisor.clipboard == .connected and delivery.paste == .waiting and supervisor.clipboard.connected.ready()) {
         switch (supervisor.clipboard.connected.publish(transcriptId(supervisor), text, now_ns)) {
             .ok => delivery.paste = .acquiring,
             .err => |err| clipboardError(supervisor, err),
@@ -1952,18 +1266,18 @@ fn advanceOutput(supervisor: *Supervisor) !void {
     switch (delivery.paste) {
         .waiting, .acquiring, .done => {},
         .settling => |deadline_ns| if (now_ns >= deadline_ns) {
-            supervisor.keyboard.?.beginPaste(supervisor.service.paste_key, supervisor.service.paste_key_gap_ms, now_ns);
+            supervisor.keyboard.ready.beginPaste(supervisor.options.paste_key, supervisor.options.paste_key_gap_ms, now_ns);
             delivery.paste = .sending;
         },
         .sending => {},
     }
     if (delivery.paste == .sending) {
-        const complete = switch (supervisor.keyboard.?.advance(now_ns)) {
+        const complete = switch (supervisor.keyboard.ready.advance(now_ns)) {
             .ok => |complete| complete,
             .err => |err| failed: {
                 logPasteError(.err, .{ .recording_ordinal = supervisor.recording_ordinal }, "Paste error; clipboard retained, no retry", &err);
-                supervisor.keyboard.?.deinit();
-                supervisor.keyboard = null;
+                supervisor.keyboard.ready.deinit();
+                supervisor.keyboard = .{ .unavailable = pasteProblem(err) };
                 delivery.paste = .done;
                 delivery.problem = pasteProblem(err);
                 break :failed false;
@@ -1987,7 +1301,7 @@ fn advanceOutput(supervisor: *Supervisor) !void {
 // Choose the popup from both outcomes, so it never promises a saved file before
 // the rename succeeds.
 fn completeDelivery(supervisor: *Supervisor, problem: ?notifications.Problem) void {
-    const text = std.mem.trim(u8, supervisor.transcript.bytes[0..supervisor.transcript.bytes_count], " \t\r\n");
+    const text = std.mem.trim(u8, transcriptBytes(supervisor)[0..supervisor.transcript.bytes_count], " \t\r\n");
     if (text.len == 0) return;
     const save_error = saveTranscript(supervisor, text);
     const saved = save_error == null;
@@ -2000,19 +1314,22 @@ fn completeDelivery(supervisor: *Supervisor, problem: ?notifications.Problem) vo
         };
         supervisor.notifications.showOutput(cause, output);
     } else if (save_error) |err| {
-        supervisor.notifications.showOutput(saveProblem(err), .clipboard_unsaved);
+        supervisor.notifications.showOutput(err, .clipboard_unsaved);
     } else supervisor.notifications.recover();
 }
 
-fn saveTranscript(supervisor: *const Supervisor, text: []const u8) ?transcript_file.Error {
-    const directory_path = supervisor.service.transcript_directory.?;
+fn saveTranscript(supervisor: *const Supervisor, text: []const u8) ?notifications.Problem {
+    const directory_path = supervisor.service.transcript_directory orelse {
+        log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Transcript not saved: recording_ordinal={d}, reason=state_directory_unavailable", .{supervisor.recording_ordinal});
+        return .transcript_save_failed;
+    };
     const started = monotonicNanoseconds();
     var elapsed_buffer: [32]u8 = undefined;
     switch (transcript_file.save(supervisor.io, directory_path, text)) {
         .ok => {},
         .err => |err| {
             logTranscriptSaveError(.{ .recording_ordinal = supervisor.recording_ordinal }, directory_path, monotonicNanoseconds() - started, &err);
-            return err;
+            return saveProblem(err);
         },
     }
     log.info(.{ .recording_ordinal = supervisor.recording_ordinal }, "Transcript saved: recording_ordinal={d}, transcript_size={d}, transcript_save_duration_ms={s}", .{
@@ -2073,24 +1390,35 @@ fn formatRecordingStopElapsedMilliseconds(buffer: *[32]u8, supervisor: *const Su
 fn cancelDelivery(supervisor: *Supervisor) void {
     const delivery = &supervisor.phase.delivering;
     closeClipboard(supervisor);
-    if (supervisor.keyboard) |*keyboard| {
+    if (supervisor.keyboard == .ready) {
+        const keyboard = &supervisor.keyboard.ready;
         if (keyboard.pending != null) {
             keyboard.deinit();
-            supervisor.keyboard = null;
+            supervisor.keyboard = .disabled;
         }
     }
     delivery.paste = .done;
 }
 
 fn transcriptId(supervisor: *const Supervisor) u64 {
-    return if (supervisor.transcript.bytes.ptr == supervisor.transcript_storage[0].ptr) 1 else 2;
+    return @as(u64, supervisor.transcript.storage_index) + 1;
+}
+
+fn transcriptBytes(supervisor: *const Supervisor) []u8 {
+    const capacity = supervisor.transcript_storage.len / transcriptStorageCount(supervisor);
+    const offset = @as(usize, supervisor.transcript.storage_index) * capacity;
+    return supervisor.transcript_storage[offset..][0..capacity];
 }
 
 fn availableTranscript(supervisor: *const Supervisor) ?u1 {
-    for (supervisor.transcript_storage, 0..) |bytes, index| {
-        if (bytes.len != 0 and (supervisor.clipboard != .connected or !supervisor.clipboard.connected.isBorrowed(index + 1))) return @intCast(index);
+    for (0..transcriptStorageCount(supervisor)) |index| {
+        if (supervisor.clipboard != .connected or !supervisor.clipboard.connected.isBorrowed(index + 1)) return @intCast(index);
     }
     return null;
+}
+
+fn transcriptStorageCount(supervisor: *const Supervisor) usize {
+    return if (supervisor.options.output == .stdout) 1 else 2;
 }
 
 fn closeClipboard(supervisor: *Supervisor) void {
@@ -2098,29 +1426,82 @@ fn closeClipboard(supervisor: *Supervisor) void {
     supervisor.clipboard = .disconnected;
 }
 
-fn clipboardError(supervisor: *Supervisor, err: clipboard_wayland.Error) void {
+fn clipboardError(supervisor: *Supervisor, err: clipboard_module.Error) void {
     if (logging.enabled(.err)) {
-        var storage: [5]logging.Entry = undefined;
+        var storage: [10]logging.Entry = undefined;
         var fields: std.ArrayList(logging.Entry) = .initBuffer(&storage);
-        fields.appendAssumeCapacity(.{ "kind", .{ .str = @tagName(err) } });
+        var protocol_error = false;
         switch (err) {
-            .transport => |detail| fields.appendSliceAssumeCapacity(&.{
-                .{ "error", .{ .str = @errorName(detail.cause) } },
-                .{ "errno", .{ .errno = detail.errno } },
-                .{ "object", .{ .u = detail.object } },
-                .{ "opcode", .{ .u = detail.opcode } },
-            }),
-            .server => |*detail| fields.appendSliceAssumeCapacity(&.{
-                .{ "object", .{ .u = detail.object } },
-                .{ "code", .{ .u = detail.code } },
-                .{ "message", .{ .str = detail.message[0..detail.message_size] } },
-                .{ "truncated", .{ .b = detail.truncated } },
-            }),
-            .unsupported => |feature| fields.appendAssumeCapacity(.{ "feature", .{ .str = @tagName(feature) } }),
-            .timed_out => |phase| fields.appendAssumeCapacity(.{ "phase", .{ .str = @tagName(phase) } }),
-            .selection_lost, .busy, .invalid_text => {},
+            .wayland => |*detail| {
+                fields.appendSliceAssumeCapacity(&.{
+                    .{ "backend", .{ .str = "wayland" } },
+                    .{ "kind", .{ .str = @tagName(detail.*) } },
+                });
+                switch (detail.*) {
+                    .transport => |failure| fields.appendSliceAssumeCapacity(&.{
+                        .{ "error", .{ .str = @errorName(failure.cause) } },
+                        .{ "errno", .{ .errno = failure.errno } },
+                        .{ "object", .{ .u = failure.object } },
+                        .{ "opcode", .{ .u = failure.opcode } },
+                    }),
+                    .server => |*failure| {
+                        protocol_error = true;
+                        fields.appendSliceAssumeCapacity(&.{
+                            .{ "object", .{ .u = failure.object } },
+                            .{ "code", .{ .u = failure.code } },
+                            .{ "message", .{ .str = failure.message[0..failure.message_size] } },
+                            .{ "truncated", .{ .b = failure.truncated } },
+                        });
+                    },
+                    .unsupported => |feature| fields.appendAssumeCapacity(.{ "feature", .{ .str = @tagName(feature) } }),
+                    .timed_out => |phase| fields.appendAssumeCapacity(.{ "phase", .{ .str = @tagName(phase) } }),
+                    .selection_lost, .busy, .invalid_text => {},
+                }
+            },
+            .x11 => |*detail| {
+                fields.appendSliceAssumeCapacity(&.{
+                    .{ "backend", .{ .str = "x11" } },
+                    .{ "kind", .{ .str = @tagName(detail.*) } },
+                });
+                switch (detail.*) {
+                    .transport => |failure| fields.appendSliceAssumeCapacity(&.{
+                        .{ "error", .{ .str = @errorName(failure.cause) } },
+                        .{ "errno", .{ .errno = failure.errno } },
+                        .{ "response_type", .{ .u = failure.response_type } },
+                        .{ "sequence", .{ .u = failure.sequence } },
+                    }),
+                    .setup => |*failure| fields.appendSliceAssumeCapacity(&.{
+                        .{ "status", .{ .u = failure.status } },
+                        .{ "message", .{ .str = failure.reason[0..failure.reason_size] } },
+                        .{ "truncated", .{ .b = failure.truncated } },
+                    }),
+                    .server => |failure| {
+                        protocol_error = true;
+                        fields.appendSliceAssumeCapacity(&.{
+                            .{ "code", .{ .u = failure.code } },
+                            .{ "sequence", .{ .u = failure.sequence } },
+                            .{ "major_opcode", .{ .u = failure.major_opcode } },
+                            .{ "minor_opcode", .{ .u = failure.minor_opcode } },
+                            .{ "bad_value", .{ .u = failure.bad_value } },
+                        });
+                    },
+                    .authority => |failure| fields.appendSliceAssumeCapacity(&.{
+                        .{ "error", .{ .str = @errorName(failure.cause) } },
+                        .{ "errno", .{ .errno = failure.errno } },
+                    }),
+                    .unsupported => |feature| fields.appendAssumeCapacity(.{ "feature", .{ .str = @tagName(feature) } }),
+                    .timed_out => |phase| fields.appendAssumeCapacity(.{ "phase", .{ .str = @tagName(phase) } }),
+                    .selection_lost, .busy, .invalid_text => {},
+                }
+            },
+            .unavailable, .busy, .invalid_text => fields.appendAssumeCapacity(.{ "kind", .{ .str = @tagName(err) } }),
         }
-        log.kv(.err, .{ .recording_ordinal = supervisor.recording_ordinal }, if (err == .server) "Clipboard protocol error" else "Clipboard error", fields.items);
+        fields.appendSliceAssumeCapacity(&.{
+            .{ "transfers_completed", .{ .u = supervisor.clipboard.connected.transfers_completed } },
+            .{ "transfers_expired", .{ .u = supervisor.clipboard.connected.transfers_expired } },
+            .{ "transfers_rejected", .{ .u = supervisor.clipboard.connected.transfers_rejected } },
+        });
+        log.kv(.err, .{ .recording_ordinal = supervisor.recording_ordinal }, if (protocol_error) "Clipboard protocol error" else "Clipboard error", fields.items);
     }
     closeClipboard(supervisor);
     if (supervisor.phase == .delivering) {
@@ -2132,11 +1513,10 @@ fn clipboardError(supervisor: *Supervisor, err: clipboard_wayland.Error) void {
 fn openPasteKeyboard(supervisor: *Supervisor) void {
     switch (paste_keyboard.Keyboard.open(monotonicNanoseconds())) {
         .ok => |keyboard| {
-            supervisor.keyboard = keyboard;
-            supervisor.paste_problem = null;
+            supervisor.keyboard = .{ .ready = keyboard };
         },
         .err => |err| {
-            supervisor.paste_problem = pasteProblem(err);
+            supervisor.keyboard = .{ .unavailable = pasteProblem(err) };
             logPasteError(.warn, .{}, "Automatic paste unavailable; clipboard delivery remains enabled", &err);
         },
     }
@@ -2199,18 +1579,32 @@ noinline fn logPasteError(severity: logging.Level, context: logging.Context, mes
     log.kv(severity, context, message, fields.items);
 }
 
-fn audioProblem(err: audio_process.Error) notifications.Problem {
+fn audioProblem(err: capture_module.Error) notifications.Problem {
     return switch (err) {
         .source_not_found => .microphone_not_found,
         .source_ambiguous => .microphone_ambiguous,
         .source_connection_lost => .microphone_connection_lost,
         .source_changed => .microphone_changed,
-        .source_observation => .microphone_identity_unavailable,
         .pipeline_full => .audio_processing_behind,
         .setup => .audio_setup_failed,
-        .capture => .microphone_failed,
-        .teardown => .audio_teardown_failed,
-        .invalid_report => .exchange_corrupt,
+        .unexpected_format,
+        .timeline_discontinuity,
+        .stream_error,
+        .stream_disconnected,
+        .invalid_buffer,
+        .corrupted_buffer,
+        => .microphone_failed,
+    };
+}
+
+const CaptureFailureCause = struct { domain: []const u8, code: i64 };
+
+fn captureFailureCause(cause: capture_module.FailureCause) CaptureFailureCause {
+    return switch (cause) {
+        .zig => |err| .{ .domain = "zig", .code = @intFromError(err) },
+        .linux => |err| .{ .domain = "linux", .code = @intFromEnum(err) },
+        .pipewire => |code| .{ .domain = "pipewire", .code = code },
+        .audio => |err| .{ .domain = "audio", .code = @intFromEnum(err) },
     };
 }
 
@@ -2242,26 +1636,19 @@ fn saveProblem(err: transcript_file.Error) notifications.Problem {
 }
 
 fn enterIdle(supervisor: *Supervisor) void {
-    // Delivery no longer borrows session text. An acknowledged result or reaped
-    // worker released every audio borrow before this idle timer starts.
-    supervisor.phase = .{ .idle = if (supervisor.transcription == .running and !supervisor.service.shutdown_requested)
-        monotonicNanoseconds() + @as(u64, supervisor.service.model_keep_warm_seconds) * std.time.ns_per_s
+    // Delivery no longer borrows session text. Acknowledged completion released every audio borrow before this idle timer starts.
+    supervisor.phase = .idle;
+    if (supervisor.transcription == .idle) supervisor.transcription.idle = if (!supervisor.service.shutdown_requested)
+        monotonicNanoseconds() + @as(u64, supervisor.options.model_keep_warm_seconds) * std.time.ns_per_s
     else
-        null };
+        null;
 }
 
-// PERFORMANCE: Keep final-report formatting outside packet dispatch. Inlining
+// PERFORMANCE: Keep final-report formatting outside result dispatch. Inlining
 // exposes the report's tagged payloads to the caller's branches and expands the
 // diagnostic code in ReleaseSafe. One call per completed capture is off the
 // graph-processing path; the report remains borrowed only during this call.
-noinline fn logCaptureReport(recording_ordinal: u64, report: *const audio_process.CaptureReport) void {
-    const outcome_name = switch (report.end) {
-        .completed => "completed",
-        .automatic_stop => "automatic_stop",
-        .stopped => "stopped",
-        .cancelled => "cancelled",
-        .failed => |failure| @tagName(failure.outcome),
-    };
+noinline fn logCaptureReport(recording_ordinal: u64, outcome_name: []const u8, report: *const capture_module.CaptureReport, failure: ?*const capture_module.RuntimeFailure) void {
     const source_description = if (report.source_identity) |source|
         source.node_description[0..source.node_description_size]
     else
@@ -2275,28 +1662,25 @@ noinline fn logCaptureReport(recording_ordinal: u64, report: *const audio_proces
     else
         -1;
 
-    log.info(.{ .recording_ordinal = recording_ordinal }, "Capture ended: recording_ordinal={d}, outcome={s}, audio_duration_seconds={f}, audio_samples_published_count={d}, audio_samples_captured_count={d}, microphone_description=\"{f}\"", .{ recording_ordinal, outcome_name, decimal.fmt(@as(f64, @floatFromInt(report.samples_count)) / audio_process.sample_rate_hz, 3), report.published_samples_count, report.samples_count, std.zig.fmtString(source_description) });
+    log.info(.{ .recording_ordinal = recording_ordinal }, "Capture ended: recording_ordinal={d}, outcome={s}, audio_duration_seconds={f}, audio_samples_published_count={d}, audio_samples_captured_count={d}, microphone_description=\"{f}\"", .{ recording_ordinal, outcome_name, decimal.fmt(@as(f64, @floatFromInt(report.samples_count)) / capture_module.sample_rate_hz, 3), report.published_samples_count, report.samples_count, std.zig.fmtString(source_description) });
 
     log.info(.{ .recording_ordinal = recording_ordinal }, "Capture protocol: recording_ordinal={d}, pipewire_server_version=\"{f}\", client_node_version_advertised={d}, client_node_version_selected={d}, graph_rate_hz={d}, graph_channels_count={d}, callback_duration_ms_max={f}, callback_gap_ms_max={f}", .{ recording_ordinal, std.zig.fmtString(report.pipewire_server_version[0..report.pipewire_server_version_size]), report.client_node_version_advertised, report.client_node_version_selected, if (report.negotiated_format) |format| format.sample_rate_hz else 0, if (report.negotiated_format) |format| format.channels_count else 0, decimal.fmt(if (report.callback) |callback| @as(f64, @floatFromInt(callback.duration_ns_max)) / std.time.ns_per_ms else 0, 3), decimal.fmt(if (report.callback) |callback| @as(f64, @floatFromInt(callback.gap_ns_max)) / std.time.ns_per_ms else 0, 3) });
 
-    if (report.end == .failed or report.teardown_failure != null) {
+    if (failure != null) {
         if (report.source_identity) |source| log.err(.{ .recording_ordinal = recording_ordinal }, "Capture source: recording_ordinal={d}, node_id={d}, node_object_serial={d}, device_id={d}, device_object_serial={d}, node_name=\"{f}\", node_description=\"{f}\", device_serial=\"{f}\", device_description=\"{f}\"", .{ recording_ordinal, source.node_id, source.node_object_serial, source.device_id, source.device_object_serial, std.zig.fmtString(source.node_name[0..source.node_name_size]), std.zig.fmtString(source.node_description[0..source.node_description_size]), std.zig.fmtString(source.device_serial[0..source.device_serial_size]), std.zig.fmtString(source.device_description[0..source.device_description_size]) });
     }
-    if (report.end == .failed) {
-        const failure = report.end.failed.detail;
-        log.err(.{ .recording_ordinal = recording_ordinal }, "Capture failed: recording_ordinal={d}, stage={s}, error_domain={s}, error_code={d}, detail=\"{f}\"", .{ recording_ordinal, @tagName(failure.coordinate.stage), @tagName(failure.coordinate.domain), failure.coordinate.code, std.zig.fmtString(failure.message[0..failure.message_size]) });
-    }
-    if (report.teardown_failure) |failure| {
-        log.err(.{ .recording_ordinal = recording_ordinal }, "Capture teardown failed: recording_ordinal={d}, stage={s}, error_domain={s}, error_code={d}, detail=\"{f}\"", .{ recording_ordinal, @tagName(failure.coordinate.stage), @tagName(failure.coordinate.domain), failure.coordinate.code, std.zig.fmtString(failure.message[0..failure.message_size]) });
+    if (failure) |detail| {
+        const cause = captureFailureCause(detail.cause);
+        log.err(.{ .recording_ordinal = recording_ordinal }, "Capture failed: recording_ordinal={d}, stage={s}, error_domain={s}, error_code={d}, detail=\"{f}\"", .{ recording_ordinal, @tagName(detail.stage), cause.domain, cause.code, std.zig.fmtString(detail.message[0..detail.message_size]) });
     }
 
     // These failures reduce scheduling guarantees, not the validity of already
     // captured samples. Preserve the warnings without discarding valid audio.
     if (report.callback != null and
-        (scheduler_priority <= 0 or !audio_process.schedulerPolicyIsRealtime(scheduler_policy)))
+        (scheduler_priority <= 0 or !capture_module.schedulerPolicyIsRealtime(scheduler_policy)))
     {
         log.warn(.{ .recording_ordinal = recording_ordinal }, "Capture did not obtain realtime scheduling: recording_ordinal={d}, policy={s}, priority={d}", .{
-            recording_ordinal, audio_process.schedulerPolicyName(scheduler_policy), scheduler_priority,
+            recording_ordinal, capture_module.schedulerPolicyName(scheduler_policy), scheduler_priority,
         });
     }
     if (report.memory_lock == .unavailable) {
@@ -2307,50 +1691,20 @@ noinline fn logCaptureReport(recording_ordinal: u64, report: *const audio_proces
     }
 }
 
-fn audioProcessExists(supervisor: *const Supervisor) bool {
-    return if (supervisor.audio.process) |audio| audio.operation != .idle and audio.operation != .initializing else false;
+fn captureActive(supervisor: *const Supervisor) bool {
+    return supervisor.audio.operation != .idle;
 }
 
-fn publishedSlots(supervisor: *Supervisor) union(enum) { count: u32, corrupt } {
+fn processedChunksCount(transcript: *const TranscriptProgress) u32 {
+    return transcript.accepted_chunks_count + transcript.no_speech_chunks_count;
+}
+
+fn publishedSlots(supervisor: *Supervisor) u32 {
     var count: u32 = 0;
     for (&supervisor.audio_exchange.slots) |*slot| {
-        switch (audio_exchange.acquireSlot(slot)) {
-            .empty => {},
-            .published => count += 1,
-            .corrupt => return .corrupt,
-        }
+        if (audio_exchange.acquireSlot(slot) != null) count += 1;
     }
-    return .{ .count = count };
-}
-
-fn createSharedMemory(name: [:0]const u8, size: usize) !std.posix.fd_t {
-    const descriptor = try std.posix.memfd_create(
-        name,
-        linux.MFD.CLOEXEC | linux.MFD.ALLOW_SEALING,
-    );
-    errdefer closeDescriptor(descriptor);
-    try checkSyscall("ftruncate", linux.ftruncate(descriptor, @intCast(size)));
-    try checkSyscall("fcntl", linux.fcntl(
-        descriptor,
-        linux.F.ADD_SEALS,
-        linux.F.SEAL_GROW | linux.F.SEAL_SHRINK | linux.F.SEAL_SEAL,
-    ));
-    return descriptor;
-}
-
-fn mapSharedMemory(
-    descriptor: std.posix.fd_t,
-    comptime T: type,
-) !SharedMapping {
-    const bytes = try std.posix.mmap(
-        null,
-        @sizeOf(T),
-        .{ .READ = true, .WRITE = true },
-        .{ .TYPE = .SHARED },
-        descriptor,
-        0,
-    );
-    return .{ .bytes = bytes };
+    return count;
 }
 
 fn register(
@@ -2372,70 +1726,6 @@ fn register(
     if (linux.errno(result) != .SUCCESS) {
         log.err(.{}, "Event registration failed: operation=epoll_ctl_add, fd={d}, source={t}, errno={f}", .{ descriptor, source, logging.fmtErrno(linux.errno(result)) });
         return error.SupervisorEpollRegisterFailed;
-    }
-}
-
-fn unregister(epoll_fd: std.posix.fd_t, descriptor: std.posix.fd_t) void {
-    const result = linux.epoll_ctl(
-        epoll_fd,
-        linux.EPOLL.CTL_DEL,
-        descriptor,
-        null,
-    );
-    logCleanupSyscall("epoll_ctl_del", result);
-}
-
-fn unregisterSocket(epoll_fd: std.posix.fd_t, process: *ChildProcess) void {
-    const socket = process.socket orelse {
-        return;
-    };
-    unregister(epoll_fd, socket);
-    closeDescriptor(socket);
-    process.socket = null;
-}
-
-fn unregisterChild(
-    epoll_fd: std.posix.fd_t,
-    process: *ChildProcess,
-) void {
-    unregisterSocket(epoll_fd, process);
-    unregister(epoll_fd, process.pid_fd);
-}
-
-// This rollback path runs outside the event loop, including partially failed
-// launches. It closes every owned descriptor exactly once even if SIGKILL
-// cannot complete; only pidfd readiness permits the otherwise blocking reap.
-fn forceStopAndReap(process: *ChildProcess) !void {
-    defer {
-        if (process.socket) |socket| closeDescriptor(socket);
-        process.socket = null;
-        closeDescriptor(process.pid_fd);
-    }
-    try signalChild(process);
-    const deadline_monotonic_ns = monotonicNanoseconds() + std.time.ns_per_s;
-    var descriptors = [_]linux.pollfd{.{ .fd = process.pid_fd, .events = linux.POLL.IN, .revents = 0 }};
-    while (true) {
-        const remaining_ns = deadline_monotonic_ns -| monotonicNanoseconds();
-        if (remaining_ns == 0) {
-            return error.SupervisorWorkerCleanupDeadlineExceeded;
-        }
-        const timeout_ms: i32 = @intCast(std.math.divCeil(u64, remaining_ns, std.time.ns_per_ms) catch unreachable);
-        const result = linux.poll(&descriptors, descriptors.len, timeout_ms);
-        switch (linux.errno(result)) {
-            .SUCCESS => {},
-            .INTR => continue,
-            else => {
-                log.err(.{}, "Worker cleanup failed: operation=poll, errno={f}", .{logging.fmtErrno(linux.errno(result))});
-                return error.SupervisorWorkerCleanupPollFailed;
-            },
-        }
-        if (result == 0) continue;
-        if (descriptors[0].revents & linux.POLL.IN == 0) {
-            log.err(.{}, "Worker cleanup failed: operation=poll, events=0x{x}", .{descriptors[0].revents});
-            return error.SupervisorWorkerCleanupPollFailed;
-        }
-        _ = try reapChild(process);
-        return;
     }
 }
 
@@ -2510,54 +1800,6 @@ fn readSignal(descriptor: std.posix.fd_t) !?linux.signalfd_siginfo {
         try checkSyscall("read_signal", result);
         assert(result == @sizeOf(linux.signalfd_siginfo));
         return signal;
-    }
-}
-
-fn setCloseOnExec(descriptor: std.posix.fd_t) !void {
-    try checkSyscall("fcntl", linux.fcntl(descriptor, linux.F.SETFD, linux.FD_CLOEXEC));
-}
-
-fn signalChild(process: *const ChildProcess) !void {
-    while (true) {
-        const result = linux.pidfd_send_signal(
-            process.pid_fd,
-            .KILL,
-            null,
-            0,
-        );
-        switch (linux.errno(result)) {
-            .SUCCESS, .SRCH => {
-                return;
-            },
-            .INTR => continue,
-            else => {
-                log.err(.{}, "Worker termination failed: operation=pidfd_send_signal, pid_fd={d}, signal=KILL, errno={f}", .{ process.pid_fd, logging.fmtErrno(linux.errno(result)) });
-                return error.SupervisorWorkerKillFailed;
-            },
-        }
-    }
-}
-
-fn reapChild(process: *const ChildProcess) !linux.siginfo_t {
-    var information: linux.siginfo_t = std.mem.zeroes(linux.siginfo_t);
-    while (true) {
-        const result = linux.waitid(
-            .PIDFD,
-            process.pid_fd,
-            &information,
-            linux.W.EXITED,
-            null,
-        );
-        switch (linux.errno(result)) {
-            .SUCCESS => {
-                return information;
-            },
-            .INTR => continue,
-            else => {
-                log.err(.{}, "Worker reap failed: operation=waitid, pid_fd={d}, errno={f}", .{ process.pid_fd, logging.fmtErrno(linux.errno(result)) });
-                return error.SupervisorWorkerReapFailed;
-            },
-        }
     }
 }
 

@@ -23,7 +23,7 @@ pub fn Result(comptime T: type) type {
 pub const Mode = enum { core, wlr, ext };
 pub const Phase = enum { discovering, binding, ready, focus, selection, restoring };
 pub const Event = union(enum) { none, ready, acquired: u64 };
-pub const Environment = struct { runtime_directory: ?[]const u8, display: ?[]const u8 };
+pub const Environment = struct { runtime_directory: ?[]const u8, display: []const u8 };
 const Kind = enum { display, registry, discovery, binding, selection, restoring, compositor, shm, seat, keyboard, manager, device, source, surface, pool, buffer, shell, xdg_surface, toplevel, gtk_shell, gtk_surface };
 const Object = struct { kind: Kind, destroyed: bool = false };
 const Global = struct { name: u32 = 0, version: u32 = 0, object: u32 = 0 };
@@ -142,7 +142,7 @@ pub const Client = struct {
     }
 
     fn start(self: *Client, environment: Environment) !void {
-        const display = environment.display orelse "wayland-0";
+        const display = environment.display;
         var path: [108]u8 = undefined;
         const socket = if (std.fs.path.isAbsolute(display)) display else try std.fmt.bufPrint(&path, "{s}/{s}", .{ environment.runtime_directory orelse {
             self.problem = .{ .unsupported = .display };
@@ -235,9 +235,10 @@ pub const Client = struct {
     fn dispatch(self: *Client, object: u32, opcode: u16, r: *wire.Reader, now_ns: u64, event: *Event) !void {
         // Server-created offers use the server ID namespace. We immediately
         // destroy them: this write-only client never reads another selection.
-        // Already-queued MIME/action events may still follow that destruction.
+        // Already-queued MIME events may still follow that destruction.
         if (object >= 0xff000000) {
-            if (opcode == 0) _ = try r.string() else if (self.mode == .core and (opcode == 1 or opcode == 2)) _ = try r.word() else return error.InvalidMessage;
+            if (opcode != 0) return error.InvalidMessage;
+            _ = try r.string();
             return;
         }
         if (object >= self.objects.len) return error.InvalidMessage;
@@ -309,14 +310,9 @@ pub const Client = struct {
                     else => unreachable,
                 }
             },
-            .seat => switch (opcode) {
-                0 => {
-                    self.keyboard_capable = try r.word() & 2 != 0;
-                },
-                1 => {
-                    _ = try r.string();
-                },
-                else => return error.InvalidMessage,
+            .seat => {
+                if (opcode != 0) return error.InvalidMessage;
+                self.keyboard_capable = try r.word() & 2 != 0;
             },
             .keyboard => switch (opcode) {
                 0 => {
@@ -339,10 +335,6 @@ pub const Client = struct {
                 },
                 4 => {
                     for (0..5) |_| _ = try r.word();
-                },
-                5 => {
-                    _ = try r.word();
-                    _ = try r.word();
                 },
                 else => return error.InvalidMessage,
             },
@@ -410,11 +402,7 @@ pub const Client = struct {
                             return error.SelectionLost;
                         };
                     };
-                } else if (self.mode == .core and opcode == 0) {
-                    _ = try r.string();
-                } else if (self.mode == .core and opcode == 5) {
-                    _ = try r.word();
-                } else if (self.mode == .core and (opcode == 3 or opcode == 4)) {} else return error.InvalidMessage;
+                } else return error.InvalidMessage;
             },
             .shell => {
                 if (opcode != 0) return error.InvalidMessage;
@@ -475,10 +463,10 @@ pub const Client = struct {
             self.problem = .{ .unsupported = .clipboard };
             return error.Unsupported;
         }
-        try self.bind(&self.seat, "wl_seat", 7, .seat);
+        try self.bind(&self.seat, "wl_seat", 1, .seat);
         switch (self.mode) {
-            .core => try self.bind(&self.core, "wl_data_device_manager", 3, .manager),
-            .wlr => try self.bind(&self.wlr, "zwlr_data_control_manager_v1", 2, .manager),
+            .core => try self.bind(&self.core, "wl_data_device_manager", 1, .manager),
+            .wlr => try self.bind(&self.wlr, "zwlr_data_control_manager_v1", 1, .manager),
             .ext => try self.bind(&self.ext, "ext_data_control_manager_v1", 1, .manager),
         }
         self.device = try self.allocate(.device);
@@ -488,7 +476,7 @@ pub const Client = struct {
                 self.problem = .{ .unsupported = .surface };
                 return error.Unsupported;
             }
-            try self.bind(&self.compositor, "wl_compositor", 4, .compositor);
+            try self.bind(&self.compositor, "wl_compositor", 1, .compositor);
             try self.bind(&self.shm, "wl_shm", 1, .shm);
             try self.bind(&self.shell, "xdg_wm_base", 1, .shell);
             // gtk_surface.release arrived in v4. Binding only when available
@@ -509,12 +497,6 @@ pub const Client = struct {
         try self.words(self.shell.object, 2, &.{ xdg, surface });
         try self.words(xdg, 1, &.{toplevel});
         if (gtk != 0) try self.words(self.gtk.object, 0, &.{ gtk, surface });
-        var w: wire.Writer = .{};
-        try w.string("Voiced clipboard");
-        try self.connection.send(toplevel, 2, w.data(), null);
-        w.size = 0;
-        try w.string("voiced");
-        try self.connection.send(toplevel, 3, w.data(), null);
         try self.words(surface, 6, &.{}); // Configure before attaching a buffer.
         return .{ .surface = surface, .xdg = xdg, .toplevel = toplevel, .gtk = gtk };
     }

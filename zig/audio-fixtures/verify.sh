@@ -22,8 +22,17 @@ while IFS=$'\t' read -r \
     printf 'missing pair for %s\n' "$id" >&2
     exit 1
   }
-  printf '%s  %s\n' "$wav_hash" "$wav" | sha256sum --check --status
-  printf '%s  %s\n' "$transcript_hash" "$transcript" | sha256sum --check --status
+  "${PYTHON:-python3}" - "$wav_hash" "$wav" "$transcript_hash" "$transcript" <<'PY'
+import hashlib
+import sys
+from blake3 import blake3
+
+for expected, path in zip(sys.argv[1::2], sys.argv[2::2]):
+    with open(path, "rb") as source:
+        actual = hashlib.file_digest(source, blake3).hexdigest()
+    if actual != expected:
+        sys.exit(f"BLAKE3 mismatch: {path}: expected {expected}, got {actual}")
+PY
 
   format=$(ffprobe -v error \
     -show_entries stream=codec_name,sample_rate,channels \

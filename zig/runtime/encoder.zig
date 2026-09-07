@@ -8,7 +8,8 @@ const linear = @import("linear.zig");
 const log_mel = @import("log_mel.zig");
 const model_module = @import("model.zig");
 const normalization = @import("normalization.zig");
-const Lane = @import("executor.zig").Lane;
+const executor = @import("executor.zig");
+const Lane = executor.Lane;
 const InferenceWeights = model_module.InferenceWeights;
 const ModelSpecification = model_module.ModelSpecification;
 const assert = std.debug.assert;
@@ -47,7 +48,7 @@ pub const Encoder = struct {
     /// `encode` writes `features.encoderPositionsCount()` rows of `encoder_width`
     /// values into `memory.encoded_audio`. All lanes participate and synchronize
     /// before returning; the remainder of the output capacity is untouched.
-    pub fn encode(encoder: *Encoder, specification: ModelSpecification, weights: *const InferenceWeights, features: log_mel.Features, lane: Lane) void {
+    pub fn encode(encoder: *Encoder, specification: ModelSpecification, weights: *const InferenceWeights, features: log_mel.Features, lane: Lane, cancel: *executor.Cancellation) void {
         const frames_count = features.frames_count;
         const positions_count = features.encoderPositionsCount();
         const width = specification.encoder_width;
@@ -72,7 +73,9 @@ pub const Encoder = struct {
         for (position_values_range.start_index..position_values_range.end_index) |value_index| {
             activation[value_index] += weights.encoder_position_encodings[value_index];
         }
+        cancel.sampleBeforeBarrier(lane);
         lane.sync();
+        if (cancel.observed) return;
 
         // ── Transformer Layers ──
 
@@ -90,7 +93,11 @@ pub const Encoder = struct {
             lane.sync();
 
             linear.forwardFeedForwardResidualRows(activation, layer_weights.ffn_layer_norm_gamma, layer_weights.ffn_layer_norm_beta, positions_count, layer_weights.ffn_expansion_weight, layer_weights.ffn_expansion_bias, layer_weights.ffn_contraction_weight, layer_weights.ffn_contraction_bias, laneFloatRow(encoder, lane), laneQuantizedRow(encoder, lane), lane);
+            // Every continuing layer contains collective operations before this
+            // next sample; all lanes have consumed the previous decision first.
+            cancel.sampleBeforeBarrier(lane);
             lane.sync();
+            if (cancel.observed) return;
         }
 
         normalization.forwardRows(activation, weights.encoder_layer_norm_gamma, weights.encoder_layer_norm_beta, positions_count, width, encoded_audio, lane);

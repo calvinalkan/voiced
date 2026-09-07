@@ -3,7 +3,8 @@
 //! an N-by-N tensor; decoder attention consumes persistent head-major K/V.
 
 const std = @import("std");
-const Lane = @import("executor.zig").Lane;
+const executor_module = @import("executor.zig");
+const Lane = executor_module.Lane;
 const assert = std.debug.assert;
 
 pub const head_width: usize = 64;
@@ -706,7 +707,7 @@ test "encoder attention tiles preserve scalar accumulation order" {
         for ([_]usize{ 4, 16, 32 }) |workers_count| {
             const parallel_scratch = try allocator.alloc(f32, encoderScratchValuesCount(workers_count));
             defer allocator.free(parallel_scratch);
-            var executor: @import("executor.zig").Executor = undefined;
+            var executor: executor_module.Executor = undefined;
             try executor.init(std.testing.io, workers_count);
             defer executor.deinit();
             var context: AttentionTraversalCheck = .{ .qkv = qkv, .positions_count = positions_count, .output = actual, .scratch = parallel_scratch };

@@ -31,9 +31,19 @@ pub fn main(init: std.process.Init) !void {
     @memcpy(std.mem.sliceAsBytes(samples), bytes);
     logging.initCli(.info);
     defer logging.deinit();
-    var loaded = try model_cache.loadModel(init, selected);
+    const installed_models_root = try models.allocInstalledRootPath(init);
+    defer init.gpa.free(installed_models_root);
+    const model_cache_root = try model_cache.allocCacheRootPath(init);
+    defer init.gpa.free(model_cache_root);
+    const context: model_cache.Context = .{
+        .io = init.io,
+        .allocator = init.gpa,
+        .installed_models_root = installed_models_root,
+        .cache_root = model_cache_root,
+    };
+    var loaded = try model_cache.loadModel(context, selected, null);
     defer loaded.deinit();
-    const vocabulary = try model_cache.loadVocabulary(init, selected);
+    const vocabulary = try model_cache.loadVocabulary(context, selected);
     defer init.gpa.free(vocabulary);
     const policy: inference.Policy = .{ .samples_count_max = 480000, .workers_count = encoder_threads, .decoder_workers_count = decoder_threads, .generated_tokens_count_max = token_limit };
     const size = try inference.Runtime.requiredMemorySize(loaded.model.kind, policy);
@@ -54,7 +64,7 @@ pub fn main(init: std.process.Init) !void {
     if (result) |value| {
         if (value.end == .token_limit) error_name = "GeneratedTokenLimitExceeded";
     }
-    var evidence: debug_capture.Evidence = .{ .chunk_available = 1, .samples = @intCast(samples.len), .token_limit = token_limit };
+    var evidence: debug_capture.Evidence = .{ .chunk_available = true, .samples = @intCast(samples.len), .token_limit = token_limit };
     evidence.finish(decoded, timings);
     const tokens = runtime.generated_tokens[0..evidence.tokens];
     const generated = if (decoded) |value| value.text else "";
@@ -67,8 +77,8 @@ pub fn main(init: std.process.Init) !void {
         .contains_activity = false,
         .model = selected.name(),
         .model_revision = selected.metadata().revision,
-        .source_sha256 = selected.metadata().weights.sha256,
-        .packed_image_sha256 = debug_capture.imageDigest(&loaded.model),
+        .source_blake3 = selected.metadata().weights.blake3,
+        .packed_image_blake3 = debug_capture.imageDigest(&loaded.model),
         .model_encoder_threads = encoder_threads,
         .model_decoder_threads = decoder_threads,
         .model_encoder_padding_seconds = debug_capture.paddingSeconds(padding),

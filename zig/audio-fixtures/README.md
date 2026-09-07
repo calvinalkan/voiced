@@ -27,9 +27,10 @@ Each split contains two female and two male speakers in each duration range:
 20–29.5 seconds
 ```
 
-A speaker occurs at most once in each split. Selection is deterministic from the SHA-256 ordering of eligible LibriSpeech utterance IDs.
+A speaker occurs at most once in each split. The selected utterance IDs are fixed
+in `manifest.tsv`; migrating checksum algorithms does not resample the corpus.
 
-`manifest.tsv` records source and checksum provenance for `verify.sh`; the Zig test does not parse it. The test discovers `.wav` files directly from `audio/` and derives each adjacent `.transcript` filename.
+`manifest.tsv` records source and BLAKE3-256 checksum provenance for `verify.sh`; the Zig test does not parse it. The test discovers `.wav` files directly from `audio/` and derives each adjacent `.transcript` filename.
 
 Run every audio fixture with the default `base.en` model from the repository root:
 
@@ -67,7 +68,16 @@ VOICED_RUNTIME_AUDIO_FIXTURE=librispeech-test-clean-6829-68769-0026 zig test zig
 
 An external directory can supply additional fixtures through `VOICED_RUNTIME_AUDIO_FIXTURES_DIRECTORY`. It must follow the same adjacent `.wav` and `.transcript` convention.
 
-Run `./verify.sh` to validate the recorded checksums and WAV representation.
+The verifier requires `ffprobe` and Python 3.11+ with the `blake3` package. From
+the repository root, use the optional reference environment:
+
+```bash
+.venv/bin/python -m pip install blake3
+PYTHON=.venv/bin/python zig/audio-fixtures/verify.sh
+```
+
+This validates the recorded BLAKE3-256 checksums and WAV representation. `PYTHON`
+defaults to `python3` when that interpreter already has `blake3` installed.
 
 ## Transcription comparison
 
@@ -92,8 +102,8 @@ The clips come from the official LibriSpeech `test-clean` and `test-other` archi
 ```text
 https://www.openslr.org/12
 
-test-clean.tar.gz MD5 32fa31d27d2e1cad72775fee3f4849a9
-test-other.tar.gz MD5 fb5a50374b501bb3bac4815ee91d3135
+test-clean.tar.gz BLAKE3-256 c4f1173bb85312ed40f04f2477d7e3a2e9158c15174225187cd3b7ec8e4879f6
+test-other.tar.gz BLAKE3-256 31e9d274a778b4d73e01e873229cf3e691afa2922e4a616a3025a94a1744324e
 ```
 
 LibriSpeech is Copyright 2014 Vassil Panayotov and licensed under Creative Commons Attribution 4.0 International. See `LIBRISPEECH-LICENSE.txt`.

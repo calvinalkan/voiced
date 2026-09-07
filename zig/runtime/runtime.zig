@@ -33,6 +33,7 @@ pub const EncoderTrailingPadding = log_mel.EncoderTrailingPadding;
 pub const Token = decoder_module.Token;
 
 pub const RuntimeError = error{
+    Cancelled,
     AudioTooShort,
     AudioDurationExceedsLimit,
     InvalidPolicy,
@@ -65,6 +66,10 @@ pub const Policy = struct {
 /// `TranscribeOptions` selects behavior that does not alter runtime capacity.
 /// Different calls on one runtime may use different trailing-padding values.
 pub const TranscribeOptions = struct {
+    /// Optional cooperative stop. Keep the flag alive until the call finishes;
+    /// once set, leave it set until return. Completion can win the cancellation
+    /// race. All compute lanes join before either outcome permits runtime reuse.
+    cancellation: ?*const std.atomic.Value(bool) = null,
     /// Normalized silence appended after content before encoder execution.
     encoder_trailing_padding: EncoderTrailingPadding = .seconds_30,
 
@@ -205,6 +210,7 @@ pub const Runtime = struct {
     pub fn transcribe(runtime: *Runtime, samples: []const f32, text_output: []u8, options: TranscribeOptions) RuntimeError!Transcription {
         if (options.evidence) |evidence| evidence.* = null;
         if (options.timings) |timings| timings.* = .{};
+        if (options.cancellation) |cancel| if (cancel.load(.acquire)) return error.Cancelled;
         for (samples) |sample| {
             if (!std.math.isFinite(sample) or sample < -1.0 or sample > 1.0) {
                 return error.InvalidSamples;
@@ -227,6 +233,7 @@ pub const Runtime = struct {
         var context: TranscriptionContext = .{
             .runtime = runtime,
             .features = features,
+            .cancellation = .{ .requested = options.cancellation },
             .timings = options.timings,
         };
         if (options.timings) |timings| {
@@ -236,8 +243,12 @@ pub const Runtime = struct {
         // Join the wide operation before narrowing: lane scratch views depend
         // on the active count, so decoding may repartition storage formerly
         // owned by encoder-only workers.
+        if (options.cancellation) |cancel| if (cancel.load(.acquire)) return error.Cancelled;
         runtime.executor.run(@ptrCast(&context), encodeWide);
+        if (context.cancellation.observed) return error.Cancelled;
         runtime.executor.runWithWorkers(runtime.decoder_workers_count, @ptrCast(&context), decodeWide);
+
+        if (context.cancellation.observed) return error.Cancelled;
 
         const scored_tokens_count = context.generated_tokens_count + @intFromBool(context.next_token == end_of_text_token);
         const average_log_probability = if (scored_tokens_count == 0) 0 else context.selected_log_probabilities_sum / @as(f32, @floatFromInt(scored_tokens_count));
@@ -268,6 +279,7 @@ pub const Runtime = struct {
 };
 
 const TranscriptionContext = struct {
+    cancellation: executor_module.Cancellation,
     runtime: *Runtime,
     features: log_mel.Features,
     timings: ?*Timings = null,
@@ -286,7 +298,7 @@ fn encodeWide(raw_context: *anyopaque, lane: Lane) void {
 
     // ── Encode Audio ──
 
-    runtime.encoder.encode(specification, weights, context.features, lane);
+    runtime.encoder.encode(specification, weights, context.features, lane, &context.cancellation);
     if (lane.isLeader()) {
         if (context.timings) |timings| {
             const now = std.Io.Clock.awake.now(runtime.executor.io);
@@ -319,7 +331,9 @@ fn decodeWide(raw_context: *anyopaque, lane: Lane) void {
     if (lane.isLeader()) {
         context.no_speech_probability = probabilityOfToken(runtime.decoder.logits(), no_speech_token);
     }
+    context.cancellation.sampleBeforeBarrier(lane);
     lane.sync();
+    if (context.cancellation.observed) return;
 
     runtime.decoder.decodeToken(specification, weights, encoder_positions_count, no_timestamps_token, 1, lane);
 
@@ -344,7 +358,12 @@ fn decodeWide(raw_context: *anyopaque, lane: Lane) void {
                 context.generated_tokens_count += 1;
             }
         }
+        // decodeToken's collective barriers ensure the previous decision has
+        // been consumed before this next sample. Reuse the token-publication
+        // barrier: extra per-token barriers measurably slow the smaller model.
+        context.cancellation.sampleBeforeBarrier(lane);
         lane.sync();
+        if (context.cancellation.observed) return;
 
         // The final allowed token has already been selected and scored; its
         // next distribution would have no consumer. The local position keeps

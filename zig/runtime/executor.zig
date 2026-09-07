@@ -70,6 +70,25 @@ pub const Lane = struct {
     }
 };
 
+/// One cancellation decision shared by all lanes in a synchronous operation.
+/// Sampling piggybacks an existing barrier rather than adding decoder barriers.
+pub const Cancellation = struct {
+    requested: ?*const std.atomic.Value(bool) = null,
+    observed: bool = false,
+
+    /// All lanes call this before the same barrier, then inspect observed after
+    /// it. The continuing path must cross another barrier before sampling again,
+    /// so no leader can overwrite the decision while a peer still reads it.
+    /// Once observed, every lane must return; requested stays set until they join.
+    pub fn sampleBeforeBarrier(cancel: *Cancellation, lane: Lane) void {
+        if (lane.isLeader()) {
+            if (cancel.requested) |requested| {
+                if (requested.load(.acquire)) cancel.observed = true;
+            }
+        }
+    }
+};
+
 pub const Range = struct {
     start_index: usize,
     end_index: usize,
@@ -321,5 +340,41 @@ test "narrow runs and collective tiles reuse the pool without omissions" {
         for (&context.visits, 0..) |*visits, index| {
             try std.testing.expectEqual(@as(usize, if (index < context.tiles_count) 3 else 0), visits.load(.acquire));
         }
+    }
+}
+
+test "collective cancellation agrees across lanes and reuses the pool" {
+    const Check = struct {
+        cancel: Cancellation,
+        requested: *std.atomic.Value(bool),
+        request_lane: usize,
+        stop_iteration: usize,
+        stopped: [workers_count_max]usize = @splat(0),
+
+        fn run(raw: *anyopaque, lane: Lane) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            for (0..64) |iteration| {
+                if (lane.index == self.request_lane and iteration == self.stop_iteration)
+                    self.requested.store(true, .release);
+                self.cancel.sampleBeforeBarrier(lane);
+                lane.sync();
+                if (self.cancel.observed) {
+                    self.stopped[lane.index] = iteration + 1;
+                    return;
+                }
+                lane.sync();
+            }
+        }
+    };
+    var executor: Executor = undefined;
+    try executor.init(std.testing.io, 16);
+    defer executor.deinit();
+    for (0..128) |iteration| {
+        const width = 1 + iteration % 16;
+        var requested: std.atomic.Value(bool) = .init(false);
+        var check: Check = .{ .cancel = .{ .requested = &requested }, .requested = &requested, .request_lane = iteration % width, .stop_iteration = iteration % 32 };
+        executor.runWithWorkers(width, &check, Check.run);
+        try std.testing.expect(check.stopped[0] > 0);
+        for (check.stopped[0..width]) |at| try std.testing.expectEqual(check.stopped[0], at);
     }
 }

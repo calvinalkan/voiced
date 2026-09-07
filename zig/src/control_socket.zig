@@ -5,6 +5,7 @@
 //! and includes client deadlines in its existing timerfd schedule.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 const logging = @import("logging.zig");
 const log = logging.scoped(.control);
@@ -13,7 +14,7 @@ pub const clients_count_max = 16;
 const request_timeout_ns = std.time.ns_per_s;
 
 pub const Request = struct {
-    cmd: enum(u8) { listen = 1, record = 2, stop = 3, cancel = 4, status = 5, kill = 6 },
+    cmd: enum(u8) { record = 2, stop = 3, cancel = 4, status = 5, kill = 6 },
     toggle: bool = false,
 };
 
@@ -36,7 +37,7 @@ const WireRequest = extern struct {
     command: Command,
     flags: u8 = 0,
 
-    const Command = enum(u8) { listen = 1, record = 2, stop = 3, cancel = 4, status = 5, kill = 6, _ };
+    const Command = enum(u8) { record = 2, stop = 3, cancel = 4, status = 5, kill = 6, _ };
 };
 
 const WireReply = extern struct {
@@ -54,7 +55,7 @@ const WireReply = extern struct {
 };
 
 comptime {
-    if (@import("builtin").target.cpu.arch.endian() != .little) @compileError("control wire ABI requires little endian");
+    if (builtin.target.cpu.arch.endian() != .little) @compileError("control wire ABI requires little endian");
     assert(@sizeOf(WireRequest) == 8);
     for (std.meta.fields(WireRequest), [_]usize{ 0, 4, 6, 7 }) |field, offset| assert(@offsetOf(WireRequest, field.name) == offset);
     assert(@sizeOf(WireReply) == 32);
@@ -374,7 +375,7 @@ pub fn sendRequest(init: std.process.Init, request: Request) !void {
     if (reply.command != wire.command or !std.mem.allEqual(u8, &reply.reserved, 0)) return error.InvalidControlReply;
     switch (reply.result) {
         .accepted, .ignored => {
-            if (reply.result == .ignored and request.cmd != .record and request.cmd != .listen) return error.InvalidControlReply;
+            if (reply.result == .ignored and request.cmd != .record) return error.InvalidControlReply;
             switch (reply.phase) {
                 .idle, .capturing, .stopping, .transcribing, .delivering => {},
                 else => return error.InvalidControlReply,

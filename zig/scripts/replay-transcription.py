@@ -16,6 +16,7 @@ from pathlib import Path
 
 def main():
     import numpy as np
+    from blake3 import blake3
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -77,15 +78,12 @@ def main():
         fd = os.open(capture.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
             fcntl.flock(fd, fcntl.LOCK_SH)
-            # Prefer v2 text; never fall back to an old JSON generation if a
-            # present text capture is malformed. Legacy support is offline only.
-            suffix = "txt" if (capture / "metadata.txt").exists() else "json"
-            for name in ("audio.wav", f"metadata.{suffix}", f"tokens.{suffix}", "generated.txt"):
+            for name in ("audio.wav", "metadata.txt", "tokens.txt", "generated.txt"):
                 (output / name).write_bytes((capture / name).read_bytes())
         finally:
             os.close(fd)
-        settings = read_metadata(output / f"metadata.{suffix}")
-        captured = read_tokens(output / f"tokens.{suffix}")
+        settings = read_metadata(output / "metadata.txt")
+        captured = read_tokens(output / "tokens.txt")
         if len(captured) != settings["evidence"]["tokens"]:
             raise ValueError("Capture token count does not match its metadata")
         audio = read_audio(output / "audio.wav")
@@ -94,7 +92,7 @@ def main():
     raw = output / "audio.f32"
     raw.write_bytes(audio.astype("<f4", copy=False).tobytes())
     report = {
-        "audio_sha256": hashlib.sha256(raw.read_bytes()).hexdigest(),
+        "audio_blake3": blake3(raw.read_bytes()).hexdigest(),
         "samples": len(audio),
         "fixture": args.audio is not None,
         "runs": {},
@@ -126,8 +124,8 @@ def main():
         if args.audio is None:
             identity_fields = (
                 "model_revision",
-                "source_sha256",
-                "packed_image_sha256",
+                "source_blake3",
+                "packed_image_blake3",
                 "prompt",
                 "suppressed_tokens",
                 "suppressed_first_tokens",
@@ -148,7 +146,7 @@ def main():
     model_path = data_home / "voiced/models" / settings["model"]
     native_metadata = results["zig-30"]["metadata"]
     with (model_path / "model.bin").open("rb") as weights:
-        if hashlib.file_digest(weights, "sha256").hexdigest() != native_metadata["source_sha256"]:
+        if hashlib.file_digest(weights, blake3).hexdigest() != native_metadata["source_blake3"]:
             raise ValueError("Reference model checksum does not match Zig")
     reference = ctranslate2.models.Whisper(
         str(model_path),
@@ -249,13 +247,8 @@ def main():
 
 
 def read_metadata(path):
-    """Read v2 text or legacy v1 JSON into the same typed metadata dictionary."""
+    """Read version-3 text metadata with BLAKE3 fingerprints."""
     text = read_capture_text(path)
-    if path.suffix == ".json":
-        metadata = json.loads(text)
-        if metadata["format_version"] != 1:
-            raise ValueError("Unsupported capture format")
-        return metadata
 
     fields = {}
     for line in text.split("\n")[:-1]:
@@ -263,7 +256,7 @@ def read_metadata(path):
         if not separator or not key or key in fields:
             raise ValueError(f"Invalid or duplicate metadata field: {key!r}")
         fields[key] = value
-    if fields.get("format_version") != "2":
+    if fields.get("format_version") != "3":
         raise ValueError("Unsupported capture format")
 
     integer_fields = {
@@ -282,8 +275,8 @@ def read_metadata(path):
     float_fields = ("evidence.no_speech_probability", "evidence.average_log_probability")
     bool_fields = ("contains_activity", "text_decode_complete", "temperature_fallback", "end_available")
     string_fields = (
-        "stage", "error_name", "model", "model_revision", "source_sha256",
-        "packed_image_sha256", "zig_version", "optimize", "sample_format", "end",
+        "stage", "error_name", "model", "model_revision", "source_blake3",
+        "packed_image_blake3", "zig_version", "optimize", "sample_format", "end",
     )
     list_fields = ("prompt", "suppressed_tokens", "suppressed_first_tokens")
     expected = set(integer_fields) | set(float_fields) | set(bool_fields) | set(string_fields) | set(list_fields)
@@ -358,13 +351,7 @@ def unescape_metadata_string(value):
 
 def read_tokens(path):
     """Read decimal u32 token IDs; a newline alone represents an empty list."""
-    text = read_capture_text(path)
-    if path.suffix == ".json":
-        tokens = json.loads(text)
-        if not isinstance(tokens, list) or any(type(token) is not int or not 0 <= token <= 0xffffffff for token in tokens):
-            raise ValueError("Invalid legacy token list")
-        return tokens
-    return parse_token_list(text)
+    return parse_token_list(read_capture_text(path))
 
 
 def parse_token_list(text):

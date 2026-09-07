@@ -4,7 +4,7 @@ const std = @import("std");
 const logging = @import("logging.zig");
 const supervisor = @import("supervisor.zig");
 const models = @import("models");
-const audio_process = @import("audio_process.zig");
+const capture_module = @import("capture.zig");
 const paste_keyboard = @import("paste_keyboard.zig");
 
 pub fn load(init: std.process.Init, arguments: []const [:0]const u8, diagnostic: *Diagnostic) !supervisor.ServiceOptions {
@@ -157,7 +157,7 @@ fn set(allocator: std.mem.Allocator, options: *supervisor.ServiceOptions, seen: 
                 return error.ConflictingOptions;
             }
             diagnostic.expected = "a nonempty source name or serial of at most 255 bytes, without NUL";
-            if (value.len == 0 or value.len >= audio_process.target_name_bytes_capacity or std.mem.indexOfScalar(u8, value, 0) != null)
+            if (value.len == 0 or value.len >= capture_module.target_name_bytes_capacity or std.mem.indexOfScalar(u8, value, 0) != null)
                 return error.InvalidValue;
             const terminated = try allocator.dupeZ(u8, value);
             options.capture.source = if (option == .microphone_node) .{ .node_name = terminated } else .{ .device_serial = terminated };
