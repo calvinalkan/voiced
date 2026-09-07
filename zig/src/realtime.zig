@@ -4,7 +4,8 @@
 const std = @import("std");
 const linux = std.os.linux;
 const dbus = @import("dbus.zig");
-const log = @import("logging.zig").scoped(.audio);
+const logging = @import("logging.zig");
+const log = logging.scoped(.audio);
 const destination = "org.freedesktop.RealtimeKit1";
 const path = "/org/freedesktop/RealtimeKit1";
 
@@ -14,7 +15,7 @@ pub fn acquire(address: []const u8, control_fd: linux.fd_t) void {
     var request: Request = .{ .deadline = now() + 500 * std.time.ns_per_ms, .control_fd = control_fd };
     defer request.connection.close();
     request.run(address) catch |err| {
-        log.warn(.{}, "Realtime scheduling unavailable: operation={s}, errno={t}, bus_error=\"{f}\", detail=\"{f}\"", .{ @errorName(err), request.connection.errno, std.zig.fmtString(request.error_name[0..request.error_name_size]), std.zig.fmtString(request.error_message[0..request.error_message_size]) });
+        log.warn(.{}, "Realtime scheduling unavailable: operation={s}, errno={f}, bus_error=\"{f}\", detail=\"{f}\"", .{ @errorName(err), logging.fmtErrno(request.connection.errno), std.zig.fmtString(request.error_name[0..request.error_name_size]), std.zig.fmtString(request.error_message[0..request.error_message_size]) });
     };
 }
 

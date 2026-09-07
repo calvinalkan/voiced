@@ -3,6 +3,7 @@
 //! Initialize before starting threads, and close only after they have joined.
 const std = @import("std");
 const linux = std.os.linux;
+const decimal = @import("decimal.zig");
 
 pub const Level = enum(u8) { critical = 2, err = 3, warn = 4, info = 6, debug = 7 };
 pub const Context = struct { recording_ordinal: ?u64 = null };
@@ -65,17 +66,66 @@ pub fn levelName(value: Level) []const u8 {
     return if (value == .err) "error" else @tagName(value);
 }
 
+/// Returns a `{f}` formatter for a named Linux errno, with the same text as
+/// `{t}` and no width or alignment. Like `{t}`, unnamed enum values are invalid.
+/// Name lookup happens only when formatted; writer errors propagate unchanged.
+pub fn fmtErrno(value: linux.E) ErrnoFormat {
+    return .{ .value = value };
+}
+
+const ErrnoFormat = struct {
+    value: linux.E,
+
+    // PERFORMANCE: Separate name selection from writing, and share both on
+    // diagnostic paths. Formatting linux.E directly with `{t}` lets LLVM copy
+    // writer logic into its many tag branches. The separate lookup returns one
+    // slice to one writer instead, at the cost of a call. Keep conversion lazy
+    // so a filtered log never performs the lookup.
+    pub noinline fn format(self: ErrnoFormat, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writer.writeAll(errnoName(self.value));
+    }
+
+    noinline fn errnoName(value: linux.E) []const u8 {
+        return @tagName(value);
+    }
+};
+
 /// The event function filters before formatting. Guard expensive argument
 /// preparation at the call site with enabled(); Zig evaluates arguments first.
 pub fn enabled(value: Level) bool {
     return @intFromEnum(value) <= @intFromEnum(threshold);
 }
 
+pub const Field = union(enum) {
+    str: []const u8,
+    u: u64,
+    i: i64,
+    f: struct { value: f64, digits: u3 },
+    /// Preserves f32 decimal rounding; widening to f64 can change the last digit.
+    f32: struct { value: f32, digits: u3 },
+    b: bool,
+    errno: linux.E,
+};
+pub const Entry = struct { []const u8, Field };
+
 pub fn scoped(comptime component: @EnumLiteral()) type {
     return struct {
         pub fn write(severity: Level, context: Context, comptime format: []const u8, args: anytype) void {
             // An inline switch would instantiate the formatter for each level.
             emit(severity, @tagName(component), context, format, args);
+        }
+
+        /// Appends ordered `key=value` fields to the message, quoting and Zig-
+        /// escaping string bytes. Keys must be nonempty ASCII identifiers
+        /// ([A-Za-z_][A-Za-z0-9_]*); the message is trusted event text.
+        /// Integers are decimal, floats use the requested fractional digits,
+        /// and errno requires a named Linux value, as with fmtErrno.
+        /// Inputs are borrowed only during the call. Filtering precedes
+        /// formatting, not argument preparation; use enabled() for costly work.
+        /// Delivery, truncation and drop accounting are the same as write().
+        pub fn kv(severity: Level, context: Context, message: []const u8, fields: []const Entry) void {
+            comptime std.debug.assert(@tagName(component).len <= 64);
+            emitKv(severity, @tagName(component), context, message, fields);
         }
 
         /// A zero exit is still unexpected if the owner needed more work.
@@ -124,6 +174,42 @@ fn emit(severity: Level, comptime component: []const u8, context: Context, compt
     sendRecord(severity, component, context, &message, truncated);
 }
 
+// PERFORMANCE: Keep this loop non-generic and out-of-line. Specializing on
+// field shapes or inlining into callers duplicates formatting across events.
+// The tagged entries and extra call trade stack space and cold-path dispatch
+// for shared code; no allocation or capture/inference hot-path work is added.
+noinline fn emitKv(severity: Level, component: []const u8, context: Context, text: []const u8, fields: []const Entry) void {
+    if (!enabled(severity)) return;
+    var message_buffer: [message_bytes_max]u8 = undefined;
+    var message = std.Io.Writer.fixed(&message_buffer);
+    const truncated = failed: {
+        message.writeAll(text) catch break :failed true;
+        for (fields, 0..) |entry, index| {
+            const key, const field = entry;
+            std.debug.assert(key.len > 0);
+            for (key, 0..) |byte, position| std.debug.assert(std.ascii.isAlphabetic(byte) or byte == '_' or (position > 0 and std.ascii.isDigit(byte)));
+            message.writeAll(if (index == 0) ": " else ", ") catch break :failed true;
+            message.writeAll(key) catch break :failed true;
+            message.writeByte('=') catch break :failed true;
+            switch (field) {
+                .str => |value| {
+                    message.writeByte('"') catch break :failed true;
+                    std.zig.stringEscape(value, &message) catch break :failed true;
+                    message.writeByte('"') catch break :failed true;
+                },
+                .u => |value| message.printInt(value, 10, .lower, .{}) catch break :failed true,
+                .i => |value| message.printInt(value, 10, .lower, .{}) catch break :failed true,
+                .f => |value| decimal.fmt(value.value, value.digits).format(&message) catch break :failed true,
+                .f32 => |value| decimal.fmt(value.value, value.digits).format(&message) catch break :failed true,
+                .b => |value| message.writeAll(if (value) "true" else "false") catch break :failed true,
+                .errno => |value| fmtErrno(value).format(&message) catch break :failed true,
+            }
+        }
+        break :failed false;
+    };
+    sendRecord(severity, component, context, &message, truncated);
+}
+
 // Keep delivery non-generic and out-of-line so journal framing and syscalls are
 // not copied into every message-format specialization. The extra call is on the
 // logging cold path, not capture/inference hot paths. Measured with Zig 0.16 on
@@ -139,7 +225,7 @@ noinline fn sendRecord(severity: Level, component: []const u8, context: Context,
     // optimizations; do not add savings across baselines or compiler versions.
     // The combined prototype passed control, logging and real-model output
     // integration, including truncation, metadata injection and receiver drops.
-    // Only emit's fixed writer enters. Append the marker before trimming so a
+    // Only emit/emitKv's fixed writers enter. Append the marker before trimming so a
     // truncated message retains embedded/trailing newlines before the marker.
     if (truncated) {
         const marker = " [truncated]";

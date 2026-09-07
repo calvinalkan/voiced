@@ -43,12 +43,13 @@ fn add_default_build_command(b: *std.Build, pie: bool) void {
         .small => .ReleaseSmall,
     };
 
-    const build_options = b.addOptions();
-    build_options.addOption(bool, "crash_diagnostics", b.option(
+    const crash_diagnostics = b.option(
         bool,
         "crash-diagnostics",
         "Keep in-process panic/fault stack traces in voiced (default: true)",
-    ) orelse true);
+    ) orelse true;
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "crash_diagnostics", crash_diagnostics);
 
     // Keep the inference kernels speed-optimized in the compact application
     // build. Debug and ReleaseSafe still apply to every module.
@@ -71,6 +72,9 @@ fn add_default_build_command(b: *std.Build, pie: bool) void {
             .root_source_file = b.path("src/main.zig"),
             .target = b.graph.host,
             .optimize = optimize,
+            // Without in-process stack walking, omit its runtime unwind tables.
+            // Debug information and frame-pointer policy remain unchanged.
+            .unwind_tables = if (crash_diagnostics) null else .none,
             // Retain debug data for symbolization; strip a separate shipping
             // copy rather than losing it to ReleaseSmall's default stripping.
             .strip = false,

@@ -26,12 +26,19 @@ const stderr = std.debug.print;
 // 1,565,784 to 1,314,072 bytes (-251,712, or 16.1%).
 const crash_diagnostics = @import("build_options").crash_diagnostics;
 
-pub const std_options: std.Options = .{
-    .allow_stack_tracing = crash_diagnostics,
-    .enable_segfault_handler = crash_diagnostics and std.debug.default_enable_segfault_handler,
-    // IPC and D-Bus use raw Unix sockets; PipeWire uses its own API.
-    // The separate model-setup executable retains std.Io networking.
-    .networking = false,
+pub const std_options: std.Options = options: {
+    var configured: std.Options = .{
+        .allow_stack_tracing = crash_diagnostics,
+        .enable_segfault_handler = crash_diagnostics and std.debug.default_enable_segfault_handler,
+        // IPC and D-Bus use raw Unix sockets; PipeWire uses its own API.
+        // The separate model-setup executable retains std.Io networking.
+        .networking = false,
+    };
+    // Thread entry allocates an alternate signal stack independently of the
+    // segfault-handler setting. Keep the standard size only when that handler
+    // is enabled by this build's crash-diagnostics policy.
+    if (!crash_diagnostics) configured.signal_stack_size = null;
+    break :options configured;
 };
 
 pub const panic = std.debug.FullPanic(if (crash_diagnostics) std.debug.defaultPanic else panicWithoutTrace);
@@ -188,7 +195,7 @@ pub fn main(init: std.process.Init) u8 {
         const errno = logging.init(configured_level);
         if (errno != .SUCCESS) {
             // This is still CLI startup, before service deadlines or threads.
-            stderr("voiced: could not initialize logging (errno={t}).\n", .{errno});
+            stderr("voiced: could not initialize logging (errno={f}).\n", .{logging.fmtErrno(errno)});
             return 1;
         }
     }
@@ -205,7 +212,7 @@ pub fn main(init: std.process.Init) u8 {
         const linux = std.os.linux;
         std.debug.assert(name.len <= 15);
         const result = linux.prctl(@intFromEnum(linux.PR.SET_NAME), @intFromPtr(name.ptr), 0, 0, 0);
-        if (linux.errno(result) != .SUCCESS) log.warn(.{}, "Process name unavailable: operation=prctl_set_name, errno={t}", .{linux.errno(result)});
+        if (linux.errno(result) != .SUCCESS) log.warn(.{}, "Process name unavailable: operation=prctl_set_name, errno={f}", .{logging.fmtErrno(linux.errno(result))});
     }
 
     if (invocation == .worker) log.debug(.{}, "Worker starting: role={s}, log_level={s}", .{ @tagName(invocation.worker.role), logging.levelName(invocation.worker.log_level) });

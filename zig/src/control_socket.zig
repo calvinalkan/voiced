@@ -6,7 +6,8 @@
 
 const std = @import("std");
 const linux = std.os.linux;
-const log = @import("logging.zig").scoped(.control);
+const logging = @import("logging.zig");
+const log = logging.scoped(.control);
 const assert = std.debug.assert;
 pub const clients_count_max = 16;
 const request_timeout_ns = std.time.ns_per_s;
@@ -120,12 +121,12 @@ pub const Server = struct {
                 try directory.deleteFile(init.io, "control.sock");
                 const retry_result = linux.bind(listener, @ptrCast(&address), address_size);
                 if (linux.errno(retry_result) != .SUCCESS) {
-                    log.err(.{}, "Control bind failed: operation=bind, errno={t}", .{linux.errno(retry_result)});
+                    log.err(.{}, "Control bind failed: operation=bind, errno={f}", .{logging.fmtErrno(linux.errno(retry_result))});
                     return error.ControlBindFailed;
                 }
             },
             else => {
-                log.err(.{}, "Control bind failed: operation=bind, errno={t}", .{linux.errno(bind_result)});
+                log.err(.{}, "Control bind failed: operation=bind, errno={f}", .{logging.fmtErrno(linux.errno(bind_result))});
                 return error.ControlBindFailed;
             },
         }
@@ -135,7 +136,7 @@ pub const Server = struct {
         try directory.setFilePermissions(init.io, "control.sock", .fromMode(0o600), .{});
         const listen_result = linux.listen(listener, clients_count_max);
         if (linux.errno(listen_result) != .SUCCESS) {
-            log.err(.{}, "Control listen failed: operation=listen, errno={t}", .{linux.errno(listen_result)});
+            log.err(.{}, "Control listen failed: operation=listen, errno={f}", .{logging.fmtErrno(linux.errno(listen_result))});
             return error.ControlListenFailed;
         }
         try register(epoll_fd, listener, listener_tag, linux.EPOLL.IN);
@@ -158,7 +159,7 @@ pub const Server = struct {
         // readiness too, or shutdown spins while a blocked reply awaits expiry.
         const errno = linux.errno(linux.epoll_ctl(server.epoll_fd, linux.EPOLL.CTL_DEL, server.listener, null));
         if (errno != .SUCCESS) {
-            log.err(.{}, "Control shutdown failed: operation=epoll_ctl_del, errno={t}", .{errno});
+            log.err(.{}, "Control shutdown failed: operation=epoll_ctl_del, errno={f}", .{logging.fmtErrno(errno)});
             return error.ControlUnregisterFailed;
         }
         server.accepting = false;
@@ -175,7 +176,7 @@ pub const Server = struct {
                     return;
                 },
                 else => {
-                    log.err(.{}, "Control accept failed: operation=accept4, errno={t}", .{linux.errno(result)});
+                    log.err(.{}, "Control accept failed: operation=accept4, errno={f}", .{logging.fmtErrno(linux.errno(result))});
                     return error.ControlAcceptFailed;
                 },
             }
@@ -405,7 +406,7 @@ fn requireOwnedPrivateDirectory(handle: std.posix.fd_t, path: []const u8) !void 
     var stat: linux.Statx = undefined;
     const stat_errno = linux.errno(linux.statx(handle, "", linux.AT.EMPTY_PATH, .BASIC_STATS, &stat));
     if (stat_errno != .SUCCESS) {
-        log.err(.{}, "Runtime directory inspection failed: path=\"{f}\", operation=statx, errno={t}", .{ std.zig.fmtString(path), stat_errno });
+        log.err(.{}, "Runtime directory inspection failed: path=\"{f}\", operation=statx, errno={f}", .{ std.zig.fmtString(path), logging.fmtErrno(stat_errno) });
         return error.ControlDirectoryStatFailed;
     }
     if (!stat.mask.TYPE or stat.mode & linux.S.IFMT != linux.S.IFDIR) {
@@ -451,7 +452,7 @@ fn unixAddress(path: []const u8) !linux.sockaddr.un {
 fn createSocket(nonblocking: bool) !std.posix.fd_t {
     const result = linux.socket(linux.AF.UNIX, linux.SOCK.SEQPACKET | linux.SOCK.CLOEXEC | (if (nonblocking) @as(u32, linux.SOCK.NONBLOCK) else 0), 0);
     if (linux.errno(result) != .SUCCESS) {
-        log.err(.{}, "Control socket failed: operation=socket, errno={t}", .{linux.errno(result)});
+        log.err(.{}, "Control socket failed: operation=socket, errno={f}", .{logging.fmtErrno(linux.errno(result))});
         return error.ControlSocketFailed;
     }
     return @intCast(result);
@@ -461,12 +462,12 @@ fn register(epoll_fd: std.posix.fd_t, descriptor: std.posix.fd_t, tag: u64, even
     var event: linux.epoll_event = .{ .events = events | linux.EPOLL.RDHUP, .data = .{ .u64 = tag } };
     const result = linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, descriptor, &event);
     if (linux.errno(result) != .SUCCESS) {
-        log.err(.{}, "Control registration failed: operation=epoll_ctl_add, fd={d}, errno={t}", .{ descriptor, linux.errno(result) });
+        log.err(.{}, "Control registration failed: operation=epoll_ctl_add, fd={d}, errno={f}", .{ descriptor, logging.fmtErrno(linux.errno(result)) });
         return error.ControlRegisterFailed;
     }
 }
 
 fn close(descriptor: std.posix.fd_t) void {
     const errno = linux.errno(linux.close(descriptor));
-    if (errno != .SUCCESS) log.err(.{}, "Control cleanup failed: operation=close, fd={d}, errno={t}", .{ descriptor, errno });
+    if (errno != .SUCCESS) log.err(.{}, "Control cleanup failed: operation=close, fd={d}, errno={f}", .{ descriptor, logging.fmtErrno(errno) });
 }

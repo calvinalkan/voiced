@@ -2,6 +2,7 @@
 //! mappings, mono conversion and shared-slot publication through one poll loop.
 //! Graph processing uses fixed storage and no allocation or blocking I/O.
 const std = @import("std");
+const logging = @import("logging.zig");
 const linux = std.os.linux;
 const assert = std.debug.assert;
 const native = @import("pipewire_native.zig");
@@ -651,7 +652,7 @@ fn describeError(client: *const native.Client, err: anyerror, buffer: []u8) u16 
 }
 
 fn writeErrorDescription(client: *const native.Client, err: anyerror, writer: *std.Io.Writer) error{WriteFailed}!void {
-    try writer.print("{s}: errno={t}, server_error_code={d}, object_id={d}, sequence={d}, detail=\"{f}\"", .{ @errorName(err), client.connection.errno, client.error_code, client.error_object, client.error_sequence, std.zig.fmtString(client.error_message[0..client.error_message_size]) });
+    try writer.print("{s}: errno={f}, server_error_code={d}, object_id={d}, sequence={d}, detail=\"{f}\"", .{ @errorName(err), logging.fmtErrno(client.connection.errno), client.error_code, client.error_object, client.error_sequence, std.zig.fmtString(client.error_message[0..client.error_message_size]) });
     if (client.diagnostic.wake_count > 0) {
         const d = client.diagnostic;
         try writer.print("; graph_rate={d}/{d}, graph_position={d}, graph_duration={d}, wake_count={d}, channel={d}, buffer_id={d}, chunk_offset={d}, chunk_size={d}, chunk_stride={d}, chunk_flags={d}, header_flags={d}, header_sequence={d}, header_pts_ns={d}", .{ d.graph_rate_num, d.graph_rate_hz, d.graph_position, d.graph_duration, d.wake_count, d.channel, d.buffer_id, d.chunk_offset, d.chunk_size, d.chunk_stride, d.chunk_flags, d.header_flags, d.header_sequence, d.header_pts_ns });

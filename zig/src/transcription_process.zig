@@ -681,7 +681,11 @@ fn sendReport(socket: std.posix.fd_t, report: Report) !void {
     try sendRecord(socket, std.mem.asBytes(&wire));
 }
 
-fn sendDiagnostic(
+// PERFORMANCE: Share construction of the fixed diagnostic payload across
+// startup and transcription failures. Inlining repeats its initialization and
+// message copy at each error exit. Only failed operations pay the extra call;
+// report encoding, evidence precision and successful inference stay unchanged.
+noinline fn sendDiagnostic(
     socket: std.posix.fd_t,
     stage: ErrorStage,
     message: []const u8,

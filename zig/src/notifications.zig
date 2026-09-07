@@ -387,7 +387,7 @@ pub const Client = struct {
     }
 
     fn disconnected(self: *Client, epoll_fd: std.posix.fd_t, err: anyerror, initial: bool) void {
-        log.warn(.{}, "Desktop notifications {s}: error={s}, phase={t}, errno={t}({d}), retry_duration=5s", .{ if (initial) "unavailable" else "disconnected", @errorName(err), self.phase, self.connection.errno, @intFromEnum(self.connection.errno) });
+        log.warn(.{}, "Desktop notifications {s}: error={s}, phase={t}, errno={f}({d}), retry_duration=5s", .{ if (initial) "unavailable" else "disconnected", @errorName(err), self.phase, logging.fmtErrno(self.connection.errno), @intFromEnum(self.connection.errno) });
         self.close(epoll_fd);
         self.request = null;
         self.notification = null;

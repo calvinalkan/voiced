@@ -2,7 +2,8 @@
 //! timer. Completion means the kernel accepted all key releases, not that the
 //! focused application inserted text. Never retry an uncertain paste.
 const std = @import("std");
-const log = @import("logging.zig").scoped(.paste);
+const logging = @import("logging.zig");
+const log = logging.scoped(.paste);
 const linux = std.os.linux;
 
 pub const Error = union(enum) {
@@ -197,11 +198,11 @@ pub const Keyboard = struct {
 
             const written = linux.write(self.fd, bytes.ptr, bytes.len);
             if (linux.errno(written) != .SUCCESS or written != bytes.len)
-                log.err(.{}, "Paste cleanup write: errno={t}, syscall_result={d}, expected_size={d}", .{ linux.errno(written), written, bytes.len });
+                log.err(.{}, "Paste cleanup write: errno={f}, syscall_result={d}, expected_size={d}", .{ logging.fmtErrno(linux.errno(written)), written, bytes.len });
         }
 
         const destroy_errno = linux.errno(linux.ioctl(self.fd, linux.IOCTL.IO('U', 2), 0)); // UI_DEV_DESTROY
-        if (destroy_errno != .SUCCESS) log.err(.{}, "Paste cleanup destroy: errno={t}", .{destroy_errno});
+        if (destroy_errno != .SUCCESS) log.err(.{}, "Paste cleanup destroy: errno={f}", .{logging.fmtErrno(destroy_errno)});
         _ = linux.close(self.fd);
 
         self.* = undefined;

@@ -304,13 +304,41 @@ const NeverFormat = struct {
 };
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (std.mem.eql(u8, args[1], "epoll-error")) {
+    if (std.mem.eql(u8, args[1], "errno-format")) {
+        // Preserve every named errno and partial-write failure, not only the
+        // common errors reached by the daemon scenarios below.
+        for (std.enums.values(linux.E)) |errno| {
+            for (0..33) |capacity| {
+                var expected_buffer: [32]u8 = undefined;
+                var actual_buffer: [32]u8 = undefined;
+                var expected = std.Io.Writer.fixed(expected_buffer[0..capacity]);
+                var actual = std.Io.Writer.fixed(actual_buffer[0..capacity]);
+                const expected_error: ?std.Io.Writer.Error = failed: {
+                    expected.print("{t}", .{errno}) catch |err| break :failed err;
+                    break :failed null;
+                };
+                const actual_error: ?std.Io.Writer.Error = failed: {
+                    actual.print("{f}", .{logging.fmtErrno(errno)}) catch |err| break :failed err;
+                    break :failed null;
+                };
+                std.debug.assert(expected_error == actual_error);
+                std.debug.assert(std.mem.eql(u8, expected.buffered(), actual.buffered()));
+            }
+        }
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "epoll-error") or std.mem.eql(u8, args[1], "paste-open-error")) {
         // Inject one OS error into the real supervisor without production hooks.
+        // On this x86-64 service, uinput uses open; std.Io uses openat. Denying
+        // open exercises paste failure without opening a real virtual keyboard.
+        const epoll_error = std.mem.eql(u8, args[1], "epoll-error");
+        const syscall: linux.SYS = if (epoll_error) .epoll_pwait else .open;
+        const errno: linux.E = if (epoll_error) .IO else .ACCES;
         const Filter = extern struct { code: u16, jt: u8 = 0, jf: u8 = 0, k: u32 };
         const filters = [_]Filter{
             .{ .code = 0x20, .k = 0 }, // Load seccomp_data.nr.
-            .{ .code = 0x15, .jf = 1, .k = @intFromEnum(linux.SYS.epoll_pwait) },
-            .{ .code = 0x06, .k = 0x00050000 | @as(u32, @intFromEnum(linux.E.IO)) },
+            .{ .code = 0x15, .jf = 1, .k = @intCast(@intFromEnum(syscall)) },
+            .{ .code = 0x06, .k = 0x00050000 | @as(u32, @intFromEnum(errno)) },
             .{ .code = 0x06, .k = 0x7fff0000 },
         };
         const Program = extern struct { len: u16, filter: [*]const Filter };
@@ -319,17 +347,47 @@ pub fn main(init: std.process.Init) !void {
         std.debug.assert(linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_SECCOMP), 2, @intFromPtr(&program), 0, 0)) == .SUCCESS);
         return std.process.replace(init.io, .{ .argv = args[2..] });
     }
+    if (std.mem.eql(u8, args[1], "kv-cli")) {
+        logging.initCli(.info);
+        defer logging.deinit();
+        log.kv(.warn, .{}, "CLI", &.{.{ "text", .{ .str = "two\nlines" } }});
+        return;
+    }
+    if (std.mem.eql(u8, args[1], "kv-f32")) {
+        logging.initCli(.info);
+        defer logging.deinit();
+        // Include decimal rounding boundaries where widening f32 changes output,
+        // both signs of zero, subnormals, finite extrema, infinities and NaNs.
+        const patterns = [_]u32{ 0, 0x80000000, @bitCast(@as(f32, 0.2500005)), @bitCast(@as(f32, -0.2500005)), 1, 0x007fffff, 0x00800000, 0x7f7fffff, 0xff7fffff, 0x7f800000, 0xff800000, 0x7fc00000 };
+        var random: u32 = 17;
+        for (0..patterns.len + 128) |index| {
+            random = random *% 1664525 +% 1013904223;
+            const value: f32 = @bitCast(if (index < patterns.len) patterns[index] else random);
+            for (0..8) |digits| {
+                var buffer: [512]u8 = undefined;
+                var expected = std.Io.Writer.fixed(&buffer);
+                try expected.printFloat(value, .{ .mode = .decimal, .precision = digits });
+                log.warn(.{}, "reference: value={s}", .{expected.buffered()});
+                log.kv(.warn, .{}, "fields", &.{.{ "value", .{ .f32 = .{ .value = value, .digits = @intCast(digits) } } }});
+            }
+        }
+        return;
+    }
     const flooding = std.mem.eql(u8, args[1], "flood");
     std.debug.assert(logging.init(if (flooding) .info else .debug) == .SUCCESS);
     defer logging.deinit();
     if (flooding) {
         log.debug(.{}, "{f}", .{NeverFormat{}});
         if (logging.enabled(.debug)) @panic("disabled expensive debug preparation");
-        for (0..100000) |i| log.info(.{}, "event {d}", .{i});
+        // Neither key validation nor errno lookup may run for a filtered KV.
+        log.kv(.debug, .{}, "disabled", &.{.{ "invalid-key", .{ .errno = @enumFromInt(4095) } }});
+        for (0..100000) |i| {
+            if (i % 2 == 0) log.info(.{}, "event {d}", .{i}) else log.kv(.info, .{}, "event", &.{.{ "ordinal", .{ .u = i } }});
+        }
         std.debug.assert(linux.write(1, "x", 1) == 1);
         var byte: [1]u8 = undefined;
         std.debug.assert(linux.read(0, &byte, 1) == 1);
-        log.info(.{}, "recovered", .{});
+        log.kv(.info, .{}, "recovered", &.{});
         return;
     }
     log.critical(.{}, "critical", .{});
@@ -340,27 +398,59 @@ pub fn main(init: std.process.Init) !void {
     log.info(.{}, "microphone_description=\"{f}\"", .{std.zig.fmtString("USB, \"mic\"\nnext")});
     const oversized: [10000]u8 = @splat('x');
     log.err(.{}, "large:{s}", .{oversized});
+    log.kv(.info, .{ .recording_ordinal = 18 }, "fields", &.{
+        .{ "text", .{ .str = "USB, \"mic\"\nPRIORITY=0\x00\xff\\" } },
+        .{ "unsigned", .{ .u = std.math.maxInt(u64) } },
+        .{ "signed", .{ .i = std.math.minInt(i64) } },
+        .{ "fraction", .{ .f = .{ .value = 1.25, .digits = 2 } } },
+        .{ "whole", .{ .f = .{ .value = 2, .digits = 0 } } },
+        .{ "precise", .{ .f = .{ .value = 0.125, .digits = 7 } } },
+        .{ "yes", .{ .b = true } },
+        .{ "no", .{ .b = false } },
+        .{ "errno", .{ .errno = .ACCES } },
+    });
+    log.kv(.warn, .{}, "empty", &.{});
+    log.kv(.err, .{}, &oversized, &.{});
+    log.kv(.err, .{}, "large field", &.{.{ "value", .{ .str = &oversized } }});
+    log.kv(.err, .{}, "large key", &.{.{ &oversized, .{ .b = true } }});
 }
 ''')
     driver = root / "driver"
     subprocess.run(["zig", "build-exe", "-OReleaseSafe", "--dep", "logging", "-Mroot=" + str(source),
                     "-Mlogging=" + str(Path("zig/src/logging.zig").resolve()), "-femit-bin=" + str(driver)],
                    check=True, timeout=60)
+    subprocess.run([str(driver), "errno-format"], check=True, timeout=5)
+    cli = subprocess.run([str(driver), "kv-cli"], check=True, capture_output=True, timeout=5)
+    assert cli.stdout == b"" and cli.stderr == b'warn: CLI: text="two\\nlines"\n', cli
+    floats = subprocess.run([str(driver), "kv-f32"], check=True, capture_output=True, timeout=5)
+    lines = floats.stderr.decode().splitlines()
+    assert floats.stdout == b"" and len(lines) == (12 + 128) * 8 * 2, floats
+    for reference, actual in zip(lines[::2], lines[1::2]):
+        assert reference.removeprefix('warn: reference: value=') == actual.removeprefix('warn: fields: value='), (reference, actual)
     reader, sender = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
     reader.settimeout(2)
     run = subprocess.Popen([str(driver), "normal"], stderr=sender)
     records = []
-    for _ in range(7):
+    for _ in range(12):
         packet = reader.recv(8192)
         assert len(packet) <= 4096
         records.append(decode_record(packet))
     assert run.wait(timeout=2) == 0
-    assert [r["PRIORITY"] for r in records] == ["2", "3", "4", "6", "7", "6", "3"]
+    assert [r["PRIORITY"] for r in records] == ["2", "3", "4", "6", "7", "6", "3", "6", "4", "3", "3", "3"]
     assert all(r["SYSLOG_IDENTIFIER"] == "voiced" and r["VOICED_COMPONENT"] == "fixture" for r in records)
     assert records[1]["VOICED_RECORDING_ORDINAL"] == "17" and "VOICED_SESSION" not in records[1]
     assert records[1]["MESSAGE"] == "line one\nPRIORITY=0\nMESSAGE=still the original message"
-    assert records[-2]["MESSAGE"] == r'microphone_description="USB, \"mic\"\nnext"'
-    assert records[-1]["MESSAGE"].startswith("large:xxx") and records[-1]["MESSAGE"].endswith(" [truncated]")
+    assert records[5]["MESSAGE"] == r'microphone_description="USB, \"mic\"\nnext"'
+    assert records[6]["MESSAGE"].startswith("large:xxx") and records[6]["MESSAGE"].endswith(" [truncated]")
+    assert records[7]["VOICED_RECORDING_ORDINAL"] == "18"
+    assert records[7]["MESSAGE"] == (
+        r'fields: text="USB, \"mic\"\nPRIORITY=0\x00\xff\\", '
+        'unsigned=18446744073709551615, signed=-9223372036854775808, '
+        'fraction=1.25, whole=2, precise=0.1250000, yes=true, no=false, errno=ACCES'
+    ), records[7]
+    assert records[8]["MESSAGE"] == "empty"
+    for record, prefix in zip(records[9:], ('xxx', 'large field: value="xxx', 'large key: xxx')):
+        assert record["MESSAGE"].startswith(prefix) and record["MESSAGE"].endswith(" [truncated]"), record
     reader.close()
     sender.close()
 
@@ -450,6 +540,52 @@ pub fn main(init: std.process.Init) !void {
             time.sleep(0.01)
         assert any(row["PRIORITY"] == "3" and "operation=epoll_wait, errno=IO" in row["MESSAGE"] for row in output.records), output.records
         assert any(row["PRIORITY"] == "2" and "Service stopped: error=SupervisorSystemCallFailed" in row["MESSAGE"] for row in output.records), output.records
+    with journal_log(root / "paste.log") as output:
+        daemon = subprocess.Popen([str(driver), "paste-open-error", binary, "serve", "--config", str(config),
+                                   "--transcript-output", "desktop", "--notification-mode", "off", "--log-level", "warn"],
+                                  env=env, stdout=subprocess.DEVNULL, stderr=output)
+        try:
+            deadline = time.monotonic() + 3
+            while not any(row["MESSAGE"].startswith("Automatic paste unavailable;") for row in output.records):
+                assert daemon.poll() is None and time.monotonic() < deadline, output.records
+                time.sleep(0.01)
+            failure = next(row for row in output.records if row["MESSAGE"].startswith("Automatic paste unavailable;"))
+            assert failure["PRIORITY"] == "4" and failure["VOICED_COMPONENT"] == "supervisor", failure
+            assert failure["MESSAGE"] == 'Automatic paste unavailable; clipboard delivery remains enabled: operation="open", errno=ACCES', failure
+            subprocess.run([binary, "kill"], env=env, check=True, capture_output=True, timeout=3)
+            assert daemon.wait(timeout=3) == 0
+        finally:
+            if daemon.poll() is None:
+                daemon.kill()
+                daemon.wait()
+    # A real worker's missing-model report must retain its stage/detail and
+    # recording context, without inventing unavailable chunk/decoder evidence.
+    missing_model_env = dict(env, XDG_DATA_HOME=str(root / "missing-model-data"), XDG_CACHE_HOME=str(root / "missing-model-cache"))
+    with journal_log(root / "missing-model.log") as output:
+        daemon = subprocess.Popen([binary, "serve", "--config", str(config)], env=missing_model_env,
+                                  stdout=subprocess.DEVNULL, stderr=output)
+        try:
+            deadline = time.monotonic() + 3
+            while not (root / "voiced-test/control.sock").exists():
+                assert daemon.poll() is None and time.monotonic() < deadline
+                time.sleep(0.01)
+            subprocess.run([binary, "record"], env=missing_model_env, check=True, capture_output=True, timeout=3)
+            deadline = time.monotonic() + 5
+            while not any(row["MESSAGE"].startswith("Transcription error:") for row in output.records):
+                assert daemon.poll() is None and time.monotonic() < deadline, output.records
+                time.sleep(0.01)
+            failure = next(row for row in output.records if row["MESSAGE"].startswith("Transcription error:"))
+            assert failure["PRIORITY"] == "3" and failure["VOICED_COMPONENT"] == "supervisor", failure
+            assert failure["VOICED_RECORDING_ORDINAL"] == "1", failure
+            assert 'recording_ordinal=1, model="' in failure["MESSAGE"] and ', stage="model_load", detail="FileNotFound"' in failure["MESSAGE"], failure
+            subprocess.run([binary, "status"], env=missing_model_env, check=True, capture_output=True, timeout=3)
+            subprocess.run([binary, "kill"], env=missing_model_env, check=True, capture_output=True, timeout=3)
+            assert daemon.wait(timeout=3) == 0
+            assert not any(row["MESSAGE"].startswith(("Transcription error evidence:", "Decoder error evidence:")) for row in output.records), output.records
+        finally:
+            if daemon.poll() is None:
+                daemon.kill()
+                daemon.wait()
     invalid = subprocess.run([binary, "serve", "--log-level", "verbose"], env=env, capture_output=True)
     assert invalid.returncode == 2 and b"critical, error, warn, info, or debug" in invalid.stderr
     print("Journal priorities, multiline framing, truncation, filtering, backpressure, and CLI configuration passed")

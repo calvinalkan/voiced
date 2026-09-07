@@ -1024,23 +1024,40 @@ fn drainTranscriptionPackets(supervisor: *Supervisor) !void {
                     .exchange => .exchange_corrupt,
                 };
                 if (err == .exchange) try beginAbort(supervisor, .{ .exchange_corrupt = .audio_slot });
-                switch (err) {
-                    inline else => |detail| {
-                        log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Transcription error: recording_ordinal={d}, model={s}, stage={t}, detail=\"{f}\"", .{ supervisor.recording_ordinal, supervisor.audio.options.transcription.model.name(), std.meta.activeTag(err), std.zig.fmtString(detail.messageBytes()) });
+                if (logging.enabled(.err)) switch (err) {
+                    .model_load, .feature_extraction, .inference, .text_decode, .exchange => |detail| {
+                        const context: logging.Context = .{ .recording_ordinal = supervisor.recording_ordinal };
+                        log.kv(.err, context, "Transcription error", &.{
+                            .{ "recording_ordinal", .{ .u = supervisor.recording_ordinal } },
+                            .{ "model", .{ .str = supervisor.audio.options.transcription.model.name() } },
+                            .{ "stage", .{ .str = @tagName(err) } },
+                            .{ "detail", .{ .str = detail.messageBytes() } },
+                        });
                         const evidence = detail.evidence;
                         if (evidence.chunk_available == 1) {
-                            log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Transcription error evidence: recording_ordinal={d}, chunk_ordinal={d}, audio_samples_count={d}, audio_duration_seconds={f}, tokens_count_max={d}, features_duration_ms={f}, encoder_duration_ms={f}, cross_key_values_duration_ms={f}, decoder_duration_ms={f}", .{
-                                supervisor.recording_ordinal,                                                      evidence.chunk,                                                                             evidence.samples,
-                                decimal.fmt(@as(f64, @floatFromInt(evidence.samples)) / 16000, 3),                 evidence.token_limit,                                                                       decimal.fmt(@as(f64, @floatFromInt(evidence.log_mel_ns)) / std.time.ns_per_ms, 3),
-                                decimal.fmt(@as(f64, @floatFromInt(evidence.encoder_ns)) / std.time.ns_per_ms, 3), decimal.fmt(@as(f64, @floatFromInt(evidence.cross_key_values_ns)) / std.time.ns_per_ms, 3), decimal.fmt(@as(f64, @floatFromInt(evidence.decoder_ns)) / std.time.ns_per_ms, 3),
+                            log.kv(.err, context, "Transcription error evidence", &.{
+                                .{ "recording_ordinal", .{ .u = supervisor.recording_ordinal } },
+                                .{ "chunk_ordinal", .{ .u = evidence.chunk } },
+                                .{ "audio_samples_count", .{ .u = evidence.samples } },
+                                .{ "audio_duration_seconds", .{ .f = .{ .value = @as(f64, @floatFromInt(evidence.samples)) / 16000, .digits = 3 } } },
+                                .{ "tokens_count_max", .{ .u = evidence.token_limit } },
+                                .{ "features_duration_ms", .{ .f = .{ .value = @as(f64, @floatFromInt(evidence.log_mel_ns)) / std.time.ns_per_ms, .digits = 3 } } },
+                                .{ "encoder_duration_ms", .{ .f = .{ .value = @as(f64, @floatFromInt(evidence.encoder_ns)) / std.time.ns_per_ms, .digits = 3 } } },
+                                .{ "cross_key_values_duration_ms", .{ .f = .{ .value = @as(f64, @floatFromInt(evidence.cross_key_values_ns)) / std.time.ns_per_ms, .digits = 3 } } },
+                                .{ "decoder_duration_ms", .{ .f = .{ .value = @as(f64, @floatFromInt(evidence.decoder_ns)) / std.time.ns_per_ms, .digits = 3 } } },
                             });
-                            if (evidence.decoding_available == 1) log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Decoder error evidence: recording_ordinal={d}, chunk_ordinal={d}, tokens_count={d}, tokens_count_max={d}, encoder_positions_count={d}, no_speech_probability={f}, average_log_probability={f}", .{
-                                supervisor.recording_ordinal, evidence.chunk,                                 evidence.tokens,                                  evidence.token_limit,
-                                evidence.encoder_positions,   decimal.fmt(evidence.no_speech_probability, 6), decimal.fmt(evidence.average_log_probability, 6),
+                            if (evidence.decoding_available == 1) log.kv(.err, context, "Decoder error evidence", &.{
+                                .{ "recording_ordinal", .{ .u = supervisor.recording_ordinal } },
+                                .{ "chunk_ordinal", .{ .u = evidence.chunk } },
+                                .{ "tokens_count", .{ .u = evidence.tokens } },
+                                .{ "tokens_count_max", .{ .u = evidence.token_limit } },
+                                .{ "encoder_positions_count", .{ .u = evidence.encoder_positions } },
+                                .{ "no_speech_probability", .{ .f32 = .{ .value = evidence.no_speech_probability, .digits = 6 } } },
+                                .{ "average_log_probability", .{ .f32 = .{ .value = evidence.average_log_probability, .digits = 6 } } },
                             });
                         }
                     },
-                }
+                };
                 // The original diagnostic is retained in the journal. Reaping
                 // still owns the bounded retry and the eventual session outcome.
                 continue;
@@ -1941,7 +1958,7 @@ fn advanceOutput(supervisor: *Supervisor) !void {
         const complete = switch (supervisor.keyboard.?.advance(now_ns)) {
             .ok => |complete| complete,
             .err => |err| failed: {
-                log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Paste error; clipboard retained, no retry: recording_ordinal={d}, detail={any}", .{ supervisor.recording_ordinal, err });
+                logPasteError(.err, .{ .recording_ordinal = supervisor.recording_ordinal }, "Paste error; clipboard retained, no retry", &err);
                 supervisor.keyboard.?.deinit();
                 supervisor.keyboard = null;
                 delivery.paste = .done;
@@ -1991,7 +2008,7 @@ fn saveTranscript(supervisor: *const Supervisor, text: []const u8) ?transcript_f
     switch (transcript_file.save(supervisor.io, directory_path, text)) {
         .ok => {},
         .err => |err| {
-            log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Transcript save error: recording_ordinal={d}, path=\"{f}/transcript.txt\", detail={any}, transcript_save_duration_ms={s}", .{ supervisor.recording_ordinal, std.zig.fmtString(directory_path), err, formatDurationMilliseconds(&elapsed_buffer, monotonicNanoseconds() - started) });
+            logTranscriptSaveError(.{ .recording_ordinal = supervisor.recording_ordinal }, directory_path, monotonicNanoseconds() - started, &err);
             return err;
         },
     }
@@ -1999,6 +2016,50 @@ fn saveTranscript(supervisor: *const Supervisor, text: []const u8) ?transcript_f
         supervisor.recording_ordinal, text.len, formatDurationMilliseconds(&elapsed_buffer, monotonicNanoseconds() - started),
     });
     return null;
+}
+
+noinline fn logTranscriptSaveError(context: logging.Context, directory_path: []const u8, duration_ns: u64, err: *const transcript_file.Error) void {
+    if (!logging.enabled(.err)) return;
+    // The largest case is unsafe_directory: five common fields plus five
+    // inspection fields. Cleanup adds two fields only to write/replace errors.
+    var storage: [10]logging.Entry = undefined;
+    var fields: std.ArrayList(logging.Entry) = .initBuffer(&storage);
+    if (context.recording_ordinal) |ordinal| fields.appendAssumeCapacity(.{ "recording_ordinal", .{ .u = ordinal } });
+    fields.appendSliceAssumeCapacity(&.{
+        .{ "directory_path", .{ .str = directory_path } },
+        .{ "file_name", .{ .str = "transcript.txt" } },
+        .{ "operation", .{ .str = @tagName(err.*) } },
+        .{ "transcript_save_duration_ms", .{ .f = .{ .value = @as(f64, @floatFromInt(duration_ns)) / std.time.ns_per_ms, .digits = 3 } } },
+    });
+    var cleanup: ?*const transcript_file.CleanupError = null;
+    switch (err.*) {
+        .open_directory, .permissions, .create_temporary => |cause| fields.appendAssumeCapacity(.{ "error", .{ .str = @errorName(cause) } }),
+        .stat_directory => |errno| fields.appendAssumeCapacity(.{ "errno", .{ .errno = errno } }),
+        .unsafe_directory => |detail| fields.appendSliceAssumeCapacity(&.{
+            .{ "uid", .{ .u = detail.uid } },
+            .{ "expected_uid", .{ .u = detail.expected_uid } },
+            .{ "mode", .{ .u = detail.mode } },
+            .{ "uid_available", .{ .b = detail.uid_available } },
+            .{ "mode_available", .{ .b = detail.mode_available } },
+        }),
+        .write => |*detail| {
+            fields.appendSliceAssumeCapacity(&.{
+                .{ "error", .{ .str = @errorName(detail.cause) } },
+                .{ "bytes_written", .{ .u = detail.bytes_written } },
+                .{ "bytes_total", .{ .u = detail.bytes_total } },
+            });
+            if (detail.cleanup) |*failure| cleanup = failure;
+        },
+        .replace => |*detail| {
+            fields.appendAssumeCapacity(.{ "error", .{ .str = @errorName(detail.cause) } });
+            if (detail.cleanup) |*failure| cleanup = failure;
+        },
+    }
+    if (cleanup) |failure| fields.appendSliceAssumeCapacity(&.{
+        .{ "cleanup_error", .{ .str = @errorName(failure.cause) } },
+        .{ "temporary_name", .{ .str = &failure.temporary_name } },
+    });
+    log.kv(.err, context, "Transcript save error", fields.items);
 }
 
 fn formatRecordingStopElapsedMilliseconds(buffer: *[32]u8, supervisor: *const Supervisor) []const u8 {
@@ -2035,9 +2096,28 @@ fn closeClipboard(supervisor: *Supervisor) void {
 }
 
 fn clipboardError(supervisor: *Supervisor, err: clipboard_wayland.Error) void {
-    switch (err) {
-        .server => |detail| log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Clipboard protocol error: object={d}, code={d}, message=\"{f}\", truncated={}", .{ detail.object, detail.code, std.zig.fmtString(detail.message[0..detail.message_size]), detail.truncated }),
-        else => log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Clipboard error: detail={any}", .{err}),
+    if (logging.enabled(.err)) {
+        var storage: [5]logging.Entry = undefined;
+        var fields: std.ArrayList(logging.Entry) = .initBuffer(&storage);
+        fields.appendAssumeCapacity(.{ "kind", .{ .str = @tagName(err) } });
+        switch (err) {
+            .transport => |detail| fields.appendSliceAssumeCapacity(&.{
+                .{ "error", .{ .str = @errorName(detail.cause) } },
+                .{ "errno", .{ .errno = detail.errno } },
+                .{ "object", .{ .u = detail.object } },
+                .{ "opcode", .{ .u = detail.opcode } },
+            }),
+            .server => |*detail| fields.appendSliceAssumeCapacity(&.{
+                .{ "object", .{ .u = detail.object } },
+                .{ "code", .{ .u = detail.code } },
+                .{ "message", .{ .str = detail.message[0..detail.message_size] } },
+                .{ "truncated", .{ .b = detail.truncated } },
+            }),
+            .unsupported => |feature| fields.appendAssumeCapacity(.{ "feature", .{ .str = @tagName(feature) } }),
+            .timed_out => |phase| fields.appendAssumeCapacity(.{ "phase", .{ .str = @tagName(phase) } }),
+            .selection_lost, .busy, .invalid_text => {},
+        }
+        log.kv(.err, .{ .recording_ordinal = supervisor.recording_ordinal }, if (err == .server) "Clipboard protocol error" else "Clipboard error", fields.items);
     }
     closeClipboard(supervisor);
     if (supervisor.phase == .delivering) {
@@ -2054,9 +2134,66 @@ fn openPasteKeyboard(supervisor: *Supervisor) void {
         },
         .err => |err| {
             supervisor.paste_problem = pasteProblem(err);
-            log.warn(.{}, "Automatic paste unavailable; clipboard delivery remains enabled: detail={any}", .{err});
+            logPasteError(.warn, .{}, "Automatic paste unavailable; clipboard delivery remains enabled", &err);
         },
     }
+}
+
+// Share the schema between setup and delivery failures rather than specializing
+// the error union's formatting for each caller's severity and message.
+noinline fn logPasteError(severity: logging.Level, context: logging.Context, message: []const u8, err: *const paste_keyboard.Error) void {
+    if (!logging.enabled(severity)) return;
+    // Setup has the most fields: ordinal, operation, request, errno and six
+    // setup members. Only the initialized entries reach the synchronous logger.
+    var storage: [10]logging.Entry = undefined;
+    var fields: std.ArrayList(logging.Entry) = .initBuffer(&storage);
+    if (context.recording_ordinal) |ordinal| fields.appendAssumeCapacity(.{ "recording_ordinal", .{ .u = ordinal } });
+    fields.appendAssumeCapacity(.{ "operation", .{ .str = @tagName(err.*) } });
+    const progress: ?paste_keyboard.Progress = switch (err.*) {
+        .open => |errno| blk: {
+            fields.appendAssumeCapacity(.{ "errno", .{ .errno = errno } });
+            break :blk null;
+        },
+        .configure => |*detail| blk: {
+            fields.appendSliceAssumeCapacity(&.{
+                .{ "request", .{ .u = detail.request } },
+                .{ "errno", .{ .errno = detail.errno } },
+            });
+            switch (detail.argument) {
+                .value => |value| fields.appendAssumeCapacity(.{ "argument", .{ .u = value } }),
+                .setup => |*setup| fields.appendSliceAssumeCapacity(&.{
+                    .{ "bustype", .{ .u = setup.id.bustype } },
+                    .{ "vendor", .{ .u = setup.id.vendor } },
+                    .{ "product", .{ .u = setup.id.product } },
+                    .{ "version", .{ .u = setup.id.version } },
+                    .{ "name", .{ .str = std.mem.sliceTo(&setup.name, 0) } },
+                    .{ "ff_effects_max", .{ .u = setup.ff_effects_max } },
+                }),
+            }
+            break :blk null;
+        },
+        .write => |detail| blk: {
+            fields.appendAssumeCapacity(.{ "errno", .{ .errno = detail.errno } });
+            break :blk detail.progress;
+        },
+        .ambiguous_write => |detail| blk: {
+            fields.appendAssumeCapacity(.{ "bytes_written", .{ .u = detail.bytes_written } });
+            break :blk detail.progress;
+        },
+        .timed_out => |detail| blk: {
+            fields.appendSliceAssumeCapacity(&.{
+                .{ "deadline_ns", .{ .u = detail.deadline_ns } },
+                .{ "observed_ns", .{ .u = detail.observed_ns } },
+            });
+            break :blk detail.progress;
+        },
+    };
+    if (progress) |value| fields.appendSliceAssumeCapacity(&.{
+        .{ "chord", .{ .str = @tagName(value.chord) } },
+        .{ "frame", .{ .u = value.frame } },
+        .{ "frame_bytes_sent", .{ .u = value.frame_bytes_sent } },
+    });
+    log.kv(severity, context, message, fields.items);
 }
 
 fn audioProblem(err: audio_process.Error) notifications.Problem {
@@ -2110,7 +2247,11 @@ fn enterIdle(supervisor: *Supervisor) void {
         null };
 }
 
-fn logCaptureReport(recording_ordinal: u64, report: *const audio_process.CaptureReport) void {
+// PERFORMANCE: Keep final-report formatting outside packet dispatch. Inlining
+// exposes the report's tagged payloads to the caller's branches and expands the
+// diagnostic code in ReleaseSafe. One call per completed capture is off the
+// graph-processing path; the report remains borrowed only during this call.
+noinline fn logCaptureReport(recording_ordinal: u64, report: *const audio_process.CaptureReport) void {
     const outcome_name = switch (report.end) {
         .completed => "completed",
         .automatic_stop => "automatic_stop",
@@ -2226,7 +2367,7 @@ fn register(
         &event,
     );
     if (linux.errno(result) != .SUCCESS) {
-        log.err(.{}, "Event registration failed: operation=epoll_ctl_add, fd={d}, source={t}, errno={t}", .{ descriptor, source, linux.errno(result) });
+        log.err(.{}, "Event registration failed: operation=epoll_ctl_add, fd={d}, source={t}, errno={f}", .{ descriptor, source, logging.fmtErrno(linux.errno(result)) });
         return error.SupervisorEpollRegisterFailed;
     }
 }
@@ -2281,7 +2422,7 @@ fn forceStopAndReap(process: *ChildProcess) !void {
             .SUCCESS => {},
             .INTR => continue,
             else => {
-                log.err(.{}, "Worker cleanup failed: operation=poll, errno={t}", .{linux.errno(result)});
+                log.err(.{}, "Worker cleanup failed: operation=poll, errno={f}", .{logging.fmtErrno(linux.errno(result))});
                 return error.SupervisorWorkerCleanupPollFailed;
             },
         }
@@ -2387,7 +2528,7 @@ fn signalChild(process: *const ChildProcess) !void {
             },
             .INTR => continue,
             else => {
-                log.err(.{}, "Worker termination failed: operation=pidfd_send_signal, pid_fd={d}, signal=KILL, errno={t}", .{ process.pid_fd, linux.errno(result) });
+                log.err(.{}, "Worker termination failed: operation=pidfd_send_signal, pid_fd={d}, signal=KILL, errno={f}", .{ process.pid_fd, logging.fmtErrno(linux.errno(result)) });
                 return error.SupervisorWorkerKillFailed;
             },
         }
@@ -2410,7 +2551,7 @@ fn reapChild(process: *const ChildProcess) !linux.siginfo_t {
             },
             .INTR => continue,
             else => {
-                log.err(.{}, "Worker reap failed: operation=waitid, pid_fd={d}, errno={t}", .{ process.pid_fd, linux.errno(result) });
+                log.err(.{}, "Worker reap failed: operation=waitid, pid_fd={d}, errno={f}", .{ process.pid_fd, logging.fmtErrno(linux.errno(result)) });
                 return error.SupervisorWorkerReapFailed;
             },
         }
@@ -2444,7 +2585,7 @@ fn descriptorFromResult(operation: []const u8, result: usize) !std.posix.fd_t {
 fn checkSyscall(operation: []const u8, result: usize) !void {
     const errno = linux.errno(result);
     if (errno == .SUCCESS) return;
-    log.err(.{}, "Supervisor system call failed: operation={s}, errno={t}", .{ operation, errno });
+    log.err(.{}, "Supervisor system call failed: operation={s}, errno={f}", .{ operation, logging.fmtErrno(errno) });
     return error.SupervisorSystemCallFailed;
 }
 
@@ -2453,7 +2594,7 @@ fn checkSyscall(operation: []const u8, result: usize) !void {
 // Linux releases the descriptor even when close reports a late I/O error.
 fn logCleanupSyscall(operation: []const u8, result: usize) void {
     const errno = linux.errno(result);
-    if (errno != .SUCCESS) log.err(.{}, "Supervisor cleanup failed: operation={s}, errno={t}", .{ operation, errno });
+    if (errno != .SUCCESS) log.err(.{}, "Supervisor cleanup failed: operation={s}, errno={f}", .{ operation, logging.fmtErrno(errno) });
 }
 
 fn closeDescriptor(descriptor: std.posix.fd_t) void {

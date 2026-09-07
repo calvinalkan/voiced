@@ -73,7 +73,12 @@ pub const Error = union(enum) {
 };
 pub const Result = union(enum) { ok: CaptureReport, err: Error };
 
-fn serviceResult(report: WorkerReport) Result {
+// PERFORMANCE: Keep report classification outside receive/dispatch. Inlining
+// into that branch tree duplicates field-wise copies of the large diagnostic
+// payloads; this boundary lets LLVM retain shared copies instead. The extra
+// call occurs once per final worker report, never per audio block. The returned
+// result still owns its complete report; no borrowed payload escapes.
+noinline fn serviceResult(report: WorkerReport) Result {
     return switch (report) {
         .setup_failed => |detail| if (detail.stage == .source_resolution and detail.domain == .voiced_audio)
             switch (detail.code) {
@@ -173,7 +178,11 @@ pub const PipeWireWorker = struct {
 
     /// `decodeReport` checks wire enums before any `@enumFromInt`. Field
     /// consistency stays in `validateReportPacket` as encoder asserts.
-    fn decodeReport(
+    // PERFORMANCE: Materialize the checked worker report at this boundary.
+    // Inlining decoding into receipt and classification expands copies of the
+    // nested diagnostics in ReleaseSafe. This adds one call per final report,
+    // not per callback, and preserves every wire and consistency check.
+    noinline fn decodeReport(
         report: WireReport,
         exchange: *const AudioExchange,
         recording_samples_target: u32,
@@ -327,7 +336,7 @@ pub const PipeWireWorker = struct {
     /// Receives and decodes one complete worker report without exposing the
     /// fixed transport record. Outer null means not ready; inner null means the
     /// socket closed before another report.
-    pub fn receiveReportNonblocking(
+    pub noinline fn receiveReportNonblocking(
         socket: std.posix.fd_t,
         exchange: *const AudioExchange,
         recording_samples_target: u32,

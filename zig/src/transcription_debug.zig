@@ -88,7 +88,7 @@ pub const Result = union(enum) { ok: void, err: Error };
 
 pub fn logError(context: logging.Context, err: Error, path: []const u8) void {
     switch (err) {
-        .publish, .stat_directory => |errno| log.err(context, "Failed transcription capture: stage={t}, errno={t}, path=\"{f}\"", .{ std.meta.activeTag(err), errno, std.zig.fmtString(path) }),
+        .publish, .stat_directory => |errno| log.err(context, "Failed transcription capture: stage={t}, errno={f}, path=\"{f}\"", .{ std.meta.activeTag(err), logging.fmtErrno(errno), std.zig.fmtString(path) }),
         .unsafe_directory => |detail| log.err(context, "Failed transcription capture: stage=unsafe_directory, uid={d}, expected_uid={d}, mode={o}, uid_available={}, mode_available={}, path=\"{f}\"", .{ detail.uid, detail.expected_uid, detail.mode, detail.uid_available, detail.mode_available, std.zig.fmtString(path) }),
         inline else => |cause| log.err(context, "Failed transcription capture: stage={t}, detail=\"{f}\", path=\"{f}\"", .{ std.meta.activeTag(err), std.zig.fmtString(@errorName(cause)), std.zig.fmtString(path) }),
     }
