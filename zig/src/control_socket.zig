@@ -1,4 +1,6 @@
-//! Owns bounded newline-JSON connections, not command or lifecycle policy.
+//! Owns bounded fixed-record control connections, not command or lifecycle policy.
+//! CLI and daemon share a little-endian wire ABI. Changing field offsets,
+//! widths, or ID meanings requires a protocol version change.
 //! The supervisor supplies epoll tags and absolute time, dispatches requests,
 //! and includes client deadlines in its existing timerfd schedule.
 
@@ -7,14 +9,57 @@ const linux = std.os.linux;
 const log = @import("logging.zig").scoped(.control);
 const assert = std.debug.assert;
 pub const clients_count_max = 16;
-const request_bytes_max = 4096;
-const response_bytes_max = 1024;
 const request_timeout_ns = std.time.ns_per_s;
 
 pub const Request = struct {
-    cmd: enum { listen, record, stop, cancel, status, kill },
+    cmd: enum(u8) { listen = 1, record = 2, stop = 3, cancel = 4, status = 5, kill = 6 },
     toggle: bool = false,
 };
+
+pub const Status = struct {
+    ignored: bool,
+    phase: Phase,
+    model: ModelState,
+    session_id: u64,
+    model_keep_warm_seconds: u64,
+};
+
+pub const Phase = enum(u8) { unavailable = 0, idle = 1, capturing = 2, stopping = 3, transcribing = 4, delivering = 5, _ };
+pub const ModelState = enum(u8) { unavailable = 0, absent = 1, restarting = 2, loading = 3, warm = 4, unloading = 5, _ };
+
+// Non-exhaustive wire enums represent every incoming byte. Validate them before
+// dispatch or @tagName; unknown values must not become invalid Zig enums.
+const WireRequest = extern struct {
+    magic: [4]u8 = "VCDQ".*,
+    version: u16 = 1,
+    command: Command,
+    flags: u8 = 0,
+
+    const Command = enum(u8) { listen = 1, record = 2, stop = 3, cancel = 4, status = 5, kill = 6, _ };
+};
+
+const WireReply = extern struct {
+    magic: [4]u8 = "VCDR".*,
+    version: u16 = 1,
+    result: Result,
+    command: WireRequest.Command,
+    session_id: u64 = 0,
+    model_keep_warm_seconds: u64 = 0,
+    phase: Phase = .unavailable,
+    model: ModelState = .unavailable,
+    reserved: [6]u8 = @splat(0),
+
+    const Result = enum(u8) { accepted = 0, ignored = 1, invalid_request = 2, unsupported_version = 3, _ };
+};
+
+comptime {
+    if (@import("builtin").target.cpu.arch.endian() != .little) @compileError("control wire ABI requires little endian");
+    assert(@sizeOf(WireRequest) == 8);
+    for (std.meta.fields(WireRequest), [_]usize{ 0, 4, 6, 7 }) |field, offset| assert(@offsetOf(WireRequest, field.name) == offset);
+    assert(@sizeOf(WireReply) == 32);
+    for (std.meta.fields(WireReply), [_]usize{ 0, 4, 6, 7, 8, 16, 24, 25, 26 }) |field, offset| assert(@offsetOf(WireReply, field.name) == offset);
+    for (std.meta.fields(@FieldType(Request, "cmd"))) |field| assert(field.value == @intFromEnum(@field(WireRequest.Command, field.name)));
+}
 
 /// `Server` holds the runtime-directory lock until deinit. Accept new clients
 /// only after consuming the current epoll batch, so a reused client slot cannot
@@ -25,6 +70,7 @@ pub const Server = struct {
     listener: std.posix.fd_t,
     epoll_fd: std.posix.fd_t,
     client_event_tag: u64,
+    accepting: bool = true,
     clients: [clients_count_max]Client = @splat(.{}),
 
     pub fn open(init: std.process.Init, epoll_fd: std.posix.fd_t, listener_tag: u64, client_tag: u64) !Server {
@@ -57,8 +103,8 @@ pub const Server = struct {
         switch (linux.errno(bind_result)) {
             .SUCCESS => {},
             .ADDRINUSE => {
-                // Do not unlink a live socket, including one owned by the Python
-                // daemon, which does not participate in this directory lock.
+                // EPROTOTYPE can mean a live older stream listener. Only
+                // ECONNREFUSED establishes staleness; never unlink on mismatch.
                 const probe = try createSocket(true);
                 defer close(probe);
                 switch (linux.errno(linux.connect(probe, @ptrCast(&address), address_size))) {
@@ -105,7 +151,21 @@ pub const Server = struct {
         server.directory.close(io);
     }
 
+    /// Stop accepting new commands while existing replies drain to their deadlines.
+    pub fn stopAccepting(server: *Server) !void {
+        if (!server.accepting) return;
+        // A queued connection keeps a level-triggered listener readable. Remove
+        // readiness too, or shutdown spins while a blocked reply awaits expiry.
+        const errno = linux.errno(linux.epoll_ctl(server.epoll_fd, linux.EPOLL.CTL_DEL, server.listener, null));
+        if (errno != .SUCCESS) {
+            log.err(.{}, "Control shutdown failed: operation=epoll_ctl_del, errno={t}", .{errno});
+            return error.ControlUnregisterFailed;
+        }
+        server.accepting = false;
+    }
+
     pub fn acceptClients(server: *Server, now_ns: u64) !void {
+        assert(server.accepting);
         for (0..clients_count_max) |_| {
             const result = linux.accept4(server.listener, null, null, linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK);
             switch (linux.errno(result)) {
@@ -148,18 +208,27 @@ pub const Server = struct {
         }
     }
 
+    /// Shutdown drains already-dispatched replies, without waiting for new requests.
+    pub fn hasPendingReplies(server: *const Server) bool {
+        for (&server.clients) |*client| {
+            if (client.descriptor != null and client.response != null) return true;
+        }
+        return false;
+    }
+
     pub fn receive(server: *Server, index: usize) ?Request {
         const client = &server.clients[index];
         const descriptor = client.descriptor orelse {
             return null;
         };
-        if (client.responding) {
+        if (client.response != null) {
             server.flush(index);
             return null;
         }
-        while (client.request_size < client.request.len) {
-            const remaining = client.request[client.request_size..];
-            const result = linux.recvfrom(descriptor, remaining.ptr, remaining.len, linux.MSG.DONTWAIT, null, null);
+        var wire: WireRequest = undefined;
+        while (true) {
+            // Without MSG_TRUNC, an oversized packet with a valid prefix passes.
+            const result = linux.recvfrom(descriptor, std.mem.asBytes(&wire).ptr, @sizeOf(WireRequest), linux.MSG.DONTWAIT | linux.MSG.TRUNC, null, null);
             switch (linux.errno(result)) {
                 .SUCCESS => {},
                 .INTR => continue,
@@ -175,42 +244,48 @@ pub const Server = struct {
                 server.closeClient(index);
                 return null;
             }
-            client.request_size += result;
-            const bytes = client.request[0..client.request_size];
-            if (std.mem.indexOfScalar(u8, bytes, '\n')) |newline| {
-                var memory: [8192]u8 = undefined;
-                var allocator = std.heap.FixedBufferAllocator.init(&memory);
-                const parsed = std.json.parseFromSlice(Request, allocator.allocator(), bytes[0..newline], .{}) catch {
-                    server.reject(index);
-                    return null;
-                };
-                defer parsed.deinit();
-                if (newline + 1 != bytes.len or (parsed.value.toggle and parsed.value.cmd != .record)) {
-                    server.reject(index);
-                    return null;
-                }
-                return parsed.value;
+            if (result != @sizeOf(WireRequest)) {
+                server.reject(index, .invalid_request, @enumFromInt(0));
+                return null;
             }
+            if (!std.mem.eql(u8, &wire.magic, "VCDQ")) {
+                server.reject(index, .invalid_request, wire.command);
+                return null;
+            }
+            if (wire.version != 1) {
+                server.reject(index, .unsupported_version, wire.command);
+                return null;
+            }
+            const cmd = std.enums.fromInt(@FieldType(Request, "cmd"), @intFromEnum(wire.command)) orelse {
+                server.reject(index, .invalid_request, wire.command);
+                return null;
+            };
+            if (wire.flags > 1 or (wire.flags == 1 and cmd != .record)) {
+                server.reject(index, .invalid_request, wire.command);
+                return null;
+            }
+            client.command = wire.command;
+            return .{ .cmd = cmd, .toggle = wire.flags == 1 };
         }
-        server.reject(index);
-        return null;
     }
 
-    pub fn respond(server: *Server, index: usize, value: anytype) void {
+    pub fn respond(server: *Server, index: usize, status: Status) void {
         const client = &server.clients[index];
-        if (client.descriptor == null) {
-            return;
-        }
-        var writer: std.Io.Writer = .fixed(&client.response);
-        std.json.Stringify.value(value, .{}, &writer) catch unreachable;
-        writer.writeByte('\n') catch unreachable;
-        client.response_size = writer.end;
-        client.responding = true;
+        if (client.descriptor == null) return;
+        client.response = .{
+            .result = if (status.ignored) .ignored else .accepted,
+            .command = client.command,
+            .session_id = status.session_id,
+            .model_keep_warm_seconds = status.model_keep_warm_seconds,
+            .phase = status.phase,
+            .model = status.model,
+        };
         server.flush(index);
     }
 
-    fn reject(server: *Server, index: usize) void {
-        server.respond(index, .{ .ok = false, .err = "invalid_request" });
+    fn reject(server: *Server, index: usize, result: WireReply.Result, command: WireRequest.Command) void {
+        server.clients[index].response = .{ .result = result, .command = command };
+        server.flush(index);
     }
 
     fn flush(server: *Server, index: usize) void {
@@ -218,11 +293,15 @@ pub const Server = struct {
         const descriptor = client.descriptor orelse {
             return;
         };
-        while (client.response_sent < client.response_size) {
-            const bytes = client.response[client.response_sent..client.response_size];
+        const bytes = std.mem.asBytes(&client.response.?);
+        while (true) {
             const result = linux.sendto(descriptor, bytes.ptr, bytes.len, linux.MSG.NOSIGNAL | linux.MSG.DONTWAIT, null, 0);
             switch (linux.errno(result)) {
-                .SUCCESS => client.response_sent += result,
+                // A short record is a failure, never a reason to send a suffix.
+                .SUCCESS => {
+                    if (result != bytes.len) log.err(.{}, "Control reply failed: short record, bytes={d}", .{result});
+                    break;
+                },
                 .INTR => continue,
                 .AGAIN => {
                     var event: linux.epoll_event = .{ .events = linux.EPOLL.OUT | linux.EPOLL.RDHUP, .data = .{ .u64 = server.client_event_tag } };
@@ -251,16 +330,12 @@ pub const Server = struct {
 const Client = struct {
     descriptor: ?std.posix.fd_t = null,
     deadline_ns: u64 = 0,
-    request: [request_bytes_max]u8 = undefined,
-    request_size: usize = 0,
-    response: [response_bytes_max]u8 = undefined,
-    response_size: usize = 0,
-    response_sent: usize = 0,
-    responding: bool = false,
+    command: WireRequest.Command = @enumFromInt(0),
+    response: ?WireReply = null,
 };
 
-/// `sendRequest` sends one command to the selected instance, prints its JSON
-/// response, and fails on timeout, malformed responses, or command rejection.
+/// `sendRequest` acknowledges one command; only status prints to stdout.
+/// A lost reply leaves the outcome unknown. Never automatically retry a toggle.
 pub fn sendRequest(init: std.process.Init, request: Request) !void {
     const path = try socketPath(init);
     defer init.gpa.free(path);
@@ -273,43 +348,54 @@ pub fn sendRequest(init: std.process.Init, request: Request) !void {
         }
     }
     const address = try unixAddress(path);
-    if (linux.errno(linux.connect(socket, @ptrCast(&address), @intCast(@offsetOf(linux.sockaddr.un, "path") + path.len + 1))) != .SUCCESS) {
-        return error.DaemonNotRunning;
+    switch (linux.errno(linux.connect(socket, @ptrCast(&address), @intCast(@offsetOf(linux.sockaddr.un, "path") + path.len + 1)))) {
+        .SUCCESS => {},
+        .PROTOTYPE => return error.IncompatibleControlProtocol,
+        else => return error.DaemonNotRunning,
     }
-    var buffer: [response_bytes_max]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&buffer);
-    try std.json.Stringify.value(request, .{}, &writer);
-    try writer.writeByte('\n');
-    var sent: usize = 0;
-    while (sent < writer.end) {
-        const bytes = buffer[sent..writer.end];
-        const result = linux.sendto(socket, bytes.ptr, bytes.len, linux.MSG.NOSIGNAL, null, 0);
+    const wire: WireRequest = .{ .command = @enumFromInt(@intFromEnum(request.cmd)), .flags = @intFromBool(request.toggle) };
+    while (true) {
+        const result = linux.sendto(socket, std.mem.asBytes(&wire).ptr, @sizeOf(WireRequest), linux.MSG.NOSIGNAL, null, 0);
         if (linux.errno(result) == .INTR) continue;
-        if (linux.errno(result) != .SUCCESS or result == 0) {
-            return error.ControlSendFailed;
-        }
-        sent += result;
+        if (linux.errno(result) != .SUCCESS or result != @sizeOf(WireRequest)) return error.ControlSendFailed;
+        break;
     }
-    var received: usize = 0;
-    while (received < buffer.len) {
-        const remaining = buffer[received..];
-        const result = linux.recvfrom(socket, remaining.ptr, remaining.len, 0, null, null);
+    var reply: WireReply = undefined;
+    while (true) {
+        const result = linux.recvfrom(socket, std.mem.asBytes(&reply).ptr, @sizeOf(WireReply), linux.MSG.TRUNC, null, null);
         if (linux.errno(result) == .INTR) continue;
-        if (linux.errno(result) != .SUCCESS or result == 0) {
-            return error.ControlReceiveFailed;
-        }
-        received += result;
-        if (std.mem.indexOfScalar(u8, buffer[0..received], '\n')) |newline| {
-            const parsed = try std.json.parseFromSlice(struct { ok: bool }, init.gpa, buffer[0..newline], .{ .ignore_unknown_fields = true });
-            defer parsed.deinit();
-            try std.Io.File.stdout().writeStreamingAll(init.io, buffer[0 .. newline + 1]);
-            if (!parsed.value.ok) {
-                return error.CommandRejected;
+        if (linux.errno(result) != .SUCCESS or result == 0) return error.ControlReceiveFailed;
+        if (result != @sizeOf(WireReply)) return error.InvalidControlReply;
+        break;
+    }
+    if (!std.mem.eql(u8, &reply.magic, "VCDR")) return error.InvalidControlReply;
+    if (reply.version != 1) return error.IncompatibleControlProtocol;
+    if (reply.command != wire.command or !std.mem.allEqual(u8, &reply.reserved, 0)) return error.InvalidControlReply;
+    switch (reply.result) {
+        .accepted, .ignored => {
+            if (reply.result == .ignored and request.cmd != .record and request.cmd != .listen) return error.InvalidControlReply;
+            switch (reply.phase) {
+                .idle, .capturing, .stopping, .transcribing, .delivering => {},
+                else => return error.InvalidControlReply,
             }
-            return;
-        }
+            switch (reply.model) {
+                .absent, .restarting, .loading, .warm, .unloading => {},
+                else => return error.InvalidControlReply,
+            }
+        },
+        .invalid_request, .unsupported_version => {
+            if (reply.session_id != 0 or reply.model_keep_warm_seconds != 0 or reply.phase != .unavailable or reply.model != .unavailable) return error.InvalidControlReply;
+            return if (reply.result == .unsupported_version) error.IncompatibleControlProtocol else error.CommandRejected;
+        },
+        else => return error.InvalidControlReply,
     }
-    return error.ControlResponseTooLarge;
+    if (request.cmd == .status) {
+        var buffer: [256]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buffer, "phase={s} model={s} session_id={d} model_keep_warm_seconds={d}\n", .{
+            @tagName(reply.phase), @tagName(reply.model), reply.session_id, reply.model_keep_warm_seconds,
+        });
+        try std.Io.File.stdout().writeStreamingAll(init.io, text);
+    }
 }
 
 // World-writable XDG_RUNTIME_DIR lets another uid create `voiced/` first.
@@ -363,7 +449,7 @@ fn unixAddress(path: []const u8) !linux.sockaddr.un {
 }
 
 fn createSocket(nonblocking: bool) !std.posix.fd_t {
-    const result = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC | (if (nonblocking) @as(u32, linux.SOCK.NONBLOCK) else 0), 0);
+    const result = linux.socket(linux.AF.UNIX, linux.SOCK.SEQPACKET | linux.SOCK.CLOEXEC | (if (nonblocking) @as(u32, linux.SOCK.NONBLOCK) else 0), 0);
     if (linux.errno(result) != .SUCCESS) {
         log.err(.{}, "Control socket failed: operation=socket, errno={t}", .{linux.errno(result)});
         return error.ControlSocketFailed;

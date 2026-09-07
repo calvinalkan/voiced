@@ -27,7 +27,7 @@ From the repository root:
 ```bash
 agent-run 'cd zig && zig build -Doptimize=ReleaseSafe install replay'
 agent-run 'zig fmt --check zig/src zig/runtime zig/scripts/setup.zig zig/build.zig zig/build.zig.zon'
-VOICED_INSTANCE=test agent-run './test.sh --zig-logging' './test.sh --zig-output'
+VOICED_INSTANCE=test agent-run './test.sh --zig-control' './test.sh --zig-logging' './test.sh --zig-output'
 VOICED_INSTANCE=test VOICED_ZIG_MODEL_TESTS=1 agent-run './test.sh --zig-output'
 VOICED_INSTANCE=test agent-run './test.sh --zig-replay'
 ```

@@ -12,7 +12,7 @@ const stderr = std.debug.print;
 pub const std_options: std.Options = .{
     // Keep panic stack tracing even when building a compact executable.
     .allow_stack_tracing = true,
-    // IPC uses raw Unix sockets; PipeWire and libsystemd use their own APIs.
+    // IPC and D-Bus use raw Unix sockets; PipeWire uses its own API.
     // The separate model-setup executable retains std.Io networking.
     .networking = false,
 };
@@ -98,7 +98,7 @@ pub fn main(init: std.process.Init) u8 {
                 .listen => "Start recording and stop automatically after speech followed by silence.",
                 .stop => "Stop recording and finish transcribing the captured audio.",
                 .cancel => "Cancel the current recording and discard its transcription.",
-                .status => "Show daemon, recording, and model status as JSON.",
+                .status => "Show daemon, recording, and model status as text.",
                 .kill => "Shut down the daemon and its workers.",
                 .record => unreachable,
             };
@@ -109,7 +109,7 @@ pub fn main(init: std.process.Init) u8 {
                     "Options:\n  -h, --help  Show this help.\n\n" ++
                     "The daemon must already be running; start it with 'voiced serve'.\n" ++
                     "Use the same VOICED_INSTANCE in both terminals.\n" ++
-                    "Responses are written to stdout as JSON; errors go to stderr.\n",
+                    "Only status prints to stdout; successful actions are silent. Errors go to stderr.\n",
                 .{ description, command },
             ) catch unreachable;
         };
@@ -161,7 +161,11 @@ pub fn main(init: std.process.Init) u8 {
         .serve => |options| supervisor.runService(init, options),
         .client => |request| control_socket.sendRequest(init, request),
         .worker => |worker| switch (worker.role) {
-            .@"audio-pipewire" => audio_process.PipeWireWorker.run(worker.socket, worker.supervisor_pid),
+            .@"audio-pipewire" => audio_process.PipeWireWorker.run(worker.socket, worker.supervisor_pid, .{
+                .runtime_directory = init.environ_map.get("PIPEWIRE_RUNTIME_DIR") orelse init.environ_map.get("XDG_RUNTIME_DIR"),
+                .remote = init.environ_map.get("PIPEWIRE_REMOTE") orelse "pipewire-0",
+                .system_bus_address = init.environ_map.get("DBUS_SYSTEM_BUS_ADDRESS") orelse "unix:path=/run/dbus/system_bus_socket",
+            }),
             .@"transcription-model" => transcription_process.runModelWorker(init, worker.socket, worker.supervisor_pid),
             .clipboard => clipboard_process.runWorker(init, worker.socket, worker.supervisor_pid),
         },
@@ -186,7 +190,9 @@ pub fn main(init: std.process.Init) u8 {
             error.RuntimeDirectoryNotSet, error.RuntimeDirectoryNotAbsolute => stderr("voiced: XDG_RUNTIME_DIR must name an absolute runtime directory for your user session.\n", .{}),
             error.InvalidInstance => stderr("voiced: VOICED_INSTANCE must contain at most 40 ASCII letters, digits, hyphens, or underscores.\n", .{}),
             error.UnsafeRuntimeDirectory => stderr("voiced: XDG_RUNTIME_DIR and the voiced instance directory must be owned by your user with no group or other permissions (typically 0700).\n", .{}),
-            error.CommandRejected => stderr("voiced: the daemon rejected the command; see its JSON response.\n", .{}),
+            error.CommandRejected => stderr("voiced: the daemon rejected the command.\n", .{}),
+            error.IncompatibleControlProtocol => stderr("voiced: incompatible control protocol. Restart the daemon using the same version as this CLI.\n", .{}),
+            error.InvalidControlReply => stderr("voiced: invalid reply from the daemon. Check its version and status before retrying a recording command.\n", .{}),
             error.ControlSendFailed, error.ControlReceiveFailed => stderr("voiced: communication with the daemon failed or timed out. Check 'voiced status' before retrying a recording command.\n", .{}),
             else => stderr("voiced: could not complete the command ({s}).\n", .{@errorName(err)}),
         }
@@ -372,7 +378,7 @@ const general_help =
     \\  record   Record manually; -t or --toggle toggles recording.
     \\  stop     Stop recording and finish transcription.
     \\  cancel   Discard the current recording.
-    \\  status   Print daemon status as JSON.
+    \\  status   Print daemon status as text.
     \\  kill     Shut down the daemon.
     \\  help     Show help, optionally for a command.
     \\
@@ -380,7 +386,7 @@ const general_help =
     \\  -h, --help  Show help without executing a command.
     \\
     \\Run 'voiced help serve' or 'voiced <command> --help' for details.
-    \\Client commands print JSON to stdout; errors go to stderr.
+    \\Only status prints to stdout; successful actions are silent. Errors go to stderr.
     \\The daemon copies final text with wl-copy and sends a paste shortcut.
     \\Use 'voiced serve --transcript-output stdout' for diagnostic transcript output.
     \\
@@ -459,6 +465,6 @@ const record_help =
     \\Toggles during stopping, transcription, or delivery are ignored.
     \\The daemon must already be running; start it with 'voiced serve'.
     \\Use the same VOICED_INSTANCE in both terminals.
-    \\Responses are written to stdout as JSON; errors go to stderr.
+    \\Successful recording commands are silent; errors go to stderr.
     \\
 ;

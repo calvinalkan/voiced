@@ -2,9 +2,7 @@ const std = @import("std");
 const logging = @import("logging.zig");
 const log = logging.scoped(.notifications);
 const linux = std.os.linux;
-const c = @cImport({
-    @cInclude("systemd/sd-bus.h");
-});
+const dbus = @import("dbus.zig");
 
 pub const Mode = enum { errors, off };
 pub const Problem = enum {
@@ -49,27 +47,34 @@ pub const Problem = enum {
 pub const Output = enum { unchanged, saved, unsaved, clipboard_saved, clipboard_unsaved, partial_saved, partial_unsaved };
 const Message = struct { problem: Problem, output: Output };
 
-/// The supervisor owns this client at a stable address from init through deinit.
-/// show/recover only coalesce requests; advance drives all bus I/O and callbacks.
-/// One outstanding call and one pending operation bound memory during a stalled
-/// desktop. No bus operation waits for a reply or flushes synchronously.
+/// One connection, one outstanding request, and one coalesced operation. All
+/// storage is reusable and all socket I/O is nonblocking. advance must run after
+/// show/recover, on descriptor readiness, and at deadline_monotonic_ns.
 pub const Client = struct {
-    bus: ?*c.sd_bus = null,
-    matches: [2]?*c.sd_bus_slot = .{ null, null },
-    request: ?struct { slot: ?*c.sd_bus_slot, operation: Operation } = null,
+    connection: dbus.Connection = .{},
+    address: dbus.Address = .{},
+    phase: Phase = .disabled,
+    request: ?Request = null,
     pending: ?Operation = null,
     last_problem: ?Message = null,
-    // Retaining the reply retains its unique sender name. Replacement/close
-    // target that owner, so an ID can never affect a restarted server's popup.
-    notification: ?struct { id: u32, reply: *c.sd_bus_message } = null,
-    descriptor: ?std.posix.fd_t = null,
+    notification: ?struct { id: u32, owner: Name } = null,
+    serial: u32 = 0,
     events: u32 = 0,
+    operation_deadline_ns: u64 = std.math.maxInt(u64),
     deadline_monotonic_ns: u64 = std.math.maxInt(u64),
 
-    pub fn init(self: *Client, epoll_fd: std.posix.fd_t, tag: u64) void {
-        self.connect(epoll_fd, tag) catch |err| {
+    const Phase = enum { disabled, retry, authenticating, begin, hello, match_closed, match_owner, ready };
+    const Request = struct { serial: u32, operation: ?Operation, owner: Name = .{}, invalidated: bool = false };
+
+    /// Environment values are borrowed only during init. A missing explicit
+    /// address falls back to XDG_RUNTIME_DIR/bus; no shell or autolaunch helper.
+    pub fn init(self: *Client, epoll_fd: std.posix.fd_t, tag: u64, bus_address: ?[]const u8, runtime_directory: ?[]const u8) void {
+        self.configure(bus_address, runtime_directory) catch |err| {
             log.warn(.{}, "Desktop notifications unavailable: error={s}", .{@errorName(err)});
-            self.deinit(epoll_fd);
+            return;
+        };
+        self.start(epoll_fd, tag) catch |err| {
+            self.disconnected(epoll_fd, err, true);
         };
     }
 
@@ -79,178 +84,316 @@ pub const Client = struct {
 
     pub fn showOutput(self: *Client, problem: Problem, output: Output) void {
         const message: Message = .{ .problem = problem, .output = output };
-        if (self.bus == null or (self.last_problem != null and std.meta.eql(self.last_problem.?, message))) return;
+        if (self.phase == .disabled or (self.last_problem != null and std.meta.eql(self.last_problem.?, message))) return;
         self.last_problem = message;
         self.pending = .{ .show = message };
     }
 
-    /// A new recording may report the same error again. Retain the notification
-    /// ID and pending reply so the next error can replace the existing popup.
+    /// Reset only suppression. The next error can replace the existing popup.
     pub fn resetSuppression(self: *Client) void {
         self.last_problem = null;
     }
 
-    /// A successful recording ends repeat suppression and closes any old error.
-    /// If Notify is still outstanding, its returned ID is closed when it arrives.
+    /// Close a previous error, including an ID from a still-outstanding Notify.
     pub fn recover(self: *Client) void {
         self.last_problem = null;
         self.pending = .close;
     }
 
     pub fn advance(self: *Client, epoll_fd: std.posix.fd_t, tag: u64) void {
-        if (self.bus == null) return;
-        self.process(epoll_fd, tag) catch |err| {
-            log.warn(.{}, "Desktop notifications disconnected: error={s}", .{@errorName(err)});
-            // A lost session bus disables notifications until service restart.
-            // Recording and output retain their own independent lifetimes.
-            self.deinit(epoll_fd);
-        };
+        if (self.phase == .disabled) return;
+        self.process(epoll_fd, tag) catch |err| self.disconnected(epoll_fd, err, false);
     }
 
     pub fn deinit(self: *Client, epoll_fd: std.posix.fd_t) void {
-        if (self.descriptor) |fd| _ = linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_DEL, fd, null);
-        if (self.request) |request| _ = c.sd_bus_slot_unref(request.slot);
-        for (self.matches) |slot| _ = c.sd_bus_slot_unref(slot);
-        self.clearNotification();
-        // close_unref deliberately drops queued output; flush_close_unref can
-        // block shutdown behind an unresponsive desktop bus.
-        _ = c.sd_bus_close_unref(self.bus);
+        self.close(epoll_fd);
         self.* = .{};
     }
 
-    fn connect(self: *Client, epoll_fd: std.posix.fd_t, tag: u64) !void {
-        // sd_bus_open_user resolves the session environment once and starts the
-        // connection. Authentication and Hello are driven by sd_bus_process.
-        try check(c.sd_bus_open_user(&self.bus), "sd_bus_open_user");
-        try check(c.sd_bus_set_method_call_timeout(self.bus, std.time.us_per_s), "sd_bus_set_method_call_timeout");
-        try check(c.sd_bus_match_signal_async(self.bus, &self.matches[0], destination, path, destination, "NotificationClosed", closed, matchInstalled, self), "sd_bus_match_signal_async");
-        try check(c.sd_bus_add_match_async(self.bus, &self.matches[1], "type='signal',sender='org.freedesktop.DBus',path='/org/freedesktop/DBus',interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='org.freedesktop.Notifications'", ownerChanged, matchInstalled, self), "sd_bus_add_match_async");
-        const fd = c.sd_bus_get_fd(self.bus);
-        try check(fd, "sd_bus_get_fd");
-        var event: linux.epoll_event = .{ .events = linux.EPOLL.IN, .data = .{ .u64 = tag } };
-        if (linux.errno(linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, fd, &event)) != .SUCCESS)
-            return error.NotificationEpollFailed;
-        self.descriptor = fd;
+    fn configure(self: *Client, address: ?[]const u8, runtime_directory: ?[]const u8) !void {
+        const text = address orelse {
+            const directory = runtime_directory orelse return error.MissingBusAddress;
+            if (!std.mem.startsWith(u8, directory, "/")) return error.InvalidAddress;
+            // This is a filesystem path, not an encoded D-Bus address. Preserve
+            // literal commas and percent signs in XDG_RUNTIME_DIR.
+            const socket_path = try std.fmt.bufPrint(self.address.value.path[0 .. self.address.value.path.len - 1], "{s}/bus", .{directory});
+            self.address.value.path[socket_path.len] = 0;
+            self.address.length = @intCast(@offsetOf(linux.sockaddr.un, "path") + socket_path.len + 1);
+            return;
+        };
+        // Desktop session addresses can list several transports. Select a
+        // supported Unix endpoint; we deliberately do not implement TCP.
+        var addresses = std.mem.splitScalar(u8, text, ';');
+        while (addresses.next()) |candidate| {
+            self.address = dbus.Address.parse(candidate) catch |err| switch (err) {
+                error.UnsupportedAddress => continue,
+                else => return err,
+            };
+            return;
+        }
+        return error.UnsupportedAddress;
+    }
+
+    fn start(self: *Client, epoll_fd: std.posix.fd_t, tag: u64) !void {
+        self.phase = .authenticating;
+        self.operation_deadline_ns = monotonicNanoseconds() + std.time.ns_per_s;
+        self.deadline_monotonic_ns = self.operation_deadline_ns;
+        try self.connection.connect(&self.address);
+        var event: linux.epoll_event = .{ .events = linux.EPOLL.IN | linux.EPOLL.OUT, .data = .{ .u64 = tag } };
+        const result = linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, self.connection.fd.?, &event);
+        self.connection.errno = linux.errno(result);
+        if (self.connection.errno != .SUCCESS) return error.NotificationEpollFailed;
         self.events = event.events;
-        try self.process(epoll_fd, tag);
+        var uid_buffer: [10]u8 = undefined;
+        const uid = try std.fmt.bufPrint(&uid_buffer, "{d}", .{linux.getuid()});
+        var hex: [20]u8 = undefined;
+        for (uid, 0..) |byte, i| {
+            hex[i * 2] = std.fmt.digitToChar(byte >> 4, .lower);
+            hex[i * 2 + 1] = std.fmt.digitToChar(byte & 15, .lower);
+        }
+        const auth = try std.fmt.bufPrint(&self.connection.output, "\x00AUTH EXTERNAL {s}\r\n", .{hex[0 .. uid.len * 2]});
+        self.connection.output_size = auth.len;
     }
 
     fn process(self: *Client, epoll_fd: std.posix.fd_t, tag: u64) !void {
-        // A busy bus must not monopolize worker/control dispatch. If this budget
-        // runs out, the existing timer wakes us immediately to resume buffered I/O.
+        const now = monotonicNanoseconds();
+        if (self.phase == .retry) {
+            if (now < self.operation_deadline_ns) return;
+            try self.start(epoll_fd, tag);
+        }
+        if (now >= self.operation_deadline_ns) {
+            if (self.phase != .ready) return error.AuthenticationOrSetupTimedOut;
+            if (self.connection.output_size != 0) return error.NotificationWriteTimedOut;
+            const request = self.request orelse return error.InvalidDeadline;
+            log.warn(.{}, "Desktop notification failed: operation={t}, name=\"org.freedesktop.DBus.Error.NoReply\", message=\"Reply deadline exceeded\", serial={d}", .{ std.meta.activeTag(request.operation.?), request.serial });
+            self.notification = null;
+            self.request = null;
+            self.operation_deadline_ns = std.math.maxInt(u64);
+        }
+        // Each iteration performs at most one read, write and message dispatch.
+        // The timer resumes buffered work when this fairness budget is exhausted.
         var budget: u8 = 16;
         while (budget > 0) : (budget -= 1) {
-            const result = c.sd_bus_process(self.bus, null);
-            try check(result, "sd_bus_process");
-            if (result == 0) break;
-        }
-        if (self.request == null and self.pending != null) {
-            var queued_writes: u64 = 0;
-            try check(c.sd_bus_get_n_queued_write(self.bus, &queued_writes), "sd_bus_get_n_queued_write");
-            // A reply timeout need not remove an unsent message. Wait for prior
-            // writes to drain before submitting again, so a blocked bus cannot
-            // accumulate wire messages behind our one outstanding reply slot.
-            if (queued_writes == 0 and c.sd_bus_is_ready(self.bus) > 0) {
-                const operation = self.pending.?;
-                self.pending = null;
-                self.submit(operation) catch |err| {
-                    log.warn(.{}, "Desktop notification failed: error={s}", .{@errorName(err)});
-                };
+            try self.connection.flush();
+            if (self.phase == .begin and self.connection.output_size == 0) self.phase = .hello;
+            if (self.phase == .authenticating) {
+                const bytes = self.connection.input[0..self.connection.input_size];
+                if (std.mem.indexOf(u8, bytes, "\r\n")) |end| {
+                    const line = bytes[0..end];
+                    if (line.len != 35 or !std.mem.startsWith(u8, line, "OK ")) {
+                        log.warn(.{}, "Desktop notification authentication rejected: response=\"{f}\"", .{std.zig.fmtString(line)});
+                        return error.AuthenticationRejected;
+                    }
+                    for (line[3..]) |byte| if (!std.ascii.isHex(byte)) return error.InvalidAuthenticationReply;
+                    if (self.connection.output_size != 0) return error.InvalidAuthenticationReply;
+                    self.connection.consume(end + 2);
+                    @memcpy(self.connection.output[0..7], "BEGIN\r\n");
+                    self.connection.output_size = 7;
+                    self.phase = .begin;
+                    continue;
+                }
+                if (bytes.len >= 1024) return error.AuthenticationReplyTooLarge;
+            } else if (self.phase != .begin) {
+                if (try dbus.Message.parse(self.connection.input[0..self.connection.input_size])) |message| {
+                    try self.received(message);
+                    self.connection.consume(message.size);
+                    if (self.request == null and self.connection.output_size == 0) try self.submit();
+                    continue;
+                }
+                if (self.request == null and self.connection.output_size == 0) try self.submit();
             }
+            if (!try self.connection.read()) break;
         }
-        const interest = c.sd_bus_get_events(self.bus);
-        try check(interest, "sd_bus_get_events");
-        const events: u32 = (if (interest & linux.POLL.IN != 0) @as(u32, linux.EPOLL.IN) else 0) |
-            (if (interest & linux.POLL.OUT != 0) @as(u32, linux.EPOLL.OUT) else 0);
+        const events = linux.EPOLL.IN | @as(u32, if (self.connection.output_size != 0) linux.EPOLL.OUT else 0);
         if (events != self.events) {
             var event: linux.epoll_event = .{ .events = events, .data = .{ .u64 = tag } };
-            if (linux.errno(linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_MOD, self.descriptor.?, &event)) != .SUCCESS)
-                return error.NotificationEpollFailed;
+            self.connection.errno = linux.errno(linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_MOD, self.connection.fd.?, &event));
+            if (self.connection.errno != .SUCCESS) return error.NotificationEpollFailed;
             self.events = events;
         }
-        var timeout_us: u64 = undefined;
-        try check(c.sd_bus_get_timeout(self.bus, &timeout_us), "sd_bus_get_timeout");
-        self.deadline_monotonic_ns = if (budget == 0) 0 else timeout_us *| std.time.ns_per_us;
+        self.deadline_monotonic_ns = if (budget == 0) 0 else self.operation_deadline_ns;
     }
 
-    fn submit(self: *Client, operation: Operation) !void {
-        if (operation == .close and self.notification == null) return;
-        var message: ?*c.sd_bus_message = null;
-        const recipient: [*c]const u8 = if (self.notification) |notification| c.sd_bus_message_get_sender(notification.reply) else destination;
-        try check(c.sd_bus_message_new_method_call(self.bus, &message, recipient, path, destination, if (operation == .show) "Notify" else "CloseNotification"), "sd_bus_message_new_method_call");
-        defer _ = c.sd_bus_message_unref(message);
-        switch (operation) {
-            .show => |problem| {
-                const text = problemText(problem);
-                try check(c.sd_bus_message_append(message, "susss", @as([*:0]const u8, "voiced"), if (self.notification) |notification| notification.id else @as(u32, 0), @as([*:0]const u8, "dialog-error"), text.title, text.body), "sd_bus_message_append");
-                try check(c.sd_bus_message_open_container(message, 'a', "s"), "sd_bus_message_open_container");
-                try check(c.sd_bus_message_close_container(message), "sd_bus_message_close_container");
-                try check(c.sd_bus_message_open_container(message, 'a', "{sv}"), "sd_bus_message_open_container");
-                try check(c.sd_bus_message_close_container(message), "sd_bus_message_close_container");
-                try check(c.sd_bus_message_append(message, "i", @as(i32, -1)), "sd_bus_message_append");
-            },
-            .close => {
-                try check(c.sd_bus_message_append(message, "u", self.notification.?.id), "sd_bus_message_append");
-                self.clearNotification();
-            },
+    fn submit(self: *Client) !void {
+        const operation: ?Operation = if (self.phase == .ready) self.pending orelse return else null;
+        if (operation != null and operation.? == .close and self.notification == null) {
+            self.pending = null;
+            return;
         }
-        var slot: ?*c.sd_bus_slot = null;
-        try check(c.sd_bus_call_async(self.bus, &slot, message, replied, self, std.time.us_per_s), "sd_bus_call_async");
-        self.request = .{ .slot = slot, .operation = operation };
-    }
-
-    fn replied(message: ?*c.sd_bus_message, userdata: ?*anyopaque, _: ?*c.sd_bus_error) callconv(.c) c_int {
-        const self: *Client = @ptrCast(@alignCast(userdata.?));
-        const request = self.request.?;
-        self.request = null;
-        defer _ = c.sd_bus_slot_unref(request.slot);
-        if (c.sd_bus_message_is_method_error(message, null) > 0) {
-            const failure = c.sd_bus_message_get_error(message);
-            log.warn(.{}, "Desktop notification failed: operation={t}, name=\"{f}\", message=\"{f}\"", .{ std.meta.activeTag(request.operation), std.zig.fmtString(std.mem.span(failure.*.name)), std.zig.fmtString(if (failure.*.message) |text| std.mem.span(text) else "") });
-            if (request.operation == .show) self.clearNotification();
-        } else if (request.operation == .show) {
-            var id: u32 = 0;
-            if (c.sd_bus_message_read(message, "u", &id) > 0 and id != 0) {
-                self.clearNotification();
-                self.notification = .{ .id = id, .reply = c.sd_bus_message_ref(message).? };
-                log.info(.{}, "Desktop notification accepted: problem={s}", .{@tagName(request.operation.show.problem)});
-            } else log.warn(.{}, "Desktop notification failed: invalid reply", .{});
+        self.serial +%= 1;
+        if (self.serial == 0) self.serial = 1;
+        const owner: Name = if (operation != null and self.notification != null) self.notification.?.owner else .{};
+        const recipient = if (operation == null) bus_destination else if (owner.len != 0) owner.slice() else destination;
+        const member: []const u8 = switch (self.phase) {
+            .hello => "Hello",
+            .match_closed, .match_owner => "AddMatch",
+            .ready => if (operation.? == .show) "Notify" else "CloseNotification",
+            else => return error.InvalidBusPhase,
+        };
+        const signature: []const u8 = switch (self.phase) {
+            .hello => "",
+            .match_closed, .match_owner => "s",
+            .ready => if (operation.? == .show) "susssasa{sv}i" else "u",
+            else => unreachable,
+        };
+        var writer = try dbus.Writer.call(&self.connection.output, self.serial, recipient, if (operation == null) bus_path else path, if (operation == null) bus_destination else destination, member, signature);
+        switch (self.phase) {
+            .hello => {},
+            .match_closed => try writer.string("type='signal',sender='org.freedesktop.Notifications',path='/org/freedesktop/Notifications',interface='org.freedesktop.Notifications',member='NotificationClosed'"),
+            .match_owner => try writer.string("type='signal',sender='org.freedesktop.DBus',path='/org/freedesktop/DBus',interface='org.freedesktop.DBus',member='NameOwnerChanged',arg0='org.freedesktop.Notifications'"),
+            .ready => switch (operation.?) {
+                .show => |problem| {
+                    const text = problemText(problem);
+                    try writer.string("voiced");
+                    try writer.uint32(if (self.notification) |notification| notification.id else 0);
+                    try writer.string("dialog-error");
+                    try writer.string(std.mem.span(text.title));
+                    try writer.string(std.mem.span(text.body));
+                    try writer.uint32(0); // Empty actions array, element alignment 4.
+                    try writer.uint32(0); // Empty hints array, element alignment 8.
+                    try writer.alignTo(8);
+                    try writer.uint32(@bitCast(@as(i32, -1)));
+                },
+                .close => try writer.uint32(self.notification.?.id),
+            },
+            else => unreachable,
         }
-        return 1;
+        self.connection.output_size = writer.finish();
+        self.request = .{ .serial = self.serial, .operation = operation, .owner = owner };
+        self.operation_deadline_ns = monotonicNanoseconds() + std.time.ns_per_s;
+        if (operation != null) {
+            self.pending = null;
+            if (operation.? == .close) self.notification = null;
+        }
     }
 
-    fn closed(message: ?*c.sd_bus_message, userdata: ?*anyopaque, _: ?*c.sd_bus_error) callconv(.c) c_int {
-        const self: *Client = @ptrCast(@alignCast(userdata.?));
-        var id: u32 = 0;
-        var reason: u32 = 0;
-        if (c.sd_bus_message_read(message, "uu", &id, &reason) > 0 and self.notification != null and id == self.notification.?.id)
-            self.clearNotification();
-        return 0;
-    }
-
-    fn ownerChanged(message: ?*c.sd_bus_message, userdata: ?*anyopaque, _: ?*c.sd_bus_error) callconv(.c) c_int {
-        const self: *Client = @ptrCast(@alignCast(userdata.?));
-        var name: [*c]const u8 = null;
-        var previous: [*c]const u8 = null;
-        var next: [*c]const u8 = null;
-        if (c.sd_bus_message_read(message, "sss", &name, &previous, &next) <= 0) return 0;
-        self.clearNotification();
-        if (self.request) |request| _ = c.sd_bus_slot_unref(request.slot);
+    fn received(self: *Client, message: dbus.Message) !void {
+        var body = message.body;
+        if (message.kind == .signal) {
+            if (std.mem.eql(u8, message.sender, bus_destination) and std.mem.eql(u8, message.path, bus_path) and std.mem.eql(u8, message.interface, bus_destination) and std.mem.eql(u8, message.member, "NameOwnerChanged")) {
+                if (!std.mem.eql(u8, message.signature, "sss")) return error.InvalidOwnerSignal;
+                const name = try body.string();
+                const previous = try body.string();
+                const next = try body.string();
+                try body.end();
+                if (!std.mem.eql(u8, name, destination)) return;
+                self.notification = null;
+                // An initial activation may precede the first Notify reply.
+                // Do not cancel that request just because its server appeared.
+                if (previous.len != 0) {
+                    if (self.request) |*request| if (request.operation != null) {
+                        request.invalidated = true;
+                    };
+                    self.pending = null;
+                }
+                if (next.len != 0 and self.last_problem != null and (self.request == null or self.request.?.invalidated)) self.pending = .{ .show = self.last_problem.? };
+                log.debug(.{}, "Desktop notification owner changed: previous=\"{f}\", next=\"{f}\"", .{ std.zig.fmtString(previous), std.zig.fmtString(next) });
+            } else if (self.notification) |notification| {
+                if (!std.mem.eql(u8, message.sender, notification.owner.slice()) or !std.mem.eql(u8, message.path, path) or !std.mem.eql(u8, message.interface, destination) or !std.mem.eql(u8, message.member, "NotificationClosed")) return;
+                if (!std.mem.eql(u8, message.signature, "uu")) return error.InvalidClosedSignal;
+                const id = try body.uint32();
+                const reason = try body.uint32();
+                try body.end();
+                if (id == notification.id) {
+                    self.notification = null;
+                    log.debug(.{}, "Desktop notification closed: id={d}, reason={d}", .{ id, reason });
+                }
+            }
+            return;
+        }
+        if (message.kind != .reply and message.kind != .err) return;
+        const request = self.request orelse return;
+        if (message.reply_serial != request.serial) return;
+        const from_bus = std.mem.eql(u8, message.sender, bus_destination);
+        if (request.operation == null) {
+            if (!from_bus) return;
+        } else if (request.owner.len != 0) {
+            if (!std.mem.eql(u8, message.sender, request.owner.slice()) and !(from_bus and message.kind == .err)) return;
+        } else if (!from_bus and !std.mem.startsWith(u8, message.sender, ":")) return;
         self.request = null;
-        self.pending = if (next[0] != 0 and self.last_problem != null) .{ .show = self.last_problem.? } else null;
-        return 0;
+        self.operation_deadline_ns = std.math.maxInt(u64);
+        if (request.invalidated) return;
+        if (message.kind == .err) {
+            const detail = if (std.mem.startsWith(u8, message.signature, "s")) try body.string() else "";
+            log.warn(.{}, "Desktop notification failed: operation={s}, name=\"{f}\", message=\"{f}\", serial={d}", .{ if (request.operation) |op| @tagName(op) else @tagName(self.phase), std.zig.fmtString(message.error_name), std.zig.fmtString(detail), message.reply_serial });
+            self.notification = null;
+            if (request.operation == null) return error.BusSetupRejected;
+            return;
+        }
+        switch (self.phase) {
+            .hello => {
+                if (!std.mem.eql(u8, message.signature, "s") or !std.mem.startsWith(u8, try body.string(), ":")) return error.InvalidHelloReply;
+                try body.end();
+                self.phase = .match_closed;
+            },
+            .match_closed, .match_owner => {
+                if (message.signature.len != 0) return error.InvalidMatchReply;
+                try body.end();
+                self.phase = if (self.phase == .match_closed) .match_owner else .ready;
+                if (self.phase == .ready) log.debug(.{}, "Desktop notification bus ready: transport=native", .{});
+            },
+            .ready => switch (request.operation.?) {
+                .show => |problem| {
+                    const id = if (std.mem.eql(u8, message.signature, "u")) try body.uint32() else 0;
+                    if (id == 0 or from_bus) {
+                        self.notification = null;
+                        log.warn(.{}, "Desktop notification failed: invalid reply", .{});
+                        return;
+                    }
+                    try body.end();
+                    self.notification = .{ .id = id, .owner = try Name.init(message.sender) };
+                    log.info(.{}, "Desktop notification accepted: problem={s}", .{@tagName(problem.problem)});
+                },
+                .close => {
+                    if (message.signature.len != 0) return error.InvalidCloseReply;
+                    try body.end();
+                    log.debug(.{}, "Desktop notification close accepted", .{});
+                },
+            },
+            else => return error.UnexpectedReply,
+        }
     }
 
-    fn clearNotification(self: *Client) void {
-        if (self.notification) |notification| _ = c.sd_bus_message_unref(notification.reply);
+    fn disconnected(self: *Client, epoll_fd: std.posix.fd_t, err: anyerror, initial: bool) void {
+        log.warn(.{}, "Desktop notifications {s}: error={s}, phase={t}, errno={t}({d}), retry_duration=5s", .{ if (initial) "unavailable" else "disconnected", @errorName(err), self.phase, self.connection.errno, @intFromEnum(self.connection.errno) });
+        self.close(epoll_fd);
+        self.request = null;
         self.notification = null;
+        self.pending = if (self.last_problem) |problem| .{ .show = problem } else null;
+        self.phase = .retry;
+        self.operation_deadline_ns = monotonicNanoseconds() + 5 * std.time.ns_per_s;
+        self.deadline_monotonic_ns = self.operation_deadline_ns;
     }
 
-    fn matchInstalled(message: ?*c.sd_bus_message, _: ?*anyopaque, _: ?*c.sd_bus_error) callconv(.c) c_int {
-        if (c.sd_bus_message_is_method_error(message, null) > 0) return -@as(c_int, @intFromEnum(linux.E.IO));
-        return 0;
+    fn close(self: *Client, epoll_fd: std.posix.fd_t) void {
+        if (self.connection.fd) |fd| _ = linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_DEL, fd, null);
+        self.connection.close();
+        self.events = 0;
     }
 };
+
+const Name = struct {
+    bytes: [255]u8 = undefined,
+    len: u8 = 0,
+    fn init(text: []const u8) !Name {
+        if (text.len == 0 or text.len > 255) return error.InvalidBusName;
+        var name: Name = .{ .len = @intCast(text.len) };
+        @memcpy(name.bytes[0..text.len], text);
+        return name;
+    }
+    fn slice(self: *const Name) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+fn monotonicNanoseconds() u64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+const bus_destination = "org.freedesktop.DBus";
+const bus_path = "/org/freedesktop/DBus";
 
 const Operation = union(enum) { show: Message, close };
 const destination = "org.freedesktop.Notifications";
@@ -263,7 +406,7 @@ fn problemText(message: Message) struct { title: [*:0]const u8, body: [*:0]const
         .audio_start_timed_out => .{ .title = "Voiced: microphone startup timed out", .body = "No audio arrived. Check the mic and audio service." },
         .audio_stalled => .{ .title = "Voiced: audio stopped arriving", .body = "Recording stopped. Check the mic and audio service." },
 
-        .microphone_not_found => .{ .title = "Voiced: configured mic not found", .body = "Check microphone_serial and connected inputs." },
+        .microphone_not_found => .{ .title = "Voiced: configured mic not found", .body = "Check the configured microphone and its connection." },
         .microphone_ambiguous => .{ .title = "Voiced: multiple mic inputs match", .body = "Replace microphone_serial with microphone_node." },
         .microphone_connection_lost => .{ .title = "Voiced: mic connection lost", .body = "Recording stopped. Check the mic connection." },
         .microphone_changed => .{ .title = "Voiced: mic changed during recording", .body = "Recording stopped to avoid mixing inputs." },
@@ -310,12 +453,4 @@ fn problemText(message: Message) struct { title: [*:0]const u8, body: [*:0]const
             else => "Partial text delivered; save failed. See logs.",
         },
     } };
-}
-
-// Share error reporting across operation names; the label is runtime data.
-fn check(result: c_int, operation: []const u8) !void {
-    if (result < 0) {
-        log.warn(.{}, "Desktop notification bus error: operation={s}, result={d}", .{ operation, result });
-        return error.NotificationBusFailed;
-    }
 }

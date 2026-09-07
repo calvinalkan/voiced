@@ -139,7 +139,7 @@ pub fn sendControl(socket: std.posix.fd_t, command: ControlCommand) !void {
 /// plus publication eventfd in one launch message. The worker returns the same
 /// logical final report used by service recordings.
 pub const PipeWireWorker = struct {
-    pub const protocol_version: u16 = 5;
+    pub const protocol_version: u16 = 6;
 
     pub const LaunchOptions = struct {
         session_id: u64,
@@ -200,6 +200,8 @@ pub const PipeWireWorker = struct {
                 .message_size = report.error_message_size,
                 .pipewire_version = report.pipewire_version,
                 .pipewire_version_size = report.pipewire_version_size,
+                .client_node_version_advertised = report.client_node_version_advertised,
+                .client_node_version_selected = report.client_node_version_selected,
             } };
         }
 
@@ -311,10 +313,8 @@ pub const PipeWireWorker = struct {
             .teardown_failure = teardown_failure,
             .memory_lock = memory_lock,
             .timeline_validation = timeline_validation,
-            .pipewire_headers_version = report.pipewire_headers_version,
-            .pipewire_headers_version_size = report.pipewire_headers_version_size,
-            .pipewire_library_version = report.pipewire_library_version,
-            .pipewire_library_version_size = report.pipewire_library_version_size,
+            .client_node_version_advertised = report.client_node_version_advertised,
+            .client_node_version_selected = report.client_node_version_selected,
             .pipewire_server_version = report.pipewire_server_version,
             .pipewire_server_version_size = report.pipewire_server_version_size,
             .source_identity = source,
@@ -380,6 +380,7 @@ pub const PipeWireWorker = struct {
     pub fn run(
         control_socket: std.posix.fd_t,
         expected_supervisor_pid: std.os.linux.pid_t,
+        environment: pipewire.Environment,
     ) !void {
         assert(control_socket >= 0);
         assert(expected_supervisor_pid > 1);
@@ -403,6 +404,7 @@ pub const PipeWireWorker = struct {
             shared_descriptors.values[0],
             shared_descriptors.values[1],
             launch_packet,
+            environment,
         );
     }
 
@@ -494,16 +496,12 @@ const WireReport = extern struct {
     setup_error_stage: u32,
     setup_error_domain: u32,
     setup_error_code: i64,
-    source_matches_count: u32,
-    source_matches_present: u8,
     pipewire_version_size: u8,
     pipewire_version: [pipewire.pipewire_version_capacity]u8,
 
     timeline_validation: u32,
-    pipewire_headers_version_size: u8,
-    pipewire_headers_version: [pipewire.pipewire_version_capacity]u8,
-    pipewire_library_version_size: u8,
-    pipewire_library_version: [pipewire.pipewire_version_capacity]u8,
+    client_node_version_advertised: u32,
+    client_node_version_selected: u32,
     pipewire_server_version_size: u8,
     pipewire_server_version: [pipewire.pipewire_version_capacity]u8,
 
@@ -581,14 +579,10 @@ fn validateReportPacket(
     exchange: *const AudioExchange,
 ) void {
     assert(report.worker_succeeded <= 1);
-    assert(report.source_matches_present <= 1);
-    if (report.source_matches_present == 0) assert(report.source_matches_count == 0);
     assert(report.shared_memory_is_locked <= 1);
     assert(report.error_message_size <= report.error_message.len);
     assert(report.teardown_error_message_size <= report.teardown_error_message.len);
     assert(report.pipewire_version_size <= report.pipewire_version.len);
-    assert(report.pipewire_headers_version_size <= report.pipewire_headers_version.len);
-    assert(report.pipewire_library_version_size <= report.pipewire_library_version.len);
     assert(report.pipewire_server_version_size <= report.pipewire_server_version.len);
     assert(report.source_is_resolved <= 1);
     assert(report.source_node_name_size <= report.source_node_name.len);
@@ -603,7 +597,6 @@ fn validateReportPacket(
         assert(std.enums.fromInt(pipewire.ErrorDomain, report.setup_error_domain) != null);
         assert(report.setup_error_stage != @intFromEnum(pipewire.SetupErrorStage.none));
         assert(report.setup_error_domain != @intFromEnum(pipewire.ErrorDomain.none));
-        assert(report.pipewire_version_size > 0);
         assert(report.error_message_size > 0);
         assert(report.shared_memory_is_locked == 0);
         assert(report.shared_memory_lock_error_code == 0);
@@ -615,8 +608,6 @@ fn validateReportPacket(
         assert(report.teardown_error_domain == @intFromEnum(pipewire.ErrorDomain.none));
         assert(report.teardown_error_code == 0);
         assert(report.teardown_error_message_size == 0);
-        assert(report.pipewire_headers_version_size == 0);
-        assert(report.pipewire_library_version_size == 0);
         assert(report.pipewire_server_version_size == 0);
         assert(report.source_is_resolved == 0);
         assert(report.negotiated_sample_rate_hz == 0);
@@ -641,8 +632,6 @@ fn validateReportPacket(
     assert(report.setup_error_domain == @intFromEnum(pipewire.ErrorDomain.none));
     assert(report.setup_error_code == 0);
     assert(report.pipewire_version_size == 0);
-    assert(report.pipewire_headers_version_size > 0);
-    assert(report.pipewire_library_version_size > 0);
     assert(report.main_loop_thread_id > 0);
     if (report.shared_memory_is_locked == 1) {
         assert(report.shared_memory_lock_error_code == 0);
@@ -740,8 +729,8 @@ fn validateReportPacket(
         }
         assert(report.source_is_resolved == 1);
         assert(report.callbacks_count > 0);
-        assert(report.negotiated_sample_rate_hz == audio_exchange.sample_rate_hz);
-        assert(report.negotiated_channels_count == audio_exchange.channels_count);
+        assert(report.negotiated_sample_rate_hz >= 8000 and report.negotiated_sample_rate_hz <= 192000);
+        assert(report.negotiated_channels_count >= 1 and report.negotiated_channels_count <= 8);
         assert(report.block_samples_count_min > 0);
         assert(report.block_samples_count_min <= report.block_samples_count_max);
         assert(report.block_samples_count_max <= audio_exchange.callback_samples_count_max);
@@ -781,6 +770,7 @@ fn runAudioWorkerSession(
     exchange_fd: std.posix.fd_t,
     publication_event_fd: std.posix.fd_t,
     launch_packet: PipeWireWorker.WireLaunch,
+    environment: pipewire.Environment,
 ) !void {
     assert(supervisor_socket >= 0);
     assert(exchange_fd >= 0);
@@ -824,6 +814,7 @@ fn runAudioWorkerSession(
         .slot_samples_boundary = audio_exchange.slot_samples_capacity,
         .automatic_stop = launch.automatic_stop,
         .process_realtime = true,
+        .environment = environment,
     });
 
     var report_packet: WireReport = std.mem.zeroes(WireReport);
@@ -874,16 +865,8 @@ fn runAudioWorkerSession(
             }
 
             report_packet.timeline_validation = @intFromEnum(capture.timeline_validation);
-            report_packet.pipewire_headers_version_size = capture.pipewire_headers_version_size;
-            @memcpy(
-                report_packet.pipewire_headers_version[0..capture.pipewire_headers_version_size],
-                capture.pipewire_headers_version[0..capture.pipewire_headers_version_size],
-            );
-            report_packet.pipewire_library_version_size = capture.pipewire_library_version_size;
-            @memcpy(
-                report_packet.pipewire_library_version[0..capture.pipewire_library_version_size],
-                capture.pipewire_library_version[0..capture.pipewire_library_version_size],
-            );
+            report_packet.client_node_version_advertised = capture.client_node_version_advertised;
+            report_packet.client_node_version_selected = capture.client_node_version_selected;
             report_packet.pipewire_server_version_size = capture.pipewire_server_version_size;
             @memcpy(
                 report_packet.pipewire_server_version[0..capture.pipewire_server_version_size],
@@ -964,7 +947,6 @@ fn runAudioWorkerSession(
         .setup_failed => |setup_error| {
             assert(setup_error.message_size > 0);
             assert(setup_error.message_size <= setup_error.message.len);
-            assert(setup_error.pipewire_version_size > 0);
             assert(setup_error.pipewire_version_size <= setup_error.pipewire_version.len);
 
             report_packet.error_message_size = setup_error.message_size;
@@ -975,6 +957,8 @@ fn runAudioWorkerSession(
             report_packet.setup_error_stage = @intFromEnum(setup_error.stage);
             report_packet.setup_error_domain = @intFromEnum(setup_error.domain);
             report_packet.setup_error_code = setup_error.code;
+            report_packet.client_node_version_advertised = setup_error.client_node_version_advertised;
+            report_packet.client_node_version_selected = setup_error.client_node_version_selected;
             report_packet.pipewire_version_size = setup_error.pipewire_version_size;
             @memcpy(
                 report_packet.pipewire_version[0..setup_error.pipewire_version_size],

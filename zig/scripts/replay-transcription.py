@@ -14,10 +14,9 @@ import time
 import zlib
 from pathlib import Path
 
-import numpy as np
-
-
 def main():
+    import numpy as np
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "capture",
@@ -78,14 +77,17 @@ def main():
         fd = os.open(capture.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
             fcntl.flock(fd, fcntl.LOCK_SH)
-            for name in ("audio.wav", "metadata.json", "tokens.json", "generated.txt"):
+            # Prefer v2 text; never fall back to an old JSON generation if a
+            # present text capture is malformed. Legacy support is offline only.
+            suffix = "txt" if (capture / "metadata.txt").exists() else "json"
+            for name in ("audio.wav", f"metadata.{suffix}", f"tokens.{suffix}", "generated.txt"):
                 (output / name).write_bytes((capture / name).read_bytes())
         finally:
             os.close(fd)
-        settings = json.loads((output / "metadata.json").read_text())
-        if settings["format_version"] != 1:
-            raise ValueError("Unsupported capture format")
-        captured = json.loads((output / "tokens.json").read_text())
+        settings = read_metadata(output / f"metadata.{suffix}")
+        captured = read_tokens(output / f"tokens.{suffix}")
+        if len(captured) != settings["evidence"]["tokens"]:
+            raise ValueError("Capture token count does not match its metadata")
         audio = read_audio(output / "audio.wav")
         if len(audio) != settings["evidence"]["samples"]:
             raise ValueError("Capture sample count does not match its metadata")
@@ -246,8 +248,149 @@ def main():
     print(f"Comparison: {output / 'comparison.json'}")
 
 
+def read_metadata(path):
+    """Read v2 text or legacy v1 JSON into the same typed metadata dictionary."""
+    text = read_capture_text(path)
+    if path.suffix == ".json":
+        metadata = json.loads(text)
+        if metadata["format_version"] != 1:
+            raise ValueError("Unsupported capture format")
+        return metadata
+
+    fields = {}
+    for line in text.split("\n")[:-1]:
+        key, separator, value = line.partition("=")
+        if not separator or not key or key in fields:
+            raise ValueError(f"Invalid or duplicate metadata field: {key!r}")
+        fields[key] = value
+    if fields.get("format_version") != "2":
+        raise ValueError("Unsupported capture format")
+
+    integer_fields = {
+        "format_version": 32, "session_id": 64, "captured_unix_seconds": -64,
+        "packed_image_format_version": 32, "packed_model_cache_version": 32,
+        "model_encoder_threads": 32, "model_decoder_threads": 32,
+        "model_encoder_padding_seconds": 32, "sample_rate": 32, "beam_size": 32,
+    }
+    integer_fields.update({"evidence." + key: 32 for key in (
+        "chunk_available", "decoding_available", "chunk", "samples", "tokens",
+        "token_limit", "encoder_positions", "reserved",
+    )})
+    integer_fields.update({"evidence." + key: 64 for key in (
+        "log_mel_ns", "encoder_ns", "cross_key_values_ns", "decoder_ns",
+    )})
+    float_fields = ("evidence.no_speech_probability", "evidence.average_log_probability")
+    bool_fields = ("contains_activity", "text_decode_complete", "temperature_fallback", "end_available")
+    string_fields = (
+        "stage", "error_name", "model", "model_revision", "source_sha256",
+        "packed_image_sha256", "zig_version", "optimize", "sample_format", "end",
+    )
+    list_fields = ("prompt", "suppressed_tokens", "suppressed_first_tokens")
+    expected = set(integer_fields) | set(float_fields) | set(bool_fields) | set(string_fields) | set(list_fields)
+    if fields.keys() != expected:
+        raise ValueError(f"Missing or unknown metadata fields: {sorted(fields.keys() ^ expected)}")
+
+    metadata = {}
+    for key, bits in integer_fields.items():
+        value = fields[key]
+        digits = value.removeprefix("-") if bits < 0 else value
+        if not digits.isascii() or not digits.isdecimal():
+            raise ValueError(f"Invalid metadata integer: {key}")
+        number = int(value)
+        minimum, maximum = (-(1 << 63), (1 << 63) - 1) if bits < 0 else (0, (1 << bits) - 1)
+        if not minimum <= number <= maximum:
+            raise ValueError(f"Metadata integer out of range: {key}")
+        metadata[key] = number
+    for key in float_fields:
+        # Preserve inf/nan evidence too; availability is a separate field.
+        metadata[key] = float(fields[key])
+    for key in bool_fields:
+        if fields[key] not in ("true", "false"):
+            raise ValueError(f"Invalid metadata boolean: {key}")
+        metadata[key] = fields[key] == "true"
+    for key in string_fields:
+        metadata[key] = unescape_metadata_string(fields[key])
+    for key in list_fields:
+        metadata[key] = parse_token_list(fields[key])
+    if len(metadata["prompt"]) != 2 or any(token > 65535 for token in metadata["prompt"]):
+        raise ValueError("Invalid capture prompt")
+    if not metadata.pop("end_available"):
+        if metadata["end"] != "":
+            raise ValueError("Unavailable end must have an empty value")
+        metadata["end"] = None
+    metadata["evidence"] = {
+        key.removeprefix("evidence."): metadata.pop(key)
+        for key in list(metadata) if key.startswith("evidence.")
+    }
+    return metadata
+
+
+def unescape_metadata_string(value):
+    """Decode the writer's byte escapes, not Python or JSON string syntax."""
+    encoded = value.encode("ascii")
+    output = bytearray()
+    escapes = {ord("n"): 10, ord("r"): 13, ord("t"): 9, ord("\\"): 92, ord('"'): 34}
+    index = 0
+    while index < len(encoded):
+        byte = encoded[index]
+        index += 1
+        if byte != 92:
+            if not 32 <= byte <= 126:
+                raise ValueError("Unescaped metadata control byte")
+            output.append(byte)
+            continue
+        if index == len(encoded):
+            raise ValueError("Truncated metadata escape")
+        escape = encoded[index]
+        index += 1
+        if escape in escapes:
+            output.append(escapes[escape])
+        elif escape == ord("x"):
+            digits = encoded[index:index + 2]
+            if len(digits) != 2 or any(byte not in b"0123456789abcdefABCDEF" for byte in digits):
+                raise ValueError("Invalid metadata hex escape")
+            output.append(int(digits, 16))
+            index += 2
+        else:
+            raise ValueError("Unknown metadata escape")
+    return output.decode("utf-8")
+
+
+def read_tokens(path):
+    """Read decimal u32 token IDs; a newline alone represents an empty list."""
+    text = read_capture_text(path)
+    if path.suffix == ".json":
+        tokens = json.loads(text)
+        if not isinstance(tokens, list) or any(type(token) is not int or not 0 <= token <= 0xffffffff for token in tokens):
+            raise ValueError("Invalid legacy token list")
+        return tokens
+    return parse_token_list(text)
+
+
+def parse_token_list(text):
+    tokens = []
+    for token in text.split():
+        if not token.isascii() or not token.isdecimal():
+            raise ValueError("Invalid decimal token ID")
+        value = int(token)
+        if value > 0xffffffff:
+            raise ValueError("Token ID exceeds u32")
+        tokens.append(value)
+    return tokens
+
+
+def read_capture_text(path):
+    with path.open("rb") as source:
+        data = source.read(1024 * 1024 + 1)
+    if len(data) > 1024 * 1024 or not data.endswith(b"\n"):
+        raise ValueError("Oversized or incomplete capture text file")
+    return data.decode("utf-8")
+
+
 def read_audio(path):
     """Read mono 16k WAV without resampling or float32 -> PCM16 conversion."""
+    import numpy as np
+
     data = path.read_bytes()
     if data[:4] != b"RIFF" or data[8:12] != b"WAVE":
         raise ValueError("Expected a RIFF/WAVE file")
@@ -278,6 +421,7 @@ def reference_features(audio, padding):
     # Independent NumPy implementation of the runtime's feature contract:
     # reflected prefix, zero suffix, floor(N/160) content frames, normalize
     # content, then append normalized zeros and align to eight frames.
+    import numpy as np
     from faster_whisper.feature_extractor import FeatureExtractor
 
     extractor = FeatureExtractor()

@@ -4,10 +4,10 @@ pub fn build(b: *std.Build) void {
     // `zig build` does not forward `-fPIE`; use `-Dpie` (same idea as `-Doptimize`).
     const pie = b.option(bool, "pie", "Build position-independent executables (default: true)") orelse true;
     add_default_build_command(b, pie);
-    add_update_compile_flags_command(b);
 
     const setup_tool = b.addExecutable(.{
         .name = "setup",
+        .linkage = .static,
         .root_module = b.createModule(.{
             .root_source_file = b.path("scripts/setup.zig"),
             .target = b.graph.host,
@@ -50,6 +50,9 @@ fn add_default_build_command(b: *std.Build, pie: bool) void {
     });
     const voiced = b.addExecutable(.{
         .name = "voiced",
+        // Static PIE retains address randomization without an ELF interpreter
+        // or shared libraries. Its ELF type is still DYN for self-relocation.
+        .linkage = .static,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = b.graph.host,
@@ -65,17 +68,27 @@ fn add_default_build_command(b: *std.Build, pie: bool) void {
     voiced.pie = pie;
     voiced.root_module.addImport("models", models_module);
     voiced.root_module.addImport("inference", inference);
-    configurePipeWireArtifact(b, voiced);
-    voiced.root_module.linkSystemLibrary("systemd", .{ .use_pkg_config = .no });
     b.installArtifact(voiced);
+
+    const notification_check = b.addExecutable(.{
+        .name = "voiced-notification-check",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/notification_check.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const install_notification_check = b.addInstallArtifact(notification_check, .{});
+    b.step("notification-check", "Build the isolated notification verification driver").dependOn(&install_notification_check.step);
 
     const replay = b.addExecutable(.{
         .name = "voiced-replay",
+        .linkage = .static,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/replay.zig"),
             .target = b.graph.host,
             .optimize = optimize,
-            .link_libc = true,
         }),
         .use_llvm = true,
     });
@@ -84,43 +97,4 @@ fn add_default_build_command(b: *std.Build, pie: bool) void {
     replay.root_module.addImport("inference", inference);
     const install_replay = b.addInstallArtifact(replay, .{});
     b.step("replay", "Build the offline failed-transcription decoder").dependOn(&install_replay.step);
-}
-
-const c_flags = [_][]const u8{
-    "-std=gnu17",
-    "-Weverything",
-    "-Werror",
-    "-pedantic-errors",
-};
-
-fn configurePipeWireArtifact(b: *std.Build, artifact: *std.Build.Step.Compile) void {
-    // Explicit roots serve ZLS, translate-c, and compilation consistently;
-    // no pkg-config discovery or separate system C compiler is required.
-    artifact.root_module.addIncludePath(b.path("src"));
-    artifact.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include/pipewire-0.3" });
-    artifact.root_module.addSystemIncludePath(.{ .cwd_relative = "/usr/include/spa-0.2" });
-    artifact.root_module.addCMacro("_REENTRANT", "1");
-    artifact.root_module.addCSourceFile(.{
-        .file = b.path("src/audio_pipewire.c"),
-        .flags = &c_flags,
-    });
-    artifact.root_module.addLibraryPath(.{ .cwd_relative = "/usr/lib/x86_64-linux-gnu" });
-    artifact.root_module.linkSystemLibrary("pipewire-0.3", .{ .use_pkg_config = .no });
-    artifact.root_module.link_libc = true;
-}
-
-fn add_update_compile_flags_command(b: *std.Build) void {
-    const flags = std.mem.join(b.allocator, "\n", &c_flags) catch @panic("OOM");
-    const contents = b.fmt(
-        "{s}\n" ++
-            "-Isrc\n" ++
-            "-isystem\n/usr/include/pipewire-0.3\n" ++
-            "-isystem\n/usr/include/spa-0.2\n" ++
-            "-D_REENTRANT=1\n",
-        .{flags},
-    );
-    const generated = b.addWriteFiles().add("compile_flags.txt", contents);
-    const update = b.addUpdateSourceFiles();
-    update.addCopyFileToSource(generated, "compile_flags.txt");
-    b.step("update-compile-flags", "Update clangd flags for the PipeWire C boundary").dependOn(&update.step);
 }

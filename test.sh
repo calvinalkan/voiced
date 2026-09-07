@@ -93,6 +93,190 @@ def close_receivers():
 PY
 fi
 
+if [[ "${1:-}" == "--zig-control" ]]; then
+    export VOICED_INSTANCE=test
+    python3 - <<'PY'
+from journal_fixture import journal_log
+import os
+from pathlib import Path
+import socket
+import struct
+import subprocess
+import tempfile
+import time
+
+binary = str(Path("zig/zig-out/bin/voiced").resolve())
+request = struct.Struct("<4sHBB")
+reply = struct.Struct("<4sHBBQQBB6s")
+assert request.size == 8 and reply.size == 32
+
+with tempfile.TemporaryDirectory(prefix="voiced-control-") as temporary:
+    root = Path(temporary)
+    env = dict(os.environ, VOICED_INSTANCE="test", XDG_RUNTIME_DIR=str(root),
+               PIPEWIRE_RUNTIME_DIR=str(root), XDG_CONFIG_HOME=str(root / "config"),
+               XDG_STATE_HOME=str(root / "state"), XDG_CACHE_HOME=str(root / "cache"),
+               DBUS_SESSION_BUS_ADDRESS="unix:path=" + str(root / "missing-bus"))
+    path = root / "voiced-test/control.sock"
+
+    def cli(*args):
+        return subprocess.run([binary, *args], env=env, capture_output=True, timeout=5)
+
+    def exchange(data):
+        with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
+            client.settimeout(3)
+            client.connect(str(path))
+            assert client.send(data) == len(data)
+            data = client.recv(4096)
+            assert len(data) == reply.size, data
+            fields = reply.unpack(data)
+            assert fields[0:2] == (b"VCDR", 1) and fields[-1] == bytes(6), fields
+            return fields
+
+    # A stale sequenced-packet pathname is recoverable without bypassing the lock.
+    path.parent.mkdir(mode=0o700)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as stale:
+        stale.bind(str(path))
+    with journal_log(root / "daemon.log") as log:
+        daemon = subprocess.Popen([binary, "serve", "--transcript-output", "stdout"], env=env,
+                                  stdout=subprocess.DEVNULL, stderr=log)
+        try:
+            deadline = time.monotonic() + 5
+            while True:
+                assert daemon.poll() is None
+                result = cli("status")
+                if result.returncode == 0: break
+                assert time.monotonic() < deadline, result.stderr
+                time.sleep(.01)
+            assert result.stdout.startswith(b"phase=idle model=absent session_id=")
+            assert path.stat().st_mode & 0o777 == 0o600
+            assert path.parent.stat().st_mode & 0o777 == 0o700
+            status = request.pack(b"VCDQ", 1, 5, 0)
+            snapshot = exchange(status)
+            assert snapshot[2:4] == (0, 5) and snapshot[6:8] == (1, 1), snapshot
+            for packet, expected in (
+                (request.pack(b"BAD!", 1, 5, 0), 2),
+                (request.pack(b"VCDQ", 2, 5, 0), 3),
+                (request.pack(b"VCDQ", 1, 0, 0), 2),
+                (request.pack(b"VCDQ", 1, 255, 0), 2),
+                (request.pack(b"VCDQ", 1, 5, 1), 2),
+                (request.pack(b"VCDQ", 1, 2, 128), 2),
+                (status[:3], 2), (status + b"x", 2), (status * 2, 2),
+                (b'{"cmd":"status"}\n', 2),
+            ):
+                rejected = exchange(packet)
+                assert rejected[2] == expected and rejected[4:8] == (0, 0, 0, 0), rejected
+            # Connections have deadlines even when the peer sends no record.
+            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as idle:
+                idle.settimeout(3)
+                idle.connect(str(path))
+                assert cli("status").returncode == 0
+                assert idle.recv(1) == b""
+            # A disconnected reader must not terminate the service via SIGPIPE.
+            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as departed:
+                departed.connect(str(path))
+                departed.send(status)
+            assert cli("status").returncode == 0
+            with journal_log(root / "duplicate.log") as refusal:
+                duplicate = subprocess.run([binary, "serve", "--transcript-output", "stdout"], env=env,
+                                           stdout=subprocess.DEVNULL, stderr=refusal, timeout=3)
+                assert duplicate.returncode == 1 and path.exists()
+            # Queue both requests before one epoll batch: the first schedules
+            # capture, the second must report ignored without scheduling again.
+            import signal
+            peers = []
+            os.kill(daemon.pid, signal.SIGSTOP)
+            try:
+                for _ in range(2):
+                    peer = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+                    peers.append(peer)
+                    peer.settimeout(3)
+                    peer.connect(str(path))
+                    packet = request.pack(b"VCDQ", 1, 2, 0)
+                    assert peer.send(packet) == len(packet)
+                os.kill(daemon.pid, signal.SIGCONT)
+                outcomes = [reply.unpack(peer.recv(4096)) for peer in peers]
+                assert [row[2] for row in outcomes] == [0, 1], outcomes
+                assert all(row[3] == 2 and row[6] == 2 for row in outcomes), outcomes
+            finally:
+                os.kill(daemon.pid, signal.SIGCONT)
+                for peer in peers: peer.close()
+            assert cli("cancel").returncode == 0
+            for args in (("stop",), ("cancel",), ("record",), ("stop",), ("listen",),
+                         ("cancel",), ("record", "-t"), ("cancel",)):
+                result = cli(*args)
+                assert result.returncode == 0 and result.stdout == b"", (args, result)
+                assert cli("status").returncode == 0
+            result = cli("kill")
+            assert result.returncode == 0 and result.stdout == b"", result
+            assert daemon.wait(timeout=5) == 0
+            assert not path.exists()
+        finally:
+            if daemon.poll() is None:
+                daemon.kill()
+                daemon.wait()
+
+    # A live older stream listener is incompatible, not stale; never unlink it.
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as old:
+        old.bind(str(path))
+        old.listen(1)
+        inode = path.stat().st_ino
+        result = cli("status")
+        assert result.returncode == 1 and b"incompatible control protocol" in result.stderr, result
+        with journal_log(root / "old-listener.log") as refusal:
+            duplicate = subprocess.run([binary, "serve", "--transcript-output", "stdout"], env=env,
+                                       stdout=subprocess.DEVNULL, stderr=refusal, timeout=3)
+            assert duplicate.returncode == 1 and path.stat().st_ino == inode
+    path.unlink()
+
+    # Exercise the real CLI against malformed replies, including unknown enums.
+    valid = reply.pack(b"VCDR", 1, 0, 5, 17, 30, 1, 4, bytes(6))
+    cases = [(valid, 0, b"phase=idle model=warm session_id=17 model_keep_warm_seconds=30\n")]
+    for offset, value in ((0, 0), (4, 2), (6, 1), (6, 2), (6, 255), (7, 2), (24, 0), (24, 255), (25, 255), (26, 1)):
+        bad = bytearray(valid)
+        bad[offset] = value
+        cases.append((bytes(bad), 1, b""))
+    cases += [(valid[:-1], 1, b""), (valid + b"x", 1, b""), (None, 1, b"")]
+    for outcome in (2, 3):
+        cases.append((reply.pack(b"VCDR", 1, outcome, 5, 0, 0, 0, 0, bytes(6)), 1, b""))
+    for packet, exit_code, stdout in cases:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as fake:
+            fake.bind(str(path))
+            fake.listen(1)
+            fake.settimeout(3)
+            client = subprocess.Popen([binary, "status"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                peer, _ = fake.accept()
+                with peer:
+                    peer.settimeout(3)
+                    assert peer.recv(1024) == request.pack(b"VCDQ", 1, 5, 0)
+                    if packet is not None: assert peer.send(packet) == len(packet)
+                output, errors = client.communicate(timeout=4)
+                assert client.returncode == exit_code and output == stdout, (packet, output, errors)
+            finally:
+                if client.poll() is None: client.kill()
+                client.wait()
+                path.unlink()
+    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as fake:
+        fake.bind(str(path)); fake.listen(1); fake.settimeout(3)
+        client = subprocess.Popen([binary, "record", "-t"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            peer, _ = fake.accept()
+            with peer:
+                peer.settimeout(3)
+                assert peer.recv(1024) == request.pack(b"VCDQ", 1, 2, 1)
+                ignored = reply.pack(b"VCDR", 1, 1, 2, 17, 30, 5, 4, bytes(6))
+                assert peer.send(ignored) == len(ignored)
+            output, errors = client.communicate(timeout=4)
+            assert client.returncode == 0 and output == b"", errors
+        finally:
+            if client.poll() is None: client.kill()
+            client.wait()
+            path.unlink()
+print("Fixed-record control integration passed.")
+PY
+    exit 0
+fi
+
 if [[ "${1:-}" == "--zig-logging" ]]; then
     export VOICED_INSTANCE=test
     python3 - <<'PY'
@@ -229,9 +413,9 @@ pub fn main(init: std.process.Init) !void {
                 assert not any(row["PRIORITY"] == "2" for row in refusal.records), refusal.records
             for command in ("record", "stop", "stop"):
                 response = subprocess.run([binary, command], env=env, capture_output=True, check=True, timeout=3)
-                assert json.loads(response.stdout)["ok"]
+                assert response.stdout == b""
             deadline = time.monotonic() + 5
-            while json.loads(subprocess.check_output([binary, "status"], env=env))["phase"] != "idle":
+            while dict(field.split("=", 1) for field in subprocess.check_output([binary, "status"], env=env, text=True).split())["phase"] != "idle":
                 assert time.monotonic() < deadline
                 time.sleep(0.01)
             subprocess.run([binary, "kill"], env=env, check=True, capture_output=True, timeout=3)
@@ -316,12 +500,59 @@ with tempfile.TemporaryDirectory(prefix="voiced-replay-test-") as temporary:
     assert replay.read_audio(capture / "audio.wav").tobytes() == raw.read_bytes()
     assert stat.S_IMODE(store.stat().st_mode) == 0o700
     assert stat.S_IMODE(capture.stat().st_mode) == 0o700
-    assert set(p.name for p in capture.iterdir()) == {"audio.wav", "generated.txt", "tokens.json", "metadata.json"}
+    assert set(p.name for p in capture.iterdir()) == {"audio.wav", "generated.txt", "tokens.txt", "metadata.txt"}
     assert all(stat.S_IMODE(p.stat().st_mode) == 0o600 for p in capture.iterdir())
+    parsed_metadata = replay.read_metadata(capture / "metadata.txt")
+    assert parsed_metadata == first["metadata"], {key: (parsed_metadata[key], value) for key, value in first["metadata"].items() if parsed_metadata[key] != value}
+    assert replay.read_tokens(capture / "tokens.txt") == first["tokens"]
+    assert (capture / "tokens.txt").read_text() == " ".join(map(str, first["tokens"])) + "\n"
+    metadata_text = (capture / "metadata.txt").read_text()
+    probe = root / "metadata.txt"
+    escaped = r'  quote=\" path=\\ cafe=caf\xc3\xa9\nnext\r\ttail  '
+    probe.write_text(metadata_text.replace("stage=offline_replay\n", "stage=" + escaped + "\n"))
+    assert replay.read_metadata(probe)["stage"] == '  quote=" path=\\ cafe=café\nnext\r\ttail  '
+    for invalid in (
+        metadata_text + "session_id=0\n", metadata_text + "unknown=0\n", metadata_text[:-1],
+        metadata_text.replace("format_version=2", "format_version=3"),
+        metadata_text.replace("session_id=0", "session_id=-1"),
+        metadata_text.replace("contains_activity=false", "contains_activity=no"),
+        metadata_text.replace("stage=offline_replay", r"stage=\q"),
+        metadata_text.replace("stage=offline_replay", r"stage=\x0"),
+    ):
+        probe.write_text(invalid)
+        try:
+            replay.read_metadata(probe)
+            raise AssertionError("malformed metadata accepted")
+        except ValueError:
+            pass
+    token_probe = root / "tokens.txt"
+    token_probe.write_text("0 4294967295\n")
+    assert replay.read_tokens(token_probe) == [0, 4294967295]
+    for invalid in ("-1\n", "4294967296\n", "1.0\n", "12"):
+        token_probe.write_text(invalid)
+        try:
+            replay.read_tokens(token_probe)
+            raise AssertionError("malformed token list accepted")
+        except ValueError:
+            pass
+    # Replay still reads old captures; the next save removes their JSON names.
+    legacy_metadata = dict(first["metadata"], format_version=1)
+    (capture / "metadata.json").write_text(json.dumps(legacy_metadata) + "\n")
+    (capture / "tokens.json").write_text(json.dumps(first["tokens"]) + "\n")
+    (capture / "metadata.txt").unlink()
+    (capture / "tokens.txt").unlink()
+    assert replay.read_metadata(capture / "metadata.json") == legacy_metadata
+    assert replay.read_tokens(capture / "tokens.json") == first["tokens"]
+    legacy = root / "legacy"
+    legacy.mkdir(mode=0o700)
+    for file in capture.iterdir():
+        (legacy / file.name).write_bytes(file.read_bytes())
     store.chmod(0o777)
     second = decode(2, "second")
     assert stat.S_IMODE(store.stat().st_mode) == 0o700
-    assert json.loads((capture / "tokens.json").read_text()) == second["tokens"]
+    assert replay.read_tokens(capture / "tokens.txt") == second["tokens"]
+    assert replay.read_metadata(capture / "metadata.txt") == second["metadata"]
+    assert not (capture / "metadata.json").exists() and not (capture / "tokens.json").exists()
     assert (capture / "generated.txt").read_text() == second["text"]
     assert not (store / "last-failed.pending").exists()
     before = {p.name: p.read_bytes() for p in capture.iterdir()}
@@ -334,17 +565,22 @@ with tempfile.TemporaryDirectory(prefix="voiced-replay-test-") as temporary:
     outside = root / "untouched"
     outside.write_text("leave this file alone")
     (pending / "generated.txt").symlink_to(outside)
+    (pending / "metadata.json").symlink_to(outside)
+    (pending / "tokens.json").write_text("interrupted legacy generation")
+    (pending / "metadata.txt").symlink_to(outside)
+    (pending / "tokens.txt").symlink_to(outside)
     decode(2, "after-interruption")
     assert outside.read_text() == "leave this file alone"
     before = {p.name: p.read_bytes() for p in capture.iterdir()}
     success = decode(446, "success")
     assert success["metadata"]["end"] == "end_of_text"
     assert before == {p.name: p.read_bytes() for p in capture.iterdir()}
-    subprocess.run([str(Path(".venv/bin/python").absolute()), "zig/scripts/replay-transcription.py",
-                    str(capture), "--output", str(root / "comparison")], check=True, timeout=60)
-    comparison = json.loads((root / "comparison/comparison.json").read_text())
-    assert comparison["comparisons"]["captured/replayed"]["tokens_equal"]
-    assert all(run["token_limit_reached"] for run in comparison["runs"].values())
+    for source, name in ((capture, "comparison"), (legacy, "legacy-comparison")):
+        subprocess.run([str(Path(".venv/bin/python").absolute()), "zig/scripts/replay-transcription.py",
+                        str(source), "--output", str(root / name)], check=True, timeout=60)
+        comparison = json.loads((root / name / "comparison.json").read_text())
+        assert comparison["comparisons"]["captured/replayed"]["tokens_equal"]
+        assert all(run["token_limit_reached"] for run in comparison["runs"].values())
 
     # Exercise the real resident worker protocol with a sealed, too-short chunk.
     # Memfds and a private socket replace capture; no microphone or desktop API.
@@ -378,12 +614,14 @@ with tempfile.TemporaryDirectory(prefix="voiced-replay-test-") as temporary:
             assert b"Failed transcription saved" in (root / "worker.log").read_bytes()
             assert struct.unpack_from("<I", transcript, 16)[0] == 0, "failure committed text"
             saved = root / "worker-state/voiced-test/last-failed"
-            metadata = json.loads((saved / "metadata.json").read_text())
+            metadata = replay.read_metadata(saved / "metadata.txt")
             assert metadata["session_id"] == 42 and metadata["evidence"]["chunk"] == 7
             assert metadata["model_encoder_padding_seconds"] == 10
             assert metadata["evidence"]["decoding_available"] == 0
             assert (saved / "audio.wav").read_bytes()[56:] == audio[48:52]
-            assert json.loads((saved / "tokens.json").read_text()) == []
+            assert replay.read_tokens(saved / "tokens.txt") == []
+            assert (saved / "tokens.txt").read_bytes() == b"\n"
+            assert metadata["end"] is None
             assert (saved / "generated.txt").read_bytes() == b""
         finally:
             if worker.poll() is None:
@@ -403,6 +641,7 @@ if [[ "${1:-}" == "--zig-output" ]]; then
 import contextlib
 from journal_fixture import journal_log
 import ctypes
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -414,6 +653,9 @@ import subprocess
 import tempfile
 import time
 
+spec = importlib.util.spec_from_file_location("replay", "zig/scripts/replay-transcription.py")
+replay = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(replay)
 binary = str(Path("zig/zig-out/bin/voiced").resolve())
 experiment = Path("/tmp/experiments/voiced-output-integration")
 experiment.mkdir(parents=True, exist_ok=True)
@@ -804,62 +1046,9 @@ pub fn main() void {
                    check=True, capture_output=True, timeout=40)
     subprocess.run([str(paste_driver)], check=True, capture_output=True, timeout=3)
 
-    driver_source = r'''
-const std = @import("std");
-const notifications = @import("notifications");
-const linux = std.os.linux;
-pub fn main() !void {
-    std.debug.assert(notifications.initLogging(.info) == .SUCCESS);
-    defer notifications.deinitLogging();
-    const fd: i32 = @intCast(linux.epoll_create1(linux.EPOLL.CLOEXEC));
-    defer _ = linux.close(fd);
-    var event: linux.epoll_event = .{ .events = linux.EPOLL.IN, .data = .{ .u64 = 2 } };
-    std.debug.assert(linux.errno(linux.epoll_ctl(fd, linux.EPOLL.CTL_ADD, 0, &event)) == .SUCCESS);
-    var client: notifications.Client = .{};
-    client.init(fd, 1);
-    defer client.deinit(fd);
-    while (true) {
-        client.advance(fd, 1);
-        var ts: linux.timespec = undefined;
-        _ = linux.clock_gettime(.MONOTONIC, &ts);
-        const now = @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-        const timeout: i32 = if (client.deadline_monotonic_ns == std.math.maxInt(u64)) -1 else
-            @intCast(@min(std.math.maxInt(i32), (client.deadline_monotonic_ns -| now +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms));
-        var events: [4]linux.epoll_event = undefined;
-        const count = linux.epoll_wait(fd, &events, events.len, timeout);
-        if (linux.errno(count) == .INTR) continue;
-        std.debug.assert(linux.errno(count) == .SUCCESS);
-        for (events[0..count]) |ready| {
-            if (ready.data.u64 != 2) continue;
-            var byte: [1]u8 = undefined;
-            if (linux.read(0, &byte, 1) != 1) return;
-            switch (byte[0]) {
-                'a' => client.show(.microphone_failed),
-                'b' => client.show(.transcription_failed),
-                'c' => client.show(.transcript_save_failed),
-                'r' => client.recover(),
-                'n' => client.resetSuppression(),
-                'q' => return,
-                else => {},
-            }
-            _ = linux.write(1, "ok\n", 3);
-        }
-    }
-}
-'''
-    driver_path = root / "notification-driver.zig"
-    driver_path.write_text(driver_source)
     driver_binary = root / "notification-driver"
-    build = ["zig", "build-exe", "-OReleaseSafe", "--dep", "notifications", "-Mroot=" + str(driver_path)]
-    if prefix := os.environ.get("VOICED_TEST_SYSTEMD_PREFIX"):
-        build += ["-I", prefix + "/include", "-L", prefix + "/lib/x86_64-linux-gnu"]
-    notification_module = root / "notification-module"
-    notification_module.mkdir()
-    (notification_module / "logging.zig").write_text(Path("zig/src/logging.zig").read_text())
-    (notification_module / "notifications.zig").write_text(Path("zig/src/notifications.zig").read_text() +
-        "\npub const initLogging = logging.init;\npub const deinitLogging = logging.deinit;\n")
-    build += ["-Mnotifications=" + str(notification_module / "notifications.zig"), "-lc", "-lsystemd", "-femit-bin=" + str(driver_binary)]
-    subprocess.run(build, check=True, timeout=90)
+    subprocess.run(["zig", "build-exe", "-OReleaseSafe", "zig/src/notification_check.zig",
+                    "-femit-bin=" + str(driver_binary)], check=True, timeout=90)
 
     @contextlib.contextmanager
     def notification_driver():
@@ -1004,7 +1193,13 @@ pub fn main() !void {
     def cli(*args):
         result = subprocess.run([binary, *args], env=env, capture_output=True, text=True, timeout=3)
         assert result.returncode == 0, (args, result.stderr, log_path.read_text())
-        return json.loads(result.stdout)
+        if args != ("status",):
+            assert result.stdout == "", (args, result.stdout)
+            return None
+        status = dict(field.split("=", 1) for field in result.stdout.split())
+        for field in ("session_id", "model_keep_warm_seconds"):
+            status[field] = int(status[field])
+        return status
 
     @contextlib.contextmanager
     def service(*options):
@@ -1042,7 +1237,8 @@ pub fn main() !void {
                         "paste_settle_ms=10", "paste_key_gap_ms=4", 'microphone="default"'):
             assert setting in startup, startup
         assert not children(daemon.pid)
-        assert cli("stop")["phase"] == "idle"
+        cli("stop")
+        assert cli("status")["phase"] == "idle"
 
     print("=== Native file configuration and CLI precedence ===")
     settings = root / "settings.conf"
@@ -1342,7 +1538,10 @@ pub fn main() !void {
                 (root / "mode").write_text("hang")
                 record_fixture()
                 wait_until(lambda: cli("status")["phase"] == "delivering", timeout=15)
-                assert cli("record", "-t")["ignored"]
+                recording = cli("status")["session_id"]
+                cli("record", "-t")
+                assert cli("status")["phase"] == "delivering"
+                assert cli("status")["session_id"] == recording
                 pending = guardian_pid()
                 wait_until(lambda: cli("status")["phase"] == "idle")
                 assert not Path(f"/proc/{pending}").exists()
@@ -1532,7 +1731,7 @@ pub fn main() !void {
                         assert title in message["title"] and "delivered and saved" in message["body"], message
                         if "tokens" in mode or mode == "both": assert "repetition" in message["body"], message
                         if error_name:
-                            metadata = json.loads((saved_transcript.parent / "last-failed/metadata.json").read_text())
+                            metadata = replay.read_metadata(saved_transcript.parent / "last-failed/metadata.txt")
                             assert metadata["error_name"] == error_name, metadata
                             assert (saved_transcript.parent / "last-failed/audio.wav").stat().st_size > 44
                         if mode == "tokens_stall": assert "Limited transcription recovered at deadline:" in logs, logs
@@ -1561,7 +1760,7 @@ pub fn main() !void {
             with service(*options, "--microphone-node", "voiced-test-missing-source"):
                 cli("record")
                 wait_until(lambda: len(notifications_sent()) == prior + 1, timeout=10)
-                assert notifications_sent()[-1]["title"] == "Voiced: microphone unavailable"
+                assert notifications_sent()[-1]["title"] == "Voiced: configured mic not found"
                 for _ in range(10):
                     started = time.monotonic()
                     assert cli("status")["phase"] == "idle"
@@ -1570,7 +1769,7 @@ pub fn main() !void {
                 cli("record")
                 wait_until(lambda: "Recording discarded: recording_ordinal=2," in log_path.read_text(), timeout=10)
                 wait_until(lambda: len(notifications_sent()) == prior + 2)
-                assert notifications_sent()[-1]["title"] == "Voiced: microphone unavailable"
+                assert notifications_sent()[-1]["title"] == "Voiced: configured mic not found"
                 assert saved_transcript.stat().st_ino == saved_inode
             server_command(desktop_server, "reply")
             server_command(desktop_server, "normal")
@@ -1585,8 +1784,8 @@ pub fn main() !void {
                 wait_until(lambda: "Recording discarded: recording_ordinal=1," in log_path.read_text(), timeout=10)
                 wait_until(lambda: len(notifications_sent()) > before)
                 logs = log_path.read_text()
-                assert "kind=source_not_found" in logs and "sources_matches_count=0" in logs, logs
-                assert "voiced-test-missing-serial" in logs and "Microphone candidate:" in logs, logs
+                assert "kind=source_not_found" in logs and "SourceNotFound" in logs, logs
+                assert "voiced-test-missing-serial" in logs and "available sources:" in logs, logs
                 assert notifications_sent()[-1]["title"] == "Voiced: configured mic not found"
         finally:
             notification_stack.close()

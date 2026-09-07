@@ -41,7 +41,7 @@ pub const Evidence = extern struct {
 };
 
 pub const Metadata = struct {
-    format_version: u32 = 1,
+    format_version: u32 = 2,
     session_id: u64,
     captured_unix_seconds: i64,
     stage: []const u8,
@@ -114,8 +114,8 @@ pub fn save(io: std.Io, directory_path: []const u8, samples: []const f32, text: 
     clearFiles(io, pending) catch |err| return .{ .err = .{ .clear_staging = err } };
     writeAudio(io, pending, samples) catch |err| return .{ .err = .{ .write_audio = err } };
     pending.writeFile(io, .{ .sub_path = "generated.txt", .data = text, .flags = .{ .exclusive = true, .permissions = .fromMode(0o600) } }) catch |err| return .{ .err = .{ .write_text = err } };
-    writeJson(io, pending, "tokens.json", tokens) catch |err| return .{ .err = .{ .write_tokens = err } };
-    writeJson(io, pending, "metadata.json", metadata) catch |err| return .{ .err = .{ .write_metadata = err } };
+    writeTokens(io, pending, tokens) catch |err| return .{ .err = .{ .write_tokens = err } };
+    writeMetadata(io, pending, metadata) catch |err| return .{ .err = .{ .write_metadata = err } };
     var errno = linux.errno(linux.renameat2(base.handle, "last-failed.pending", base.handle, "last-failed", .{ .NOREPLACE = true }));
     if (errno == .EXIST) {
         errno = linux.errno(linux.renameat2(base.handle, "last-failed.pending", base.handle, "last-failed", .{ .EXCHANGE = true }));
@@ -156,7 +156,8 @@ fn openPrivate(io: std.Io, parent: std.Io.Dir, path: []const u8) union(enum) { o
 }
 
 fn clearFiles(io: std.Io, dir: std.Io.Dir) !void {
-    for ([_][]const u8{ "audio.wav", "generated.txt", "tokens.json", "metadata.json" }) |name| {
+    // Also remove v1 names when replacing a JSON generation or reusing staging.
+    for ([_][]const u8{ "audio.wav", "generated.txt", "tokens.txt", "metadata.txt", "tokens.json", "metadata.json" }) |name| {
         dir.deleteFile(io, name) catch |err| if (err != error.FileNotFound) return err;
     }
 }
@@ -186,14 +187,74 @@ fn writeAudio(io: std.Io, dir: std.Io.Dir, samples: []const f32) !void {
     try file.writeStreamingAll(io, std.mem.sliceAsBytes(samples));
 }
 
-pub fn writeJson(io: std.Io, dir: std.Io.Dir, name: []const u8, value: anytype) !void {
-    const file = try dir.createFile(io, name, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+fn writeTokens(io: std.Io, dir: std.Io.Dir, tokens: []const inference.Token) !void {
+    const file = try dir.createFile(io, "tokens.txt", .{ .exclusive = true, .permissions = .fromMode(0o600) });
     defer file.close(io);
     var buffer: [4096]u8 = undefined;
     var writer = file.writerStreaming(io, &buffer);
-    std.json.Stringify.value(value, .{ .whitespace = .indent_2 }, &writer.interface) catch return writer.err.?;
-    writer.interface.writeByte('\n') catch return writer.err.?;
+    writeTokenList(&writer.interface, tokens) catch return writer.err.?;
     writer.interface.flush() catch return writer.err.?;
+}
+
+// V2 is key=value, with one physical line per field and dotted evidence keys.
+// Strings use Zig byte escapes without surrounding quotes; no value is trimmed.
+// end_available distinguishes null from an empty end string. Keep the schema in
+// sync with read_metadata in scripts/replay-transcription.py.
+fn writeMetadata(io: std.Io, dir: std.Io.Dir, metadata: Metadata) !void {
+    std.debug.assert(metadata.format_version == 2);
+    const file = try dir.createFile(io, "metadata.txt", .{ .exclusive = true, .permissions = .fromMode(0o600) });
+    defer file.close(io);
+    var buffer: [4096]u8 = undefined;
+    var writer = file.writerStreaming(io, &buffer);
+    const evidence = metadata.evidence;
+    writer.interface.print(
+        "format_version={d}\nsession_id={d}\ncaptured_unix_seconds={d}\n" ++
+            "stage={f}\nerror_name={f}\n" ++
+            "evidence.chunk_available={d}\nevidence.decoding_available={d}\n" ++
+            "evidence.chunk={d}\nevidence.samples={d}\nevidence.tokens={d}\nevidence.token_limit={d}\n" ++
+            "evidence.encoder_positions={d}\nevidence.no_speech_probability={d}\nevidence.average_log_probability={d}\n" ++
+            "evidence.reserved={d}\nevidence.log_mel_ns={d}\nevidence.encoder_ns={d}\n" ++
+            "evidence.cross_key_values_ns={d}\nevidence.decoder_ns={d}\n",
+        .{
+            metadata.format_version,                  metadata.session_id,                        metadata.captured_unix_seconds,
+            std.zig.fmtString(metadata.stage),        std.zig.fmtString(metadata.error_name),     evidence.chunk_available,
+            evidence.decoding_available,              evidence.chunk,                             evidence.samples,
+            evidence.tokens,                          evidence.token_limit,                       evidence.encoder_positions,
+            // Widen before formatting so an f64 reader recovers the exact f32
+            // evidence value, rather than only a decimal that rounds back to it.
+            @as(f64, evidence.no_speech_probability), @as(f64, evidence.average_log_probability), evidence.reserved,
+            evidence.log_mel_ns,                      evidence.encoder_ns,                        evidence.cross_key_values_ns,
+            evidence.decoder_ns,
+        },
+    ) catch return writer.err.?;
+    writer.interface.print(
+        "contains_activity={}\nmodel={f}\nmodel_revision={f}\nsource_sha256={f}\npacked_image_sha256={s}\n" ++
+            "packed_image_format_version={d}\npacked_model_cache_version={d}\nzig_version={f}\noptimize={f}\n" ++
+            "model_encoder_threads={d}\nmodel_decoder_threads={d}\nmodel_encoder_padding_seconds={d}\n" ++
+            "sample_rate={d}\nsample_format={f}\ntext_decode_complete={}\nend_available={}\nend={f}\n" ++
+            "prompt={d} {d}\nbeam_size={d}\ntemperature_fallback={}\nsuppressed_tokens=",
+        .{
+            metadata.contains_activity,                std.zig.fmtString(metadata.model),         std.zig.fmtString(metadata.model_revision),
+            std.zig.fmtString(metadata.source_sha256), &metadata.packed_image_sha256,             metadata.packed_image_format_version,
+            metadata.packed_model_cache_version,       std.zig.fmtString(metadata.zig_version),   std.zig.fmtString(metadata.optimize),
+            metadata.model_encoder_threads,            metadata.model_decoder_threads,            metadata.model_encoder_padding_seconds,
+            metadata.sample_rate,                      std.zig.fmtString(metadata.sample_format), metadata.text_decode_complete,
+            metadata.end != null,                      std.zig.fmtString(metadata.end orelse ""), metadata.prompt[0],
+            metadata.prompt[1],                        metadata.beam_size,                        metadata.temperature_fallback,
+        },
+    ) catch return writer.err.?;
+    writeTokenList(&writer.interface, metadata.suppressed_tokens) catch return writer.err.?;
+    writer.interface.writeAll("suppressed_first_tokens=") catch return writer.err.?;
+    writeTokenList(&writer.interface, metadata.suppressed_first_tokens) catch return writer.err.?;
+    writer.interface.flush() catch return writer.err.?;
+}
+
+fn writeTokenList(writer: *std.Io.Writer, tokens: []const inference.Token) std.Io.Writer.Error!void {
+    for (tokens, 0..) |token, index| {
+        if (index != 0) try writer.writeByte(' ');
+        try writer.print("{d}", .{token});
+    }
+    try writer.writeByte('\n');
 }
 
 pub fn paddingSeconds(padding: inference.EncoderTrailingPadding) u32 {

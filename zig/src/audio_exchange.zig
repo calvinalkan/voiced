@@ -168,8 +168,8 @@ pub fn initialize(exchange: *AudioExchange, session_id: u64) void {
     }
 }
 
-/// `publishTimelineValidation` announces the capability selected from the
-/// headers used to build the worker and the PipeWire library loaded at runtime.
+/// `publishTimelineValidation` announces the timeline validation performed by
+/// the capture worker before its first callback heartbeat.
 /// The supervisor reads it when capture first makes sample progress and emits
 /// any degraded-mode warning once per worker.
 pub fn publishTimelineValidation(

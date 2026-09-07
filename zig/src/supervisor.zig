@@ -428,7 +428,7 @@ pub fn runService(init: std.process.Init, options: ServiceOptions) !void {
     try register(epoll_fd, signal_fd, .service_signal);
 
     if (options.notification_mode == .errors and options.output != .stdout)
-        supervisor.notifications.init(epoll_fd, @intFromEnum(EventSource.notification_bus));
+        supervisor.notifications.init(epoll_fd, @intFromEnum(EventSource.notification_bus), init.environ_map.get("DBUS_SESSION_BUS_ADDRESS"), init.environ_map.get("XDG_RUNTIME_DIR"));
     defer {
         supervisor.notifications.recover();
         supervisor.notifications.advance(epoll_fd, @intFromEnum(EventSource.notification_bus));
@@ -488,7 +488,8 @@ pub fn runService(init: std.process.Init, options: ServiceOptions) !void {
             if (supervisor.phase != .delivering) enterIdle(&supervisor);
         }
         if (supervisor.service.shutdown_requested and supervisor.phase == .idle and
-            supervisor.transcription == .absent and supervisor.clipboard[0] == null and supervisor.clipboard[1] == null)
+            supervisor.transcription == .absent and supervisor.clipboard[0] == null and supervisor.clipboard[1] == null and
+            !supervisor.service.control.hasPendingReplies())
         {
             return;
         }
@@ -556,8 +557,12 @@ pub fn runService(init: std.process.Init, options: ServiceOptions) !void {
                     try dispatchControl(&supervisor, index, request);
                 }
             }
-            for (events[0..events_count]) |event| {
-                if (eventSource(event) == .control_listener) try service.control.acceptClients(monotonicNanoseconds());
+            if (service.shutdown_requested) {
+                try service.control.stopAccepting();
+            } else {
+                for (events[0..events_count]) |event| {
+                    if (eventSource(event) == .control_listener) try service.control.acceptClients(monotonicNanoseconds());
+                }
             }
         }
 
@@ -633,24 +638,23 @@ fn dispatchControl(supervisor: *Supervisor, client_index: usize, request: contro
         .status => {},
     }
     if (ignored) log.debug(.{ .recording_ordinal = supervisor.recording_ordinal }, "Command ignored: recording_ordinal={d}, command={s}, phase={s}", .{ supervisor.recording_ordinal, @tagName(request.cmd), @tagName(supervisor.phase) });
-    const phase: []const u8 = switch (supervisor.phase) {
-        .idle => if (service.pending_recording != null) "capturing" else "idle",
-        .active => "capturing",
-        .finishing => if (audioProcessExists(supervisor)) "stopping" else "transcribing",
-        .delivering => "delivering",
-        .aborting => "stopping",
+    const phase: control_socket.Phase = switch (supervisor.phase) {
+        .idle => if (service.pending_recording != null) .capturing else .idle,
+        .active => .capturing,
+        .finishing => if (audioProcessExists(supervisor)) .stopping else .transcribing,
+        .delivering => .delivering,
+        .aborting => .stopping,
     };
-    const model_state: []const u8 = switch (supervisor.transcription) {
-        .absent => "absent",
-        .restart_pending => "restarting",
+    const model_state: control_socket.ModelState = switch (supervisor.transcription) {
+        .absent => .absent,
+        .restart_pending => .restarting,
         .running => |running| switch (running.operation) {
-            .starting => "loading",
-            .idle, .busy => "warm",
-            .shutdown_sent, .exiting, .terminating => "unloading",
+            .starting => .loading,
+            .idle, .busy => .warm,
+            .shutdown_sent, .exiting, .terminating => .unloading,
         },
     };
     service.control.respond(client_index, .{
-        .ok = true,
         .ignored = ignored,
         .phase = phase,
         .model = model_state,
@@ -868,7 +872,7 @@ fn drainAudioPackets(supervisor: *Supervisor) !void {
                 log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Audio service error: recording_ordinal={d}, kind={t}", .{ supervisor.recording_ordinal, std.meta.activeTag(err) });
                 switch (err) {
                     .source_not_found, .source_ambiguous, .setup => |detail| {
-                        log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Capture setup error: recording_ordinal={d}, kind={t}, stage={t}, domain={t}, code={d}, pipewire_error=\"{f}\", detail=\"{f}\"", .{ supervisor.recording_ordinal, std.meta.activeTag(err), detail.stage, detail.domain, detail.code, std.zig.fmtString(detail.pipewire_version[0..detail.pipewire_version_size]), std.zig.fmtString(detail.message[0..detail.message_size]) });
+                        log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Capture setup error: recording_ordinal={d}, kind={t}, stage={t}, domain={t}, code={d}, pipewire_server_version=\"{f}\", client_node_version_advertised={d}, client_node_version_selected={d}, detail=\"{f}\"", .{ supervisor.recording_ordinal, std.meta.activeTag(err), detail.stage, detail.domain, detail.code, std.zig.fmtString(detail.pipewire_version[0..detail.pipewire_version_size]), detail.client_node_version_advertised, detail.client_node_version_selected, std.zig.fmtString(detail.message[0..detail.message_size]) });
                         if (err == .source_ambiguous) log.err(.{}, "Microphone selection: sources_expected_count=1; replace microphone_serial with a microphone_node from the candidate list", .{});
                         try beginAbort(supervisor, .audio_failed);
                         continue;
@@ -2129,6 +2133,8 @@ fn logCaptureReport(recording_ordinal: u64, report: *const audio_process.Capture
         -1;
 
     log.info(.{ .recording_ordinal = recording_ordinal }, "Capture ended: recording_ordinal={d}, outcome={s}, audio_duration_seconds={d:.3}, audio_samples_published_count={d}, audio_samples_captured_count={d}, microphone_description=\"{f}\"", .{ recording_ordinal, outcome_name, @as(f64, @floatFromInt(report.samples_count)) / audio_process.sample_rate_hz, report.published_samples_count, report.samples_count, std.zig.fmtString(source_description) });
+
+    log.info(.{ .recording_ordinal = recording_ordinal }, "Capture protocol: recording_ordinal={d}, pipewire_server_version=\"{f}\", client_node_version_advertised={d}, client_node_version_selected={d}, graph_rate_hz={d}, graph_channels_count={d}, callback_duration_ms_max={d:.3}, callback_gap_ms_max={d:.3}", .{ recording_ordinal, std.zig.fmtString(report.pipewire_server_version[0..report.pipewire_server_version_size]), report.client_node_version_advertised, report.client_node_version_selected, if (report.negotiated_format) |format| format.sample_rate_hz else 0, if (report.negotiated_format) |format| format.channels_count else 0, if (report.callback) |callback| @as(f64, @floatFromInt(callback.duration_ns_max)) / std.time.ns_per_ms else 0, if (report.callback) |callback| @as(f64, @floatFromInt(callback.gap_ns_max)) / std.time.ns_per_ms else 0 });
 
     if (report.end == .failed or report.teardown_failure != null) {
         if (report.source_identity) |source| log.err(.{ .recording_ordinal = recording_ordinal }, "Capture source: recording_ordinal={d}, node_id={d}, node_object_serial={d}, device_id={d}, device_object_serial={d}, node_name=\"{f}\", node_description=\"{f}\", device_serial=\"{f}\", device_description=\"{f}\"", .{ recording_ordinal, source.node_id, source.node_object_serial, source.device_id, source.device_object_serial, std.zig.fmtString(source.node_name[0..source.node_name_size]), std.zig.fmtString(source.node_description[0..source.node_description_size]), std.zig.fmtString(source.device_serial[0..source.device_serial_size]), std.zig.fmtString(source.device_description[0..source.device_description_size]) });

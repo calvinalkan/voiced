@@ -78,7 +78,16 @@ pub fn main(init: std.process.Init) !void {
     const valid_utf8 = std.unicode.utf8ValidateSlice(generated);
     var hex_buffer: [8192]u8 = undefined;
     const invalid_text_hex: ?[]const u8 = if (valid_utf8) null else try std.fmt.bufPrint(&hex_buffer, "{x}", .{generated});
-    try debug_capture.writeJson(init.io, std.Io.Dir.cwd(), args[7], .{ .metadata = metadata, .text = if (valid_utf8) generated else "", .invalid_text_hex = invalid_text_hex, .tokens = tokens });
+    // JSON belongs to this offline executable, not the daemon's capture writer.
+    {
+        const file = try std.Io.Dir.cwd().createFile(init.io, args[7], .{ .exclusive = true, .permissions = .fromMode(0o600) });
+        defer file.close(init.io);
+        var buffer: [4096]u8 = undefined;
+        var writer = file.writerStreaming(init.io, &buffer);
+        std.json.Stringify.value(.{ .metadata = metadata, .text = if (valid_utf8) generated else "", .invalid_text_hex = invalid_text_hex, .tokens = tokens }, .{ .whitespace = .indent_2 }, &writer.interface) catch return writer.err.?;
+        writer.interface.writeByte('\n') catch return writer.err.?;
+        writer.interface.flush() catch return writer.err.?;
+    }
     if (args.len == 9 and error_name != null) switch (debug_capture.save(init.io, args[8], samples, generated, tokens, metadata)) {
         .ok => {},
         .err => |err| {

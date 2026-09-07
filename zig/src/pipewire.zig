@@ -1,39 +1,21 @@
-//! Owns one PipeWire input stream and writes its audio into a fixed shared
-//! exchange. PipeWire state and format callbacks run on the main-loop thread;
-//! with realtime processing enabled, `processAudio` runs concurrently on
-//! PipeWire's data thread. The realtime callback performs only bounded
-//! validation, copies, atomic publication, buffer return, and bounded
-//! nonblocking eventfd signals. The main-loop thread owns diagnostics and stream
-//! teardown.
-
+//! One native PipeWire capture session. The worker owns graph discovery,
+//! mappings, mono conversion and shared-slot publication through one poll loop.
+//! Graph processing uses fixed storage and no allocation or blocking I/O.
 const std = @import("std");
+const linux = std.os.linux;
+const assert = std.debug.assert;
+const native = @import("pipewire_native.zig");
+const audio_resampler = @import("audio_resampler.zig");
+const realtime_scheduling = @import("realtime.zig");
 const audio_activity = @import("audio_activity.zig");
 const audio_exchange = @import("audio_exchange.zig");
 const audio_policy = @import("audio_policy.zig");
-const assert = std.debug.assert;
-
-// These calls use Zig's direct Linux syscall wrappers even though this binary
-// links libc. Their return values must be decoded with `linux.errno`; using
-// `std.posix.errno` would instead consult libc errno, which direct syscalls do
-// not set.
-const linux = std.os.linux;
 const AudioExchange = audio_exchange.AudioExchange;
-const AudioSlot = audio_exchange.AudioSlot;
-
-const pipewire = @cImport({
-    @cInclude("audio_pipewire.h");
-});
-
-const callback_error_message_capacity = 512;
-pub const runtime_error_message_capacity = callback_error_message_capacity;
+pub const runtime_error_message_capacity = 512;
+const callback_error_message_capacity = runtime_error_message_capacity;
 pub const setup_error_message_capacity = 4096;
-pub const pipewire_version_capacity =
-    pipewire.VOICED_AUDIO_PIPEWIRE_VERSION_CAPACITY;
-pub const source_identity_text_capacity =
-    pipewire.VOICED_AUDIO_PIPEWIRE_IDENTITY_TEXT_CAPACITY;
-pub const source_catalog_capacity =
-    pipewire.VOICED_AUDIO_PIPEWIRE_SOURCE_CATALOG_CAPACITY;
-
+pub const pipewire_version_capacity = 64;
+pub const source_identity_text_capacity = 256;
 pub const TimelineValidation = enum(u32) {
     header_only,
     full,
@@ -72,6 +54,7 @@ pub const Launch = struct {
     slot_samples_boundary: u32,
     automatic_stop: AutomaticStop,
     process_realtime: bool,
+    environment: Environment,
 };
 
 /// Classifies why capture stopped so the supervisor can choose policy without
@@ -178,10 +161,8 @@ pub const Report = struct {
     teardown_failure: ?RuntimeFailure,
 
     timeline_validation: TimelineValidation,
-    pipewire_headers_version: [pipewire_version_capacity]u8,
-    pipewire_headers_version_size: u8,
-    pipewire_library_version: [pipewire_version_capacity]u8,
-    pipewire_library_version_size: u8,
+    client_node_version_advertised: u32,
+    client_node_version_selected: u32,
     pipewire_server_version: [pipewire_version_capacity]u8,
     pipewire_server_version_size: u8,
 
@@ -201,54 +182,17 @@ pub const Report = struct {
 
 pub const SetupErrorStage = enum(u32) {
     none,
-    file_descriptor_limits_query,
-    file_descriptor_limit,
-    memory_lock_limits_query,
-    main_loop_create,
-    callback_event_create,
-    callback_event_register,
-    control_socket_register,
-    properties_create,
-    property_config,
-    property_media_type,
-    property_media_category,
-    property_media_role,
-    property_target,
-    stream_create,
     source_resolution,
-    source_resolution_main_loop_create,
-    source_resolution_context_create,
-    source_resolution_core_connect,
-    source_resolution_core_observer_register,
-    source_resolution_registry_create,
-    source_resolution_registry_observer_register,
-    source_resolution_node_bind,
-    source_resolution_device_bind,
-    source_resolution_sync,
-    source_resolution_main_loop,
-    source_observer_create,
-    source_registry_create,
-    source_observer_register,
-    server_observer_register,
     stream_connect,
 };
 
-/// Defines how to interpret an error's numeric code. Native domains retain the
-/// exact Zig error value, errno, or negative PipeWire result. `spa_buffer` and
-/// `voiced_audio` use the stable enums below; `boundary_validation` uses the C
-/// boundary's stable enum; `resource_limit` carries the observed soft limit.
-/// PipeWire state callbacks provide text but no numeric result, so
-/// `pipewire_callback` legitimately uses code zero.
+/// Numeric errors retain their native Zig error, Linux errno or PipeWire
+/// result. Voiced policy codes use the explicit enums below.
 pub const ErrorDomain = enum(u32) {
     none,
     zig_error,
     linux_errno,
-    libc_errno,
     pipewire_result,
-    pipewire_callback,
-    boundary_validation,
-    resource_limit,
-    spa_buffer,
     voiced_audio,
 };
 
@@ -291,12 +235,7 @@ pub const FailureStage = enum(u32) {
 pub const FailureDomain = enum(u32) {
     zig_error = @intFromEnum(ErrorDomain.zig_error),
     linux_errno = @intFromEnum(ErrorDomain.linux_errno),
-    libc_errno = @intFromEnum(ErrorDomain.libc_errno),
     pipewire_result = @intFromEnum(ErrorDomain.pipewire_result),
-    pipewire_callback = @intFromEnum(ErrorDomain.pipewire_callback),
-    boundary_validation = @intFromEnum(ErrorDomain.boundary_validation),
-    resource_limit = @intFromEnum(ErrorDomain.resource_limit),
-    spa_buffer = @intFromEnum(ErrorDomain.spa_buffer),
     voiced_audio = @intFromEnum(ErrorDomain.voiced_audio),
 };
 
@@ -311,32 +250,9 @@ pub const SourceResolutionErrorCode = enum(u32) {
     none,
     configured_device_not_found,
     configured_device_ambiguous,
-    malformed_boundary_result,
 };
 
-pub const AudioErrorCode = enum(u32) {
-    none,
-    callback_event_source_error,
-    callback_event_short_read,
-    format_parameter_removed,
-    unexpected_format,
-    exchange_full,
-    control_socket_source_error,
-    control_socket_closed,
-    source_link_removed,
-    source_node_removed,
-    source_device_removed,
-    source_changed,
-    malformed_source_event,
-};
-
-/// Machine-readable coordinates for one audio error. An empty coordinate is
-/// exactly `{ none, none, 0 }`; a present error has a non-none stage and domain.
-pub const RuntimeError = struct {
-    stage: RuntimeErrorStage,
-    domain: ErrorDomain,
-    code: i64,
-};
+pub const AudioErrorCode = enum(u32) { none, exchange_full };
 
 /// Identifies the first concrete PipeWire source linked during one recording.
 /// Global IDs and object serials diagnose that graph instance; `device_serial`
@@ -357,40 +273,12 @@ pub const SourceIdentity = struct {
 };
 
 pub const SetupFailureStage = enum(u32) {
-    file_descriptor_limits_query = @intFromEnum(SetupErrorStage.file_descriptor_limits_query),
-    file_descriptor_limit = @intFromEnum(SetupErrorStage.file_descriptor_limit),
-    memory_lock_limits_query = @intFromEnum(SetupErrorStage.memory_lock_limits_query),
-    main_loop_create = @intFromEnum(SetupErrorStage.main_loop_create),
-    callback_event_create = @intFromEnum(SetupErrorStage.callback_event_create),
-    callback_event_register = @intFromEnum(SetupErrorStage.callback_event_register),
-    control_socket_register = @intFromEnum(SetupErrorStage.control_socket_register),
-    properties_create = @intFromEnum(SetupErrorStage.properties_create),
-    property_config = @intFromEnum(SetupErrorStage.property_config),
-    property_media_type = @intFromEnum(SetupErrorStage.property_media_type),
-    property_media_category = @intFromEnum(SetupErrorStage.property_media_category),
-    property_media_role = @intFromEnum(SetupErrorStage.property_media_role),
-    property_target = @intFromEnum(SetupErrorStage.property_target),
-    stream_create = @intFromEnum(SetupErrorStage.stream_create),
     source_resolution = @intFromEnum(SetupErrorStage.source_resolution),
-    source_resolution_main_loop_create = @intFromEnum(SetupErrorStage.source_resolution_main_loop_create),
-    source_resolution_context_create = @intFromEnum(SetupErrorStage.source_resolution_context_create),
-    source_resolution_core_connect = @intFromEnum(SetupErrorStage.source_resolution_core_connect),
-    source_resolution_core_observer_register = @intFromEnum(SetupErrorStage.source_resolution_core_observer_register),
-    source_resolution_registry_create = @intFromEnum(SetupErrorStage.source_resolution_registry_create),
-    source_resolution_registry_observer_register = @intFromEnum(SetupErrorStage.source_resolution_registry_observer_register),
-    source_resolution_node_bind = @intFromEnum(SetupErrorStage.source_resolution_node_bind),
-    source_resolution_device_bind = @intFromEnum(SetupErrorStage.source_resolution_device_bind),
-    source_resolution_sync = @intFromEnum(SetupErrorStage.source_resolution_sync),
-    source_resolution_main_loop = @intFromEnum(SetupErrorStage.source_resolution_main_loop),
-    source_observer_create = @intFromEnum(SetupErrorStage.source_observer_create),
-    source_registry_create = @intFromEnum(SetupErrorStage.source_registry_create),
-    source_observer_register = @intFromEnum(SetupErrorStage.source_observer_register),
-    server_observer_register = @intFromEnum(SetupErrorStage.server_observer_register),
     stream_connect = @intFromEnum(SetupErrorStage.stream_connect),
 };
 
-/// Private setup accumulation uses sentinel-bearing enums while construction is
-/// in progress. `run` translates it into this failure-only public payload.
+/// Setup diagnostics retain the server release and protocol negotiation even
+/// when no audio callback was accepted.
 pub const SetupFailure = struct {
     stage: SetupFailureStage,
     domain: FailureDomain,
@@ -399,72 +287,355 @@ pub const SetupFailure = struct {
     message_size: u16,
     pipewire_version: [pipewire_version_capacity]u8,
     pipewire_version_size: u8,
+    client_node_version_advertised: u32,
+    client_node_version_selected: u32,
 };
 
-/// Describes an error returned before a runtime `Report` can be constructed.
-const SetupError = struct {
-    stage: SetupErrorStage,
-    domain: ErrorDomain,
-    code: i64,
-    message: [setup_error_message_capacity]u8,
-    message_size: u16,
-    pipewire_version: [pipewire_version_capacity]u8,
-    pipewire_version_size: u8,
+pub const Environment = struct {
+    runtime_directory: ?[]const u8,
+    remote: []const u8,
+    system_bus_address: []const u8,
 };
 
-const StreamState = union(enum) {
-    not_created,
-    live: *pipewire.pw_stream,
-    disconnecting: *pipewire.pw_stream,
-    destroyed,
+pub const RunResult = union(enum) { captured: Report, setup_failed: SetupFailure };
 
-    fn pointer(state: StreamState) ?*pipewire.pw_stream {
-        return switch (state) {
-            .live, .disconnecting => |stream| stream,
-            .not_created, .destroyed => null,
+/// Own the native connection, shared graph mappings and recording publication
+/// for one worker session. No other thread accesses this client. Control work is
+/// interleaved one message at a time with graph wakes and supervisor commands.
+pub fn run(launch: Launch) RunResult {
+    var client: native.Client = .{ .source = switch (launch.source) {
+        .default => .default,
+        .node_name => |value| .{ .node_name = value },
+        .device_serial => |value| .{ .device_serial = value },
+    } };
+    defer client.deinit();
+    var report: Report = undefined;
+    // Keep the large Report out of the error union: constant error returns must
+    // not materialize zero-filled report payloads.
+    runCapture(launch, &client, &report) catch |err| {
+        var detail: SetupFailure = undefined;
+        detail.message = @splat(0);
+        detail.pipewire_version = @splat(0);
+        detail.stage = if (client.source != .default and (err == error.SourceNotFound or err == error.SourceAmbiguous)) .source_resolution else .stream_connect;
+        detail.domain = if (err == error.SourceNotFound or err == error.SourceAmbiguous) .voiced_audio else if (err == error.GraphError) .pipewire_result else .zig_error;
+        detail.code = switch (err) {
+            error.SourceNotFound => @intFromEnum(SourceResolutionErrorCode.configured_device_not_found),
+            error.SourceAmbiguous => @intFromEnum(SourceResolutionErrorCode.configured_device_ambiguous),
+            error.GraphError => client.error_code,
+            else => @intFromError(err),
+        };
+        detail.pipewire_version_size = @intCast(@min(client.server_version.size, detail.pipewire_version.len));
+        @memcpy(detail.pipewire_version[0..detail.pipewire_version_size], client.server_version.get()[0..detail.pipewire_version_size]);
+        detail.client_node_version_advertised = client.client_node_version;
+        detail.client_node_version_selected = if (client.stream_created) @min(client.client_node_version, 5) else 0;
+        detail.message_size = describeError(&client, err, &detail.message);
+        return .{ .setup_failed = detail };
+    };
+    return .{ .captured = report };
+}
+
+fn runCapture(launch: Launch, client: *native.Client, report: *Report) !void {
+    assert(launch.recording_samples_target > 0);
+    assert(launch.slot_samples_boundary >= audio_exchange.callback_samples_count_max);
+    assert(launch.slot_samples_boundary <= audio_exchange.slot_samples_capacity);
+    const limits = try std.posix.getrlimit(.MEMLOCK);
+    const bytes = std.mem.asBytes(launch.exchange);
+    var offset: usize = 0;
+    while (offset < bytes.len) : (offset += std.heap.page_size_min) {
+        const byte: *volatile u8 = @ptrCast(&bytes[offset]);
+        byte.* = byte.*;
+    }
+    const lock_errno = linux.errno(linux.mlock(bytes.ptr, bytes.len));
+    defer if (lock_errno == .SUCCESS) {
+        _ = linux.munlock(bytes.ptr, bytes.len);
+    };
+    var socket_buffer: [108]u8 = undefined;
+    const socket_path = if (std.fs.path.isAbsolute(launch.environment.remote)) launch.environment.remote else try std.fmt.bufPrint(&socket_buffer, "{s}/{s}", .{ launch.environment.runtime_directory orelse return error.PipeWireRuntimeDirectoryMissing, launch.environment.remote });
+    if (launch.process_realtime) realtime_scheduling.acquire(launch.environment.system_bus_address, launch.control_socket);
+    try client.init(socket_path);
+    var capture: RealtimeCapture = .{
+        .exchange = launch.exchange,
+        .publication_event_fd = launch.publication_event_fd,
+        .recording_samples_target = launch.recording_samples_target,
+        .slot_samples_boundary = launch.slot_samples_boundary,
+        .automatic_stop = launch.automatic_stop,
+        .activity_detector = audio_activity.Detector.init(audio_exchange.sample_rate_hz),
+    };
+    if (!beginNextAvailableSlot(&capture)) return error.AudioExchangeFull;
+    defer abandonUnpublishedActiveSlot(&capture);
+    var resampler: audio_resampler.Resampler = .{};
+    var converted: [audio_exchange.callback_samples_count_max]f32 = undefined;
+    var negotiated: ?NegotiatedFormat = null;
+    var outcome: TerminalOutcome = .none;
+    var capture_error: ?anyerror = null;
+    var polling_errno: linux.E = .SUCCESS;
+    while (outcome == .none) {
+        client.connection.flush() catch |err| {
+            capture_error = err;
+            break;
+        };
+        var fds = [_]linux.pollfd{
+            .{ .fd = launch.control_socket, .events = linux.POLL.IN, .revents = 0 },
+            .{ .fd = client.connection.fd, .events = linux.POLL.IN | (if (client.connection.output_size > 0) @as(i16, linux.POLL.OUT) else 0), .revents = 0 },
+            .{ .fd = client.wake_fd, .events = linux.POLL.IN, .revents = 0 },
+        };
+        const result = linux.poll(&fds, fds.len, -1);
+        polling_errno = linux.errno(result);
+        if (polling_errno == .INTR) continue;
+        if (polling_errno != .SUCCESS) {
+            capture_error = error.CapturePollFailed;
+            break;
+        }
+        // A stop applies at the last completed graph cycle. The native client
+        // has already returned its buffers before exposing mono scratch here.
+        if (fds[0].revents != 0) {
+            var command: ControlPacket = undefined;
+            const received = linux.recvfrom(launch.control_socket, std.mem.asBytes(&command).ptr, @sizeOf(ControlPacket), linux.MSG.DONTWAIT | linux.MSG.TRUNC, null, null);
+            if (linux.errno(received) == .INTR or linux.errno(received) == .AGAIN) continue;
+            if (received != @sizeOf(ControlPacket) or command.reserved != 0 or command.command > @intFromEnum(ControlCommand.cancel)) {
+                capture_error = error.InvalidControlCommand;
+                break;
+            }
+            outcome = if (command.command == @intFromEnum(ControlCommand.cancel)) .cancelled else .stopped;
+            break;
+        }
+        // Process at most one control message before returning to the poller.
+        // New mappings and identity changes cannot race a graph buffer read.
+        if (fds[1].revents & (linux.POLL.IN | linux.POLL.HUP | linux.POLL.ERR) != 0) {
+            _ = client.dispatch() catch |err| {
+                capture_error = err;
+                break;
+            };
+        }
+        if (fds[2].revents & (linux.POLL.HUP | linux.POLL.ERR) != 0) {
+            capture_error = error.WakeFailed;
+            break;
+        }
+        if (fds[2].revents & linux.POLL.IN == 0) continue;
+        const start = monotonicNanoseconds();
+        const block = client.process() catch |err| {
+            capture_error = captureErrorAfterPendingEvents(client, err);
+            break;
+        } orelse {
+            if (capture.callback_state == .observed) {
+                observeCallback(&capture, start);
+                capture.callback_state.observed.missing_buffers_count += 1;
+            }
+            continue;
+        };
+        if (capture.callback_state == .unobserved) audio_exchange.publishTimelineValidation(launch.exchange, .full);
+        observeCallback(&capture, start);
+        if (block.header_present) capture.callback_state.observed.header_metadata_buffers_count += 1;
+        if (negotiated == null or negotiated.?.sample_rate_hz != block.rate) {
+            client.publishFormat(block.rate) catch |err| {
+                capture_error = err;
+                break;
+            };
+        }
+        negotiated = .{ .sample_rate_hz = block.rate, .channels_count = @intCast(client.ports_count) };
+        resampler.configure(block.rate) catch |err| {
+            capture_error = err;
+            break;
+        };
+        const samples = resampler.process(block.samples, &converted) catch |err| {
+            capture_error = err;
+            break;
+        };
+        if (samples.len > 0) {
+            outcome = publishCompleteBlock(&capture, .{ .samples = .{ .first_bytes = std.mem.sliceAsBytes(samples), .second_bytes = &.{} } });
+            if (block.silence and block.header_present and outcome != .pipeline_full) {
+                capture.callback_state.observed.header_gap_buffers_count += 1;
+                capture.callback_state.observed.header_gap_samples_count += @intCast(samples.len);
+            }
+        }
+        capture.callback_state.observed.duration_ns_max = @max(capture.callback_state.observed.duration_ns_max, monotonicNanoseconds() -| start);
+    }
+    if (capture_error) |err| {
+        // Before the first retained callback, discovery/format errors remain
+        // setup errors and shared liveness must remain unpublished.
+        if (capture.callback_state == .unobserved) return err;
+        outcome = classifyError(err);
+    }
+    if (outcome != .cancelled and !(outcome == .automatic_stop and capture.automatic_stop_confirmation_tail_is_private)) publishActiveSlotIfNonEmpty(&capture);
+    report.* = undefined;
+    report.teardown_failure = null;
+    report.source_identity = null;
+    report.callback = null;
+    report.pipewire_server_version = @splat(0);
+    if (capture.callback_state == .unobserved) audio_exchange.publishTimelineValidation(launch.exchange, .full);
+    report.end = switch (outcome) {
+        .completed => .completed,
+        .automatic_stop => .automatic_stop,
+        .stopped => .stopped,
+        .cancelled => .cancelled,
+        else => failed: {
+            var failure: RuntimeFailure = undefined;
+            failure.message = @splat(0);
+            failure.coordinate = .{ .stage = switch (outcome) {
+                .pipeline_full => .exchange_publication,
+                .source_changed, .source_disconnected => .source_identity,
+                .control_error => .supervisor_control,
+                .timeline_discontinuity => .timeline_continuity,
+                .invalid_buffer, .corrupted_buffer => .buffer_data,
+                else => .stream_state,
+            }, .domain = if ((capture_error orelse error.NoCaptureError) == error.GraphError) .pipewire_result else if (outcome == .pipeline_full) .voiced_audio else .zig_error, .code = if (capture_error) |err| if (err == error.GraphError) client.error_code else @intFromError(err) else @intFromEnum(AudioErrorCode.exchange_full) };
+            failure.message_size = describeError(client, capture_error orelse error.AudioExchangeFull, &failure.message);
+            if ((capture_error orelse error.NoCaptureError) == error.CapturePollFailed) failure.coordinate = .{ .stage = .main_loop, .domain = .linux_errno, .code = @intFromEnum(polling_errno) };
+            break :failed .{ .failed = .{ .outcome = std.meta.stringToEnum(FailureOutcome, @tagName(outcome)).?, .detail = failure } };
+        },
+    };
+    report.timeline_validation = .full;
+    report.pipewire_server_version_size = @intCast(@min(client.server_version.size, report.pipewire_server_version.len));
+    @memcpy(report.pipewire_server_version[0..report.pipewire_server_version_size], client.server_version.get()[0..report.pipewire_server_version_size]);
+    report.client_node_version_advertised = client.client_node_version;
+    report.client_node_version_selected = if (client.stream_created) @min(client.client_node_version, 5) else 0;
+    if (client.selected) |identity| {
+        var source: SourceIdentity = std.mem.zeroes(SourceIdentity);
+        source.node_id = identity.node.id;
+        source.node_object_serial = identity.node.serial;
+        source.device_id = std.math.maxInt(u32);
+        source.node_name = identity.node.name.bytes;
+        source.node_name_size = identity.node.name.size;
+        source.node_description = identity.node.description.bytes;
+        source.node_description_size = identity.node.description.size;
+        if (identity.device) |device| {
+            source.device_id = device.id;
+            source.device_object_serial = device.serial;
+            source.device_serial = device.device_serial.bytes;
+            source.device_serial_size = device.device_serial.size;
+            source.device_description = device.description.bytes;
+            source.device_description_size = device.description.size;
+        }
+        report.source_identity = source;
+    }
+    report.negotiated_format = negotiated;
+    report.samples_count = capture.samples_count;
+    report.published_samples_count = capture.published_samples_count;
+    report.slot_publications_count = capture.publications_count;
+    report.memory_lock = if (lock_errno == .SUCCESS) .{ .locked = limits.cur } else .{ .unavailable = .{ .error_code = @intFromEnum(lock_errno), .limit_bytes = limits.cur } };
+    report.main_loop_thread_id = linux.gettid();
+    if (capture.callback_state == .observed) {
+        const metrics = capture.callback_state.observed;
+        report.callback = .{
+            .thread_id = metrics.thread_id,
+            .scheduler_policy = metrics.scheduler_policy,
+            .scheduler_priority = metrics.scheduler_priority,
+            .callbacks_count = metrics.callbacks_count,
+            .missing_buffers_count = metrics.missing_buffers_count,
+            .clipped_samples_count = metrics.clipped_samples_count,
+            .header_metadata_buffers_count = metrics.header_metadata_buffers_count,
+            .header_gap_buffers_count = metrics.header_gap_buffers_count,
+            .header_gap_samples_count = metrics.header_gap_samples_count,
+            .samples_range = metrics.samples_range,
+            .duration_ns_max = metrics.duration_ns_max,
+            .gap_ns_max = metrics.gap_ns_max,
+            .activity = capture.activity_detector.report(),
         };
     }
-};
+}
 
-const Audio = struct {
-    main_loop: *pipewire.pw_main_loop,
-    stream: StreamState,
-    callback_event_fd: std.posix.fd_t,
-    control_socket: std.posix.fd_t,
-    server_observer: pipewire.voiced_audio_pipewire_server_observer,
-    source_identity: pipewire.voiced_audio_pipewire_source_identity,
+fn captureErrorAfterPendingEvents(client: *native.Client, cycle_error: anyerror) anyerror {
+    // On 0.3.48, unplug can wake an already-invalid cycle before the queued
+    // registry removal reaches us. Stop retaining audio immediately, but drain
+    // bounded, already-readable control work to report the concrete source loss
+    // instead of only its buffer/timeline symptom. Never wait for future events.
+    const cycle_errno = client.connection.errno;
+    defer client.connection.errno = cycle_errno;
+    for (0..256) |_| {
+        const dispatched = client.dispatch() catch |err| {
+            if (err == error.SourceDisconnected or err == error.SourceChanged) {
+                if (client.error_message_size == 0) {
+                    const message = std.fmt.bufPrint(&client.error_message, "audio_cycle_error={s}", .{@errorName(cycle_error)}) catch unreachable;
+                    client.error_message_size = message.len;
+                }
+                return err;
+            }
+            return cycle_error;
+        };
+        if (dispatched) continue;
+        // receive() can consume just the header and still have the body
+        // waiting in the socket. Readiness distinguishes that from waiting.
+        var fd = [_]linux.pollfd{.{ .fd = client.connection.fd, .events = linux.POLL.IN, .revents = 0 }};
+        const result = linux.poll(&fd, 1, 0);
+        if (linux.errno(result) != .SUCCESS or fd[0].revents & linux.POLL.IN == 0) break;
+    }
+    return cycle_error;
+}
 
-    exchange: *AudioExchange,
-    target: ?[:0]const u8,
-    recording_samples_target: u32,
-    slot_samples_boundary: u32,
-    process_realtime: bool,
-    timeline_validation: TimelineValidation,
+fn observeCallback(capture: *RealtimeCapture, start: u64) void {
+    if (capture.callback_state == .unobserved) {
+        var metrics: CallbackMetrics = std.mem.zeroes(CallbackMetrics);
+        metrics.thread_id = linux.gettid();
+        metrics.started_ns_previous = start;
+        const result = linux.sched_getscheduler(0);
+        if (linux.errno(result) == .SUCCESS) {
+            const scheduler: linux.SCHED = @bitCast(@as(i32, @intCast(result)));
+            metrics.scheduler_policy = @intFromEnum(scheduler.mode);
+        }
+        var params: linux.sched_param = undefined;
+        if (linux.errno(linux.sched_getparam(0, &params)) == .SUCCESS) metrics.scheduler_priority = params.priority;
+        capture.callback_state = .{ .observed = metrics };
+    }
+    const callback = &capture.callback_state.observed;
+    callback.gap_ns_max = @max(callback.gap_ns_max, start -| callback.started_ns_previous);
+    callback.started_ns_previous = start;
+    callback.callbacks_count += 1;
+    audio_exchange.publishAudioCallbacksCount(capture.exchange, callback.callbacks_count);
+}
 
-    source_is_linked_atomic: *std.atomic.Value(bool),
-    negotiated_format_is_accepted_atomic: *std.atomic.Value(bool),
-    negotiated_format: ?NegotiatedFormat,
+fn classifyError(err: anyerror) TerminalOutcome {
+    return switch (err) {
+        error.SourceDisconnected => .source_disconnected,
+        error.SourceChanged => .source_changed,
+        error.TimelineDiscontinuity => .timeline_discontinuity,
+        error.CorruptedBuffer => .corrupted_buffer,
+        error.InvalidBuffer, error.InvalidSample, error.OutputFull => .invalid_buffer,
+        error.UnsupportedFormat, error.UnsupportedRate => .unexpected_format,
+        error.InvalidControlCommand => .control_error,
+        error.Disconnected => .stream_disconnected,
+        else => .stream_error,
+    };
+}
 
-    error_message: [callback_error_message_capacity]u8,
-    error_message_size: u16,
-    runtime_error: RuntimeError,
-    teardown_error_message: [callback_error_message_capacity]u8,
-    teardown_error_message_size: u16,
-    teardown_error: RuntimeError,
+fn describeError(client: *const native.Client, err: anyerror, buffer: []u8) u16 {
+    var writer = std.Io.Writer.fixed(buffer);
+    writeErrorDescription(client, err, &writer) catch {
+        const marker = " [truncated]";
+        const end = @min(writer.end, buffer.len - marker.len);
+        @memcpy(buffer[end..][0..marker.len], marker);
+        writer.end = end + marker.len;
+    };
+    return @intCast(writer.end);
+}
 
-    realtime: RealtimeCapture,
-};
+fn writeErrorDescription(client: *const native.Client, err: anyerror, writer: *std.Io.Writer) error{WriteFailed}!void {
+    try writer.print("{s}: errno={t}, server_error_code={d}, object_id={d}, sequence={d}, detail=\"{f}\"", .{ @errorName(err), client.connection.errno, client.error_code, client.error_object, client.error_sequence, std.zig.fmtString(client.error_message[0..client.error_message_size]) });
+    if (client.diagnostic.wake_count > 0) {
+        const d = client.diagnostic;
+        try writer.print("; graph_rate={d}/{d}, graph_position={d}, graph_duration={d}, wake_count={d}, channel={d}, buffer_id={d}, chunk_offset={d}, chunk_size={d}, chunk_stride={d}, chunk_flags={d}, header_flags={d}, header_sequence={d}, header_pts_ns={d}", .{ d.graph_rate_num, d.graph_rate_hz, d.graph_position, d.graph_duration, d.wake_count, d.channel, d.buffer_id, d.chunk_offset, d.chunk_size, d.chunk_stride, d.chunk_flags, d.header_flags, d.header_sequence, d.header_pts_ns });
+    }
+    if (client.previous) |previous| try writer.print("; previous_position={d}, previous_duration={d}, previous_rate_hz={d}", .{ previous.position, previous.duration, previous.rate });
+    if (client.diagnostic.invalid_sample_index) |index| try writer.print("; invalid_sample_index={d}", .{index});
+    if (err == error.SourceNotFound or err == error.SourceAmbiguous) {
+        try writer.print("; available sources:", .{});
+        for (client.catalog) |entry| if (entry) |object| {
+            if (object.kind != .node or !object.is_source) continue;
+            var serial: []const u8 = "";
+            for (client.catalog) |candidate| if (candidate) |device| {
+                if (device.kind == .device and device.id == object.parent) {
+                    serial = device.device_serial.get();
+                    break;
+                }
+            };
+            try writer.print(" [name=\"{f}\", description=\"{f}\", serial=\"{f}\"]", .{ std.zig.fmtString(object.name.get()), std.zig.fmtString(object.description.get()), std.zig.fmtString(serial) });
+        };
+    }
+}
 
 const FillingSlot = struct {
     writer: audio_exchange.SlotWriter,
     samples_count: u32,
     contains_activity: bool,
-};
-
-const PreviousTimeline = struct {
-    buffer_ticks: u64,
-    graph_rate_num: u32,
-    graph_rate_denom: u32,
 };
 
 const CallbackSamplesRange = struct {
@@ -493,63 +664,6 @@ const CallbackState = union(enum) {
     observed: CallbackMetrics,
 };
 
-const capture_gate_preparing: i32 = 0;
-const capture_gate_ready: i32 = 1;
-
-const CaptureGate = union(enum) {
-    preparing,
-    ready,
-    early_buffer_return_failed: i32,
-};
-
-const RealtimeCapture = struct {
-    // Published once before `pw_stream_connect` and then immutable until stream
-    // destruction has joined the data thread. The callback must not inspect the
-    // main-loop-owned `Audio.stream` lifecycle union.
-    stream: ?*pipewire.pw_stream,
-    exchange: *AudioExchange,
-    publication_event_fd: std.posix.fd_t,
-    source_is_linked_atomic: *std.atomic.Value(bool),
-    negotiated_format_is_accepted_atomic: *std.atomic.Value(bool),
-    capture_gate_atomic: *std.atomic.Value(i32),
-    callback_event_fd: std.posix.fd_t,
-    timeline_state: TimelineState,
-
-    recording_samples_target: u32,
-    slot_samples_boundary: u32,
-    automatic_stop: AutomaticStop,
-    active_slot: ?FillingSlot,
-    publications_count: u32,
-    samples_count: u32,
-    published_samples_count: u32,
-    automatic_stop_confirmation_tail_is_private: bool,
-
-    terminal_outcome_atomic: std.atomic.Value(TerminalOutcome),
-    runtime_error: RuntimeError,
-    buffer_error: BufferError,
-    queue_buffer_result: i32,
-
-    main_loop_thread_id: i32,
-    callback_state: CallbackState,
-    activity_detector: audio_activity.Detector,
-};
-
-const SourceEvent = union(enum) {
-    linked: u32,
-    link_removed: u32,
-    node_removed: u32,
-    device_removed: u32,
-    changed: struct {
-        previous_node_id: u32,
-        current_node_id: u32,
-    },
-    observation_error: struct {
-        domain: ErrorDomain,
-        code: i64,
-        message: []const u8,
-    },
-};
-
 const TerminalOutcome = enum(u8) {
     none,
     completed,
@@ -571,109 +685,6 @@ const TerminalOutcome = enum(u8) {
     invalid_buffer,
     corrupted_buffer,
     buffer_return_error,
-};
-
-/// Stable `voiced_audio` codes for a malformed or discontinuous PipeWire graph
-/// timeline. The runtime stage disambiguates these from other Voiced codes.
-pub const TimelineErrorCode = enum(u32) {
-    none,
-    invalid_rate,
-    invalid_graph_time,
-    buffer_from_future,
-    tick_underflow,
-    rate_changed,
-    ticks_regressed,
-    discontinuity,
-};
-
-/// Stable `spa_buffer` codes for external metadata, geometry, and sample data
-/// rejected on PipeWire's realtime callback thread.
-const TimelineDataError = enum(u32) {
-    invalid_rate = @intFromEnum(TimelineErrorCode.invalid_rate),
-    invalid_graph_time = @intFromEnum(TimelineErrorCode.invalid_graph_time),
-    buffer_from_future = @intFromEnum(TimelineErrorCode.buffer_from_future),
-    tick_underflow = @intFromEnum(TimelineErrorCode.tick_underflow),
-    rate_changed = @intFromEnum(TimelineErrorCode.rate_changed),
-    ticks_regressed = @intFromEnum(TimelineErrorCode.ticks_regressed),
-};
-
-pub const BufferErrorCode = enum(u32) {
-    none,
-    missing_spa_buffer,
-    metadata_count_exceeds_realtime_limit,
-    missing_metadata_array,
-    duplicate_header_metadata,
-    undersized_header_metadata,
-    missing_header_metadata_data,
-    misaligned_header_metadata_data,
-    unsupported_header_flags,
-    header_corrupted,
-    timeline_discontinuity,
-    unexpected_data_planes,
-    missing_data_planes,
-    missing_chunk,
-    chunk_corrupted,
-    missing_mapped_data,
-    unreadable_data,
-    empty_data_capacity,
-    invalid_stride,
-    incomplete_sample,
-    misaligned_sample_offset,
-    non_finite_sample,
-    block_exceeds_realtime_limit,
-};
-
-const TimelineObservation = struct {
-    graph_now_ns: i64,
-    graph_rate_num: u32,
-    graph_rate_denom: u32,
-    graph_ticks: u64,
-    buffer_cycle_ns: u64,
-    buffer_ticks_previous: u64,
-    buffer_ticks_current: u64,
-    block_samples_count: u32,
-};
-
-const TimelineFailure = union(enum) {
-    query_failed: struct {
-        result: i32,
-        block_samples_count: u32,
-    },
-    invalid: struct {
-        code: TimelineDataError,
-        observation: TimelineObservation,
-    },
-    discontinuity: TimelineObservation,
-};
-
-const TimelineState = union(enum) {
-    header_only,
-    full_initial,
-    full_tracking: PreviousTimeline,
-    failed: TimelineFailure,
-
-    fn validation(state: TimelineState) TimelineValidation {
-        return switch (state) {
-            .header_only => .header_only,
-            .full_initial, .full_tracking, .failed => .full,
-        };
-    }
-};
-
-const BufferError = struct {
-    reason: BufferErrorCode,
-    data_planes_count: u32,
-    data_flags: u32,
-    data_max_size: u32,
-    metadata_count: u32,
-    metadata_size: u32,
-    header_flags: u32,
-    header_sequence: u64,
-    header_presentation_timestamp_ns: i64,
-    chunk_offset: u32,
-    chunk_size: u32,
-    chunk_stride: i32,
-    invalid_sample_index: u32,
 };
 
 const ValidatedAudioBlock = union(enum) {
@@ -698,2823 +709,20 @@ const ValidatedAudioBlock = union(enum) {
     }
 };
 
-pub const RunResult = union(enum) {
-    captured: Report,
-    setup_failed: SetupFailure,
+const RealtimeCapture = struct {
+    exchange: *AudioExchange,
+    publication_event_fd: linux.fd_t,
+    recording_samples_target: u32,
+    slot_samples_boundary: u32,
+    automatic_stop: AutomaticStop,
+    active_slot: ?FillingSlot = null,
+    publications_count: u32 = 0,
+    samples_count: u32 = 0,
+    published_samples_count: u32 = 0,
+    automatic_stop_confirmation_tail_is_private: bool = false,
+    callback_state: CallbackState = .unobserved,
+    activity_detector: audio_activity.Detector,
 };
-
-/// `run` initializes one stream, captures complete PipeWire callback blocks into
-/// the supplied exchange, and returns only after callbacks have stopped. Setup
-/// failure and completed stream ownership are mutually exclusive outcomes; the
-/// caller never has to correlate an error union with a second output parameter.
-pub fn run(launch: Launch) RunResult {
-    var setup_error: SetupError = std.mem.zeroes(SetupError);
-    const report = runCapture(launch, &setup_error) catch {
-        assert(setup_error.stage != .none);
-        assert(setup_error.domain != .none);
-        assert(setup_error.message_size > 0);
-        return .{ .setup_failed = .{
-            .stage = @enumFromInt(@intFromEnum(setup_error.stage)),
-            .domain = @enumFromInt(@intFromEnum(setup_error.domain)),
-            .code = setup_error.code,
-            .message = setup_error.message,
-            .message_size = setup_error.message_size,
-            .pipewire_version = setup_error.pipewire_version,
-            .pipewire_version_size = setup_error.pipewire_version_size,
-        } };
-    };
-    assert(setup_error.stage == .none);
-    assert(setup_error.domain == .none);
-    assert(setup_error.message_size == 0);
-    return .{ .captured = report };
-}
-
-/// The fallible implementation records every setup failure before returning its
-/// internal error. `run` closes that bookkeeping protocol into one tagged result.
-fn runCapture(launch: Launch, setup_error: *SetupError) !Report {
-    assert(setup_error.stage == .none);
-    assert(setup_error.domain == .none);
-    assert(setup_error.code == 0);
-    assert(setup_error.message_size == 0);
-    assert(setup_error.pipewire_version_size == 0);
-    assert(launch.exchange.version == audio_exchange.format_version);
-    assert(launch.exchange.session_id > 0);
-    assert(launch.publication_event_fd >= 0);
-    assert(launch.control_socket >= 0);
-    assert(launch.publication_event_fd != launch.control_socket);
-    switch (launch.source) {
-        .default => {},
-        .node_name, .device_serial => |source| {
-            assert(source.len > 0);
-            assert(source.len < source_identity_text_capacity);
-        },
-    }
-    const direct_target: ?[:0]const u8 = switch (launch.source) {
-        .node_name => |node_name| node_name,
-        .default, .device_serial => null,
-    };
-    const configured_device_serial: ?[:0]const u8 = switch (launch.source) {
-        .device_serial => |device_serial| device_serial,
-        .default, .node_name => null,
-    };
-    assert(launch.recording_samples_target > 0);
-    assert(launch.recording_samples_target <=
-        std.math.maxInt(u32) - audio_exchange.callback_samples_count_max);
-    assert(launch.slot_samples_boundary >= audio_exchange.callback_samples_count_max);
-    assert(launch.slot_samples_boundary <= audio_exchange.slot_samples_capacity);
-    assert(launch.exchange.timeline_validation_atomic == 0);
-    assert(launch.exchange.audio_callbacks_count_atomic == 0);
-    assert(launch.exchange.audio_samples_count_atomic == 0);
-    assert(launch.exchange.reserved_2 == 0);
-
-    for (&launch.exchange.slots) |*slot| {
-        assert(@atomicLoad(
-            u32,
-            &slot.published_samples_count_atomic,
-            .acquire,
-        ) == 0);
-        assert(slot.publication_ordinal == 0);
-    }
-
-    // PipeWire creates loop pollers, eventfds, a protocol socket, local memfds,
-    // and imported buffer descriptors during setup. On PipeWire 1.0.5, limits
-    // in the teens fail at different internal stages; some asynchronous errors
-    // never become terminal stream events. Requiring a soft limit of sixty-four
-    // is a conservative policy for this otherwise descriptor-clean worker, not
-    // a PipeWire API minimum, and does not replace the setup deadline.
-    const pipewire_file_descriptor_limit_min: u64 = 64;
-
-    const file_descriptor_limits = std.posix.getrlimit(.NOFILE) catch |limit_error| {
-        recordSetupError(
-            setup_error,
-            .file_descriptor_limits_query,
-            .zig_error,
-            @intFromError(limit_error),
-            &.{},
-            "getrlimit(RLIMIT_NOFILE) returned {s}",
-            .{@errorName(limit_error)},
-        );
-        return limit_error;
-    };
-
-    if (file_descriptor_limits.cur < pipewire_file_descriptor_limit_min) {
-        recordSetupError(
-            setup_error,
-            .file_descriptor_limit,
-            .resource_limit,
-            @intCast(file_descriptor_limits.cur),
-            &.{},
-            "RLIMIT_NOFILE soft limit is {d}; Voiced requires at least {d}",
-            .{ file_descriptor_limits.cur, pipewire_file_descriptor_limit_min },
-        );
-        return error.PipeWireFileDescriptorLimitTooLow;
-    }
-
-    const memory_lock_limits = std.posix.getrlimit(.MEMLOCK) catch |limit_error| {
-        recordSetupError(
-            setup_error,
-            .memory_lock_limits_query,
-            .zig_error,
-            @intFromError(limit_error),
-            &.{},
-            "getrlimit(RLIMIT_MEMLOCK) returned {s}",
-            .{@errorName(limit_error)},
-        );
-        return limit_error;
-    };
-
-    // Touch every shared page before PipeWire can enter the realtime callback.
-    // `mlock` remains best effort: an unlocked exchange is still safe, but the
-    // kernel may reclaim its pages under pressure and delay a later callback.
-    // Retain both errno and the inherited soft limit so the supervisor can warn
-    // without guessing whether the mapping exceeded policy or permission was
-    // denied for another reason.
-    const exchange_bytes = std.mem.asBytes(launch.exchange);
-    var page_offset: usize = 0;
-    while (page_offset < exchange_bytes.len) : (page_offset += std.heap.page_size_min) {
-        const page_byte: *volatile u8 = @ptrCast(&exchange_bytes[page_offset]);
-        page_byte.* = page_byte.*;
-    }
-    const memory_lock_result = linux.mlock(exchange_bytes.ptr, exchange_bytes.len);
-    const memory_lock_errno = linux.errno(memory_lock_result);
-    const shared_memory_is_locked = memory_lock_errno == .SUCCESS;
-    const shared_memory_lock_error_code: i32 = if (shared_memory_is_locked)
-        0
-    else
-        @intFromEnum(memory_lock_errno);
-    defer if (shared_memory_is_locked) {
-        // The mapping disappears with this isolated worker regardless. A rare
-        // cleanup error cannot be repaired here and must not erase an already
-        // completed audio report by turning teardown into an assertion crash.
-        _ = linux.munlock(exchange_bytes.ptr, exchange_bytes.len);
-    };
-
-    pipewire.pw_init(null, null);
-    defer pipewire.pw_deinit();
-
-    // The C boundary intersects the headers used to build this executable with
-    // the library loaded on this machine. PipeWire 1.0.5 provides the exact
-    // cycle timestamp needed for full per-buffer continuity checks; older
-    // installations continue in Header-only mode without touching that newer
-    // struct field. Keep both versions in every successful report so an issue
-    // does not mistake build capability for runtime capability.
-    var native_environment: pipewire.voiced_audio_pipewire_environment = undefined;
-    pipewire.voiced_audio_pipewire_environment_read(&native_environment);
-    assert(native_environment.headers_version_size > 0);
-    assert(native_environment.headers_version_size <=
-        native_environment.headers_version.len);
-    assert(native_environment.library_version_size > 0);
-    assert(native_environment.library_version_size <=
-        native_environment.library_version.len);
-    const timeline_validation: TimelineValidation =
-        switch (native_environment.timeline_validation) {
-            pipewire.VOICED_AUDIO_PIPEWIRE_TIMELINE_VALIDATION_HEADER_ONLY => .header_only,
-            pipewire.VOICED_AUDIO_PIPEWIRE_TIMELINE_VALIDATION_FULL => .full,
-            else => unreachable,
-        };
-    audio_exchange.publishTimelineValidation(
-        launch.exchange,
-        switch (timeline_validation) {
-            .header_only => .header_only,
-            .full => .full,
-        },
-    );
-
-    // Every synchronous C wrapper clears this output before doing native work,
-    // leaves it empty on success, and captures the native code and owned message
-    // before returning an error. Reusing one value makes that boundary contract
-    // visible without separating a failed call from a later errno lookup.
-    var native_error: pipewire.voiced_audio_pipewire_error = undefined;
-
-    // A configured physical microphone is named by stable Device serial, not by
-    // a PipeWire graph ID or node name. Inventory the current graph before the
-    // capture stream exists, join each source Node to its Device, and resolve
-    // exactly one current node name. Failure therefore never opens the default
-    // microphone, and every new recording naturally re-resolves after hotplug.
-    var configured_source_resolution = std.mem.zeroes(
-        pipewire.voiced_audio_pipewire_source_resolution,
-    );
-    const capture_target: ?[:0]const u8 = if (configured_device_serial) |device_serial| configured: {
-        if (!pipewire.voiced_audio_pipewire_source_resolve_device_serial(
-            device_serial.ptr,
-            &configured_source_resolution,
-            &native_error,
-        )) {
-            const error_stage: SetupErrorStage = switch (native_error.stage) {
-                pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_SOURCE_RESOLUTION_MAIN_LOOP_CREATE => .source_resolution_main_loop_create,
-                pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_SOURCE_RESOLUTION_CONTEXT_CREATE => .source_resolution_context_create,
-                pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_SOURCE_RESOLUTION_CORE_CONNECT => .source_resolution_core_connect,
-                pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_SOURCE_RESOLUTION_CORE_OBSERVER_REGISTER => .source_resolution_core_observer_register,
-                pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_SOURCE_RESOLUTION_REGISTRY_CREATE => .source_resolution_registry_create,
-                pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_SOURCE_RESOLUTION_REGISTRY_OBSERVER_REGISTER => .source_resolution_registry_observer_register,
-                pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_SOURCE_RESOLUTION_NODE_BIND => .source_resolution_node_bind,
-                pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_SOURCE_RESOLUTION_DEVICE_BIND => .source_resolution_device_bind,
-                pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_SOURCE_RESOLUTION_SYNC => .source_resolution_sync,
-                pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_SOURCE_RESOLUTION_MAIN_LOOP_RUN => .source_resolution_main_loop,
-                pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_SOURCE_RESOLUTION => .source_resolution,
-                else => unreachable,
-            };
-            const error_domain: ErrorDomain = switch (native_error.domain) {
-                pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_LIBC_ERRNO => .libc_errno,
-                pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_PIPEWIRE_RESULT => .pipewire_result,
-                pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_PIPEWIRE_CALLBACK => .pipewire_callback,
-                pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_BOUNDARY_VALIDATION => .boundary_validation,
-                else => unreachable,
-            };
-            assert(native_error.message_size <= native_error.message.len);
-            recordSetupError(
-                setup_error,
-                error_stage,
-                error_domain,
-                native_error.code,
-                native_error.message[0..native_error.message_size],
-                "configured microphone discovery failed during {s}",
-                .{@tagName(error_stage)},
-            );
-            return error.PipeWireConfiguredSourceResolutionFailed;
-        }
-        assert(native_error.stage == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_NONE);
-        assert(native_error.domain == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_NONE);
-        assert(native_error.code == 0);
-        assert(native_error.message_size == 0);
-        if (!configuredSourceResolutionIsValid(
-            &configured_source_resolution,
-            device_serial,
-        )) {
-            recordSetupError(
-                setup_error,
-                .source_resolution,
-                .boundary_validation,
-                @intFromEnum(SourceResolutionErrorCode.malformed_boundary_result),
-                &.{},
-                "PipeWire source discovery returned an inconsistent result",
-                .{},
-            );
-            return error.PipeWireConfiguredSourceResolutionFailed;
-        }
-
-        var available_sources: [3072]u8 = undefined;
-        var available_sources_size: usize = 0;
-        var available_sources_listed: u32 = 0;
-        const source_lines_capacity = available_sources.len - 96;
-        for (configured_source_resolution.sources[0..configured_source_resolution.sources_count]) |source| {
-            assert(source.is_resolved == 1);
-            assert(source.node_name_size <= source.node_name.len);
-            assert(source.node_description_size <= source.node_description.len);
-            assert(source.device_serial_size <= source.device_serial.len);
-            assert(source.device_description_size <= source.device_description.len);
-            const source_name = if (source.node_description_size > 0)
-                source.node_description[0..source.node_description_size]
-            else if (source.node_name_size > 0)
-                source.node_name[0..source.node_name_size]
-            else
-                "unnamed PipeWire source";
-            const source_device_serial = if (source.device_serial_size > 0)
-                source.device_serial[0..source.device_serial_size]
-            else
-                "not provided";
-            const line = std.fmt.bufPrint(
-                available_sources[available_sources_size..source_lines_capacity],
-                "\n  - {s} (node={s}, device.serial={s})",
-                .{
-                    source_name,
-                    source.node_name[0..source.node_name_size],
-                    source_device_serial,
-                },
-            ) catch break;
-            available_sources_size += line.len;
-            available_sources_listed += 1;
-        }
-        if (available_sources_listed < configured_source_resolution.sources_count) {
-            const omitted = std.fmt.bufPrint(
-                available_sources[available_sources_size..],
-                "\n  - ... {d} additional sources omitted",
-                .{configured_source_resolution.sources_count - available_sources_listed},
-            ) catch unreachable;
-            available_sources_size += omitted.len;
-        }
-        if (available_sources_size == 0) {
-            const none = std.fmt.bufPrint(
-                &available_sources,
-                " none",
-                .{},
-            ) catch unreachable;
-            available_sources_size = none.len;
-        }
-
-        switch (configured_source_resolution.status) {
-            pipewire.VOICED_AUDIO_PIPEWIRE_SOURCE_RESOLUTION_NOT_FOUND => {
-                assert(configured_source_resolution.matches_count == 0);
-                recordSetupError(
-                    setup_error,
-                    .source_resolution,
-                    .voiced_audio,
-                    @intFromEnum(SourceResolutionErrorCode.configured_device_not_found),
-                    &.{},
-                    "no available PipeWire source belongs to configured device.serial={s}; available sources:{s}",
-                    .{
-                        device_serial,
-                        available_sources[0..available_sources_size],
-                    },
-                );
-                return error.ConfiguredMicrophoneNotFound;
-            },
-            pipewire.VOICED_AUDIO_PIPEWIRE_SOURCE_RESOLUTION_AMBIGUOUS => {
-                assert(configured_source_resolution.matches_count > 1);
-                recordSetupError(
-                    setup_error,
-                    .source_resolution,
-                    .voiced_audio,
-                    @intFromEnum(SourceResolutionErrorCode.configured_device_ambiguous),
-                    &.{},
-                    "configured device.serial={s} exposes {d} available PipeWire sources; available sources:{s}",
-                    .{
-                        device_serial,
-                        configured_source_resolution.matches_count,
-                        available_sources[0..available_sources_size],
-                    },
-                );
-                return error.ConfiguredMicrophoneAmbiguous;
-            },
-            pipewire.VOICED_AUDIO_PIPEWIRE_SOURCE_RESOLUTION_RESOLVED => {},
-            else => unreachable,
-        }
-
-        const resolved_source = &configured_source_resolution.resolved_source;
-        assert(configured_source_resolution.matches_count == 1);
-        assert(resolved_source.is_resolved == 1);
-        assert(resolved_source.node_name_size > 0);
-        assert(resolved_source.node_name_size < resolved_source.node_name.len);
-        assert(resolved_source.node_name[resolved_source.node_name_size] == 0);
-        assert(resolved_source.device_serial_size == device_serial.len);
-        assert(std.mem.eql(
-            u8,
-            resolved_source.device_serial[0..resolved_source.device_serial_size],
-            device_serial,
-        ));
-        break :configured resolved_source.node_name[0..resolved_source.node_name_size :0];
-    } else direct_target;
-
-    const main_loop_optional = pipewire.voiced_audio_pipewire_main_loop_create(
-        &native_error,
-    );
-    if (main_loop_optional == null) {
-        assert(native_error.stage == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_MAIN_LOOP_CREATE);
-        assert(native_error.domain == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_LIBC_ERRNO);
-        assert(native_error.code >= 0);
-        assert(native_error.message_size > 0);
-        assert(native_error.message_size <= native_error.message.len);
-        recordSetupError(
-            setup_error,
-            .main_loop_create,
-            .libc_errno,
-            native_error.code,
-            native_error.message[0..native_error.message_size],
-            "pw_main_loop_new returned null",
-            .{},
-        );
-
-        return error.PipeWireMainLoopCreationFailed;
-    }
-    assert(native_error.stage == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_NONE);
-    assert(native_error.domain == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_NONE);
-    assert(native_error.code == 0);
-    assert(native_error.message_size == 0);
-
-    const main_loop = main_loop_optional.?;
-    defer pipewire.pw_main_loop_destroy(main_loop);
-
-    const callback_event_result = linux.eventfd(
-        0,
-        linux.EFD.CLOEXEC | linux.EFD.NONBLOCK,
-    );
-
-    const callback_event_errno = linux.errno(callback_event_result);
-
-    if (callback_event_errno != .SUCCESS) {
-        const error_code: i32 = @intFromEnum(callback_event_errno);
-        recordSetupError(
-            setup_error,
-            .callback_event_create,
-            .linux_errno,
-            error_code,
-            &.{},
-            "eventfd could not create the realtime callback wake descriptor: errno={s}",
-            .{@tagName(callback_event_errno)},
-        );
-        return error.CallbackEventCreationFailed;
-    }
-    const callback_event_fd: std.posix.fd_t = @intCast(callback_event_result);
-    defer closeFileDescriptor(callback_event_fd);
-
-    var source_is_linked = std.atomic.Value(bool).init(false);
-    var negotiated_format_is_accepted = std.atomic.Value(bool).init(false);
-    var capture_gate = std.atomic.Value(i32).init(capture_gate_preparing);
-    var audio: Audio = .{
-        .main_loop = main_loop,
-        .stream = .not_created,
-        .callback_event_fd = callback_event_fd,
-        .control_socket = launch.control_socket,
-        .server_observer = std.mem.zeroes(
-            pipewire.voiced_audio_pipewire_server_observer,
-        ),
-        .source_identity = std.mem.zeroes(
-            pipewire.voiced_audio_pipewire_source_identity,
-        ),
-        .exchange = launch.exchange,
-        .target = capture_target,
-        .recording_samples_target = launch.recording_samples_target,
-        .slot_samples_boundary = launch.slot_samples_boundary,
-        .process_realtime = launch.process_realtime,
-        .timeline_validation = timeline_validation,
-        .source_is_linked_atomic = &source_is_linked,
-        .negotiated_format_is_accepted_atomic = &negotiated_format_is_accepted,
-        .negotiated_format = null,
-        .error_message = @splat(0),
-        .error_message_size = 0,
-        .runtime_error = .{
-            .stage = .none,
-            .domain = .none,
-            .code = 0,
-        },
-        .teardown_error_message = @splat(0),
-        .teardown_error_message_size = 0,
-        .teardown_error = .{
-            .stage = .none,
-            .domain = .none,
-            .code = 0,
-        },
-        .realtime = .{
-            .stream = null,
-            .exchange = launch.exchange,
-            .publication_event_fd = launch.publication_event_fd,
-            .source_is_linked_atomic = &source_is_linked,
-            .negotiated_format_is_accepted_atomic = &negotiated_format_is_accepted,
-            .capture_gate_atomic = &capture_gate,
-            .callback_event_fd = callback_event_fd,
-            .timeline_state = switch (timeline_validation) {
-                .header_only => .header_only,
-                .full => .full_initial,
-            },
-            .recording_samples_target = launch.recording_samples_target,
-            .slot_samples_boundary = launch.slot_samples_boundary,
-            .automatic_stop = launch.automatic_stop,
-            .active_slot = null,
-            .publications_count = 0,
-            .samples_count = 0,
-            .published_samples_count = 0,
-            .automatic_stop_confirmation_tail_is_private = false,
-            .terminal_outcome_atomic = .init(.none),
-            .runtime_error = .{
-                .stage = .none,
-                .domain = .none,
-                .code = 0,
-            },
-            .buffer_error = .{
-                .reason = .none,
-                .data_planes_count = 0,
-                .data_flags = 0,
-                .data_max_size = 0,
-                .metadata_count = 0,
-                .metadata_size = 0,
-                .header_flags = 0,
-                .header_sequence = 0,
-                .header_presentation_timestamp_ns = 0,
-                .chunk_offset = 0,
-                .chunk_size = 0,
-                .chunk_stride = 0,
-                .invalid_sample_index = 0,
-            },
-            .queue_buffer_result = 0,
-            .main_loop_thread_id = linux.gettid(),
-            .callback_state = .unobserved,
-            .activity_detector = .init(audio_exchange.sample_rate_hz),
-        },
-    };
-
-    // The eventfd is the only callback-to-main-loop wake path. The realtime
-    // thread writes one fixed integer after publishing a terminal outcome; this
-    // source drains that integer and stops the loop on its owning thread.
-    const pipewire_loop = pipewire.pw_main_loop_get_loop(main_loop);
-    const callback_event_source_optional =
-        pipewire.voiced_audio_pipewire_callback_event_register(
-            pipewire_loop,
-            callback_event_fd,
-            pipewire.SPA_IO_IN | pipewire.SPA_IO_ERR | pipewire.SPA_IO_HUP,
-            callbackEventReceived,
-            &audio,
-            &native_error,
-        );
-    if (callback_event_source_optional == null) {
-        assert(native_error.stage == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_CALLBACK_EVENT_REGISTER);
-        assert(native_error.domain == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_LIBC_ERRNO);
-        assert(native_error.code >= 0);
-        assert(native_error.message_size > 0);
-        assert(native_error.message_size <= native_error.message.len);
-        recordSetupError(
-            setup_error,
-            .callback_event_register,
-            .libc_errno,
-            native_error.code,
-            native_error.message[0..native_error.message_size],
-            "pw_loop_add_io returned null for the callback eventfd",
-            .{},
-        );
-        return error.CallbackEventRegistrationFailed;
-    }
-    assert(native_error.stage == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_NONE);
-    assert(native_error.domain == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_NONE);
-    assert(native_error.code == 0);
-    assert(native_error.message_size == 0);
-
-    const callback_event_source = callback_event_source_optional.?;
-    defer pipewire.voiced_audio_pipewire_loop_io_unregister(
-        pipewire_loop,
-        callback_event_source,
-    );
-
-    // The worker receives its launch packet before entering `run`, then leaves
-    // the same SOCK_SEQPACKET endpoint with this loop. A queued stop or cancel
-    // therefore wakes the PipeWire owner thread without polling from the
-    // realtime callback or introducing a second control thread.
-    const control_socket_source_optional =
-        pipewire.voiced_audio_pipewire_control_socket_register(
-            pipewire_loop,
-            launch.control_socket,
-            pipewire.SPA_IO_IN | pipewire.SPA_IO_ERR | pipewire.SPA_IO_HUP,
-            controlSocketEventReceived,
-            &audio,
-            &native_error,
-        );
-    if (control_socket_source_optional == null) {
-        assert(native_error.stage ==
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_CONTROL_SOCKET_REGISTER);
-        assert(native_error.domain ==
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_LIBC_ERRNO);
-        assert(native_error.code >= 0);
-        assert(native_error.message_size > 0);
-        assert(native_error.message_size <= native_error.message.len);
-        recordSetupError(
-            setup_error,
-            .control_socket_register,
-            .libc_errno,
-            native_error.code,
-            native_error.message[0..native_error.message_size],
-            "pw_loop_add_io could not register the supervisor control socket",
-            .{},
-        );
-        return error.ControlSocketRegistrationFailed;
-    }
-    assert(native_error.stage == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_NONE);
-    assert(native_error.domain == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_NONE);
-    assert(native_error.code == 0);
-    assert(native_error.message_size == 0);
-
-    const control_socket_source = control_socket_source_optional.?;
-    defer pipewire.voiced_audio_pipewire_loop_io_unregister(
-        pipewire_loop,
-        control_socket_source,
-    );
-
-    // C owns stream property construction as one semantic operation. Its error
-    // stage still identifies the exact failed property or constructor without
-    // exposing each `pw_properties_*` call as a separate Zig-facing API.
-    var stream_callbacks: pipewire.voiced_audio_pipewire_stream_callbacks = .{
-        .context = &audio,
-        .state_changed = streamStateChanged,
-        .format_changed = streamFormatChanged,
-        .process = processAudio,
-    };
-
-    // This cleanup is declared before stream destruction so every callback has
-    // stopped before an otherwise unpublished slot is returned to the exchange.
-    // Normal terminal paths publish their final non-empty slot explicitly.
-    defer abandonUnpublishedActiveSlot(&audio.realtime);
-
-    const stream_optional = pipewire.voiced_audio_pipewire_capture_stream_create(
-        pipewire_loop,
-        if (capture_target) |target| target.ptr else null,
-        &stream_callbacks,
-        &native_error,
-    );
-    if (stream_optional == null) {
-        const error_stage: SetupErrorStage = switch (native_error.stage) {
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_CAPTURE_PROPERTIES_CREATE => .properties_create,
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_CAPTURE_PROPERTY_CONFIG => .property_config,
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_CAPTURE_PROPERTY_MEDIA_TYPE => .property_media_type,
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_CAPTURE_PROPERTY_MEDIA_CATEGORY => .property_media_category,
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_CAPTURE_PROPERTY_MEDIA_ROLE => .property_media_role,
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_CAPTURE_PROPERTY_TARGET => .property_target,
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_CAPTURE_STREAM_CREATE => .stream_create,
-            else => unreachable,
-        };
-        const error_domain: ErrorDomain = switch (native_error.domain) {
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_LIBC_ERRNO => .libc_errno,
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_PIPEWIRE_RESULT => .pipewire_result,
-            else => unreachable,
-        };
-        assert(native_error.message_size > 0);
-        assert(native_error.message_size <= native_error.message.len);
-        recordSetupError(
-            setup_error,
-            error_stage,
-            error_domain,
-            native_error.code,
-            native_error.message[0..native_error.message_size],
-            "capture stream creation failed during {s}",
-            .{@tagName(error_stage)},
-        );
-        return error.PipeWireCaptureStreamCreationFailed;
-    }
-    assert(native_error.stage == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_NONE);
-    assert(native_error.domain == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_NONE);
-    assert(native_error.code == 0);
-    assert(native_error.message_size == 0);
-    const stream = stream_optional.?;
-    audio.stream = .{ .live = stream };
-    audio.realtime.stream = stream;
-    var stream_is_alive = true;
-    defer if (stream_is_alive) pipewire.pw_stream_destroy(stream);
-
-    // Claim the first physical slot before connecting. PipeWire may start its
-    // data thread as soon as the stream becomes active, so the callback must
-    // never observe an exchange without one producer-owned destination.
-    // The worker starts from the exchange asserted above, so the initial slot
-    // claim cannot encounter consumer-owned audio. Later claims may fail
-    // normally when all three slots are still published to the supervisor.
-    assert(beginNextAvailableSlot(&audio.realtime));
-
-    // WARNING: a zero result means only that PipeWire accepted this asynchronous
-    // connection request. It does not prove that a target was linked, a Format
-    // was negotiated, the stream reached `STREAMING`, or a process callback will
-    // ever arrive. Descriptor exhaustion and an unresponsive hardware source
-    // have both produced successful calls followed by no progress. The
-    // supervising process must therefore enforce separate setup and callback-
-    // progress deadlines; this worker must never treat this return as readiness.
-    const connect_result = pipewire.voiced_audio_pipewire_capture_stream_connect(
-        stream,
-        audio_exchange.sample_rate_hz,
-        audio_exchange.callback_samples_count_max,
-        &native_error,
-    );
-    if (connect_result < 0) {
-        assert(native_error.stage ==
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_CAPTURE_STREAM_CONNECT);
-        assert(native_error.domain ==
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_PIPEWIRE_RESULT);
-        assert(native_error.code == connect_result);
-        assert(native_error.message_size <= native_error.message.len);
-        recordSetupError(
-            setup_error,
-            .stream_connect,
-            .pipewire_result,
-            native_error.code,
-            native_error.message[0..native_error.message_size],
-            "pw_stream_connect rejected the asynchronous input request",
-            .{},
-        );
-        return error.PipeWireStreamConnectionFailed;
-    }
-    assert(native_error.stage == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_NONE);
-    assert(native_error.domain == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_NONE);
-    assert(native_error.code == 0);
-    assert(native_error.message_size == 0);
-
-    // A PipeWire target is only a routing request. Real WirePlumber graphs can
-    // replace the requested microphone's Link with one from the new default
-    // source after unplug, even while `node.dont-reconnect` remains true. The
-    // stream exposes its private core only after connect, but no graph callback
-    // can run until the loop starts below. Register in that window so the first
-    // incoming Link locks one source and opens the realtime copy gate.
-    var source_callbacks: pipewire.voiced_audio_pipewire_source_callbacks = .{
-        .context = &audio,
-        .event = sourceEventReceived,
-    };
-    const source_observer_optional =
-        pipewire.voiced_audio_pipewire_capture_source_observer_create(
-            stream,
-            if (configured_device_serial) |device_serial|
-                device_serial.ptr
-            else
-                null,
-            &source_callbacks,
-            &native_error,
-        );
-    if (source_observer_optional == null) {
-        const error_stage: SetupErrorStage = switch (native_error.stage) {
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_CAPTURE_SOURCE_OBSERVER_CREATE => .source_observer_create,
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_CAPTURE_SOURCE_REGISTRY_CREATE => .source_registry_create,
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_CAPTURE_SOURCE_OBSERVER_REGISTER => .source_observer_register,
-            else => unreachable,
-        };
-        const error_domain: ErrorDomain = switch (native_error.domain) {
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_LIBC_ERRNO => .libc_errno,
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_PIPEWIRE_RESULT => .pipewire_result,
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_BOUNDARY_VALIDATION => .boundary_validation,
-            else => unreachable,
-        };
-        assert(native_error.message_size > 0);
-        assert(native_error.message_size <= native_error.message.len);
-        recordSetupError(
-            setup_error,
-            error_stage,
-            error_domain,
-            native_error.code,
-            native_error.message[0..native_error.message_size],
-            "capture source observation failed during {s}",
-            .{@tagName(error_stage)},
-        );
-        return error.PipeWireSourceObserverCreationFailed;
-    }
-    assert(native_error.stage == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_NONE);
-    assert(native_error.domain == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_NONE);
-    assert(native_error.code == 0);
-    assert(native_error.message_size == 0);
-    const source_observer = source_observer_optional.?;
-    var source_observer_is_alive = true;
-    defer if (source_observer_is_alive) {
-        pipewire.voiced_audio_pipewire_capture_source_observer_destroy(
-            source_observer,
-        );
-    };
-
-    // The linked client-library version says which local ABI is loaded; it does
-    // not identify the remote PipeWire daemon. Connecting creates the stream's
-    // private core, but no asynchronous core event can run before the loop below.
-    // Register now so that first event retains the server version in fixed
-    // worker-owned storage for the final report.
-    const server_observer_result =
-        pipewire.voiced_audio_pipewire_capture_server_observer_register(
-            stream,
-            &audio.server_observer,
-            &native_error,
-        );
-    if (server_observer_result < 0) {
-        assert(native_error.stage ==
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_CAPTURE_SERVER_OBSERVER_REGISTER);
-        const error_domain: ErrorDomain = switch (native_error.domain) {
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_PIPEWIRE_RESULT => .pipewire_result,
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_BOUNDARY_VALIDATION => .boundary_validation,
-            else => unreachable,
-        };
-        assert(native_error.message_size > 0);
-        assert(native_error.message_size <= native_error.message.len);
-        recordSetupError(
-            setup_error,
-            .server_observer_register,
-            error_domain,
-            native_error.code,
-            native_error.message[0..native_error.message_size],
-            "the capture stream could not observe its PipeWire server",
-            .{},
-        );
-        return error.PipeWireServerObserverRegistrationFailed;
-    }
-    assert(native_error.stage == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_NONE);
-    assert(native_error.domain == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_NONE);
-    assert(native_error.code == 0);
-    assert(native_error.message_size == 0);
-    assert(audio.server_observer.is_registered == 1);
-    var server_observer_is_registered = true;
-    defer if (server_observer_is_registered) {
-        pipewire.voiced_audio_pipewire_capture_server_observer_unregister(
-            &audio.server_observer,
-        );
-    };
-
-    // Only now can callback activity count as capture liveness. If PipeWire
-    // schedules the data function unusually early during connect, its setup-gate
-    // branch returns any borrowed buffer without publishing shared progress.
-    // Thus every `setup_failed` result still proves the shared exchange remained
-    // untouched, while normal callback deadlines begin after all observers exist.
-    const preparing_gate = audio.realtime.capture_gate_atomic.cmpxchgStrong(
-        capture_gate_preparing,
-        capture_gate_ready,
-        .acq_rel,
-        .acquire,
-    );
-    if (preparing_gate) |encoded_gate| {
-        const gate = decodeCaptureGate(encoded_gate);
-        assert(gate == .early_buffer_return_failed);
-        audio.realtime.queue_buffer_result = gate.early_buffer_return_failed;
-        publishRealtimeOutcome(&audio.realtime, .buffer_return_error);
-    }
-
-    // `pw_main_loop_run` has no capture deadline. It returns only after one of
-    // our callbacks quits the loop or PipeWire itself fails the loop. A source
-    // can remain nominally connected without either event, so process-level
-    // supervision is part of this operation's correctness contract.
-    const loop_result = pipewire.voiced_audio_pipewire_main_loop_run(
-        main_loop,
-        &native_error,
-    );
-    if (loop_result < 0) {
-        assert(native_error.stage ==
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_MAIN_LOOP_RUN);
-        assert(native_error.domain ==
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_PIPEWIRE_RESULT);
-        assert(native_error.code == loop_result);
-        assert(native_error.message_size > 0);
-        assert(native_error.message_size <= native_error.message.len);
-        if (claimMainLoopOutcome(&audio, .stream_error)) {
-            recordRuntimeError(
-                &audio.runtime_error,
-                .main_loop,
-                .pipewire_result,
-                native_error.code,
-            );
-            writeErrorMessage(
-                &audio,
-                "pw_main_loop_run terminated with result {d}: {s}",
-                .{
-                    native_error.code,
-                    native_error.message[0..native_error.message_size],
-                },
-            );
-        }
-    } else {
-        assert(native_error.stage == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_NONE);
-        assert(native_error.domain == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_NONE);
-        assert(native_error.code == 0);
-        assert(native_error.message_size == 0);
-    }
-    assert(audio.realtime.terminal_outcome_atomic.load(.acquire) != .none);
-
-    // Preserve the first-linked source before unregistering graph callbacks.
-    // A false result with an empty error is valid when connection failed before
-    // any Link appeared. A resolved snapshot remains the original source even
-    // when its Link or Node was the event that just ended this recording.
-    const source_was_resolved =
-        pipewire.voiced_audio_pipewire_capture_source_snapshot(
-            source_observer,
-            &audio.source_identity,
-            &native_error,
-        );
-    assert(native_error.stage == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_NONE);
-    assert(native_error.domain == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_NONE);
-    assert(native_error.code == 0);
-    assert(native_error.message_size == 0);
-    assert(source_was_resolved == (audio.source_identity.is_resolved == 1));
-    assert(audio.source_identity.reserved == 0);
-    if (source_was_resolved) {
-        assert(audio.source_identity.node_id != pipewire.PW_ID_ANY);
-    } else {
-        assert(audio.source_identity.node_id == pipewire.PW_ID_ANY);
-    }
-
-    // Close the copy gate before removing the registry observer. The terminal
-    // latch already makes later process callbacks return borrowed buffers only;
-    // this release also states that no source remains authorized for teardown.
-    audio.source_is_linked_atomic.store(false, .release);
-    assert(source_observer_is_alive);
-    pipewire.voiced_audio_pipewire_capture_source_observer_destroy(
-        source_observer,
-    );
-    source_observer_is_alive = false;
-    assert(!audio.source_is_linked_atomic.load(.acquire));
-
-    audio.stream = .{ .disconnecting = stream };
-    const disconnect_result =
-        pipewire.voiced_audio_pipewire_capture_stream_disconnect(
-            stream,
-            &native_error,
-        );
-
-    // A failed disconnect must not discard an already captured prefix, and it
-    // must not let us inspect callback-owned fields while the data thread could
-    // still be running. Destroy the stream synchronously on every path. The
-    // report retains a disconnect error separately because capture already has
-    // a first-wins terminal outcome that teardown must not overwrite. The source
-    // observer is already gone so expected disconnect cannot masquerade as a
-    // microphone removal; remove the core observer before destroying its core.
-    assert(stream_is_alive);
-    assert(!source_observer_is_alive);
-    assert(server_observer_is_registered);
-    pipewire.voiced_audio_pipewire_capture_server_observer_unregister(
-        &audio.server_observer,
-    );
-    server_observer_is_registered = false;
-    assert(audio.server_observer.is_registered == 0);
-    pipewire.pw_stream_destroy(stream);
-    stream_is_alive = false;
-    assert(!stream_is_alive);
-    audio.stream = .destroyed;
-    assert(audio.stream == .destroyed);
-
-    // Stream destruction is the synchronization boundary with PipeWire's data
-    // thread: after it returns, no callback can still be writing the active
-    // slot. Normal stop and every terminal capture result retain that complete
-    // callback-block prefix. Cancel abandons the private final slot and asks the
-    // supervisor to discard the whole session. Automatic stop also abandons a
-    // private tail when an earlier natural boundary already published the
-    // complete utterance and the tail contains only the remaining quiet used to
-    // confirm that recording should end.
-    const terminal_outcome = audio.realtime.terminal_outcome_atomic.load(.acquire);
-    assert(terminal_outcome != .none);
-    if (terminal_outcome == .cancelled or
-        (terminal_outcome == .automatic_stop and
-            audio.realtime.automatic_stop_confirmation_tail_is_private))
-    {
-        abandonUnpublishedActiveSlot(&audio.realtime);
-    } else {
-        publishActiveSlotIfNonEmpty(&audio.realtime);
-    }
-
-    if (disconnect_result < 0) {
-        assert(native_error.stage ==
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_CAPTURE_STREAM_DISCONNECT);
-        assert(native_error.domain ==
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_PIPEWIRE_RESULT);
-        assert(native_error.code == disconnect_result);
-        assert(native_error.message_size > 0);
-        assert(native_error.message_size <= native_error.message.len);
-        recordRuntimeError(
-            &audio.teardown_error,
-            .stream_disconnect,
-            .pipewire_result,
-            native_error.code,
-        );
-        writeTeardownErrorMessage(
-            &audio,
-            "pw_stream_disconnect failed with result {d}: {s}; the stream was destroyed",
-            .{
-                disconnect_result,
-                native_error.message[0..native_error.message_size],
-            },
-        );
-    } else {
-        assert(native_error.stage == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_NONE);
-        assert(native_error.domain == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_NONE);
-        assert(native_error.code == 0);
-        assert(native_error.message_size == 0);
-    }
-
-    // Every thread competes for one atomic first-wins terminal cause. Reading
-    // the value captured after stream destruction preserves whichever callback
-    // actually ended capture first.
-    const outcome: Outcome = switch (terminal_outcome) {
-        .none => unreachable,
-        .completed => .completed,
-        .automatic_stop => .automatic_stop,
-        .stopped => .stopped,
-        .cancelled => .cancelled,
-        .control_error => .control_error,
-        .pipeline_full => .pipeline_full,
-        .format_parse_error => .format_parse_error,
-        .unexpected_format => .unexpected_format,
-        .buffer_configuration_error => .buffer_configuration_error,
-        .timeline_error => .timeline_error,
-        .timeline_discontinuity => .timeline_discontinuity,
-        .stream_error => .stream_error,
-        .stream_disconnected => .stream_disconnected,
-        .source_disconnected => .source_disconnected,
-        .source_changed => .source_changed,
-        .source_observation_error => .source_observation_error,
-        .invalid_buffer => .invalid_buffer,
-        .corrupted_buffer => .corrupted_buffer,
-        .buffer_return_error => .buffer_return_error,
-    };
-    const runtime_error = switch (outcome) {
-        .completed, .automatic_stop, .stopped, .cancelled => RuntimeError{
-            .stage = .none,
-            .domain = .none,
-            .code = 0,
-        },
-        .control_error,
-        .format_parse_error,
-        .unexpected_format,
-        .buffer_configuration_error,
-        .stream_error,
-        .stream_disconnected,
-        .source_disconnected,
-        .source_changed,
-        .source_observation_error,
-        => audio.runtime_error,
-        .pipeline_full,
-        .timeline_error,
-        .timeline_discontinuity,
-        .invalid_buffer,
-        .corrupted_buffer,
-        .buffer_return_error,
-        => audio.realtime.runtime_error,
-    };
-
-    if (audio.error_message_size == 0) {
-        switch (outcome) {
-            .pipeline_full => writeErrorMessage(
-                &audio,
-                "all audio exchange slots remained published to the consumer",
-                .{},
-            ),
-            .invalid_buffer => writeErrorMessage(
-                &audio,
-                "buffer validation failed ({s}): metas={d}, meta_size={d}, " ++
-                    "header_flags=0x{x}, header_seq={d}, header_pts={d}, " ++
-                    "planes={d}, data_flags=0x{x}, max_size={d}, " ++
-                    "chunk=offset {d}, size {d}, stride {d}, invalid_sample={d}",
-                .{
-                    @tagName(audio.realtime.buffer_error.reason),
-                    audio.realtime.buffer_error.metadata_count,
-                    audio.realtime.buffer_error.metadata_size,
-                    audio.realtime.buffer_error.header_flags,
-                    audio.realtime.buffer_error.header_sequence,
-                    audio.realtime.buffer_error.header_presentation_timestamp_ns,
-                    audio.realtime.buffer_error.data_planes_count,
-                    audio.realtime.buffer_error.data_flags,
-                    audio.realtime.buffer_error.data_max_size,
-                    audio.realtime.buffer_error.chunk_offset,
-                    audio.realtime.buffer_error.chunk_size,
-                    audio.realtime.buffer_error.chunk_stride,
-                    audio.realtime.buffer_error.invalid_sample_index,
-                },
-            ),
-            .corrupted_buffer => writeErrorMessage(
-                &audio,
-                "PipeWire marked audio corrupted: header_flags=0x{x}, " ++
-                    "chunk_offset={d}, chunk_size={d}",
-                .{
-                    audio.realtime.buffer_error.header_flags,
-                    audio.realtime.buffer_error.chunk_offset,
-                    audio.realtime.buffer_error.chunk_size,
-                },
-            ),
-            .timeline_error => switch (audio.realtime.timeline_state.failed) {
-                .query_failed => |failure| writeErrorMessage(
-                    &audio,
-                    "pw_stream_get_time_n failed with result {d}",
-                    .{failure.result},
-                ),
-                .invalid => |failure| writeErrorMessage(
-                    &audio,
-                    "PipeWire returned an unusable buffer timeline ({s}): " ++
-                        "graph_now={d}, rate={d}/{d}, graph_ticks={d}, " ++
-                        "buffer_time={d}, previous_buffer_ticks={d}, " ++
-                        "current_buffer_ticks={d}, block_samples={d}",
-                    .{
-                        @tagName(failure.code),
-                        failure.observation.graph_now_ns,
-                        failure.observation.graph_rate_num,
-                        failure.observation.graph_rate_denom,
-                        failure.observation.graph_ticks,
-                        failure.observation.buffer_cycle_ns,
-                        failure.observation.buffer_ticks_previous,
-                        failure.observation.buffer_ticks_current,
-                        failure.observation.block_samples_count,
-                    },
-                ),
-                .discontinuity => unreachable,
-            },
-            .timeline_discontinuity => if (audio.realtime.timeline_state == .failed) {
-                const timeline = audio.realtime.timeline_state.failed.discontinuity;
-                writeErrorMessage(
-                    &audio,
-                    "PipeWire buffer timeline advanced beyond received audio: " ++
-                        "rate={d}/{d}, previous_buffer_ticks={d}, " ++
-                        "current_buffer_ticks={d}, tick_delta={d}, " ++
-                        "block_samples={d}",
-                    .{
-                        timeline.graph_rate_num,
-                        timeline.graph_rate_denom,
-                        timeline.buffer_ticks_previous,
-                        timeline.buffer_ticks_current,
-                        timeline.buffer_ticks_current - timeline.buffer_ticks_previous,
-                        timeline.block_samples_count,
-                    },
-                );
-            } else {
-                writeErrorMessage(
-                    &audio,
-                    "PipeWire marked an audio timeline discontinuity: " ++
-                        "header_flags=0x{x}, sequence={d}, pts={d}",
-                    .{
-                        audio.realtime.buffer_error.header_flags,
-                        audio.realtime.buffer_error.header_sequence,
-                        audio.realtime.buffer_error.header_presentation_timestamp_ns,
-                    },
-                );
-            },
-            .buffer_return_error => writeErrorMessage(
-                &audio,
-                "pw_stream_queue_buffer failed with result {d}",
-                .{audio.realtime.queue_buffer_result},
-            ),
-            else => {},
-        }
-    }
-
-    const end: CaptureEnd = switch (outcome) {
-        .completed => .completed,
-        .automatic_stop => .automatic_stop,
-        .stopped => .stopped,
-        .cancelled => .cancelled,
-        else => .{ .failed = .{
-            .outcome = @enumFromInt(@intFromEnum(outcome)),
-            .detail = .{
-                .coordinate = .{
-                    .stage = @enumFromInt(@intFromEnum(runtime_error.stage)),
-                    .domain = @enumFromInt(@intFromEnum(runtime_error.domain)),
-                    .code = runtime_error.code,
-                },
-                .message = audio.error_message,
-                .message_size = audio.error_message_size,
-            },
-        } },
-    };
-    const teardown_failure: ?RuntimeFailure = if (audio.teardown_error.stage == .none)
-        null
-    else
-        .{
-            .coordinate = .{
-                .stage = @enumFromInt(@intFromEnum(audio.teardown_error.stage)),
-                .domain = @enumFromInt(@intFromEnum(audio.teardown_error.domain)),
-                .code = audio.teardown_error.code,
-            },
-            .message = audio.teardown_error_message,
-            .message_size = audio.teardown_error_message_size,
-        };
-    const source_identity: ?SourceIdentity = if (audio.source_identity.is_resolved == 1)
-        .{
-            .node_id = audio.source_identity.node_id,
-            .node_object_serial = audio.source_identity.node_object_serial,
-            .device_id = audio.source_identity.device_id,
-            .device_object_serial = audio.source_identity.device_object_serial,
-            .node_name = audio.source_identity.node_name,
-            .node_name_size = @intCast(audio.source_identity.node_name_size),
-            .node_description = audio.source_identity.node_description,
-            .node_description_size = @intCast(audio.source_identity.node_description_size),
-            .device_serial = audio.source_identity.device_serial,
-            .device_serial_size = @intCast(audio.source_identity.device_serial_size),
-            .device_description = audio.source_identity.device_description,
-            .device_description_size = @intCast(audio.source_identity.device_description_size),
-        }
-    else
-        null;
-    const memory_lock: MemoryLockResult = if (shared_memory_is_locked)
-        .{ .locked = memory_lock_limits.cur }
-    else
-        .{ .unavailable = .{
-            .error_code = shared_memory_lock_error_code,
-            .limit_bytes = memory_lock_limits.cur,
-        } };
-    const callback_metrics: ?CallbackMetrics = switch (audio.realtime.callback_state) {
-        .unobserved => null,
-        .observed => |metrics| metrics,
-    };
-    const callback: ?ReportCallback = if (callback_metrics) |metrics|
-        .{
-            .thread_id = metrics.thread_id,
-            .scheduler_policy = metrics.scheduler_policy,
-            .scheduler_priority = metrics.scheduler_priority,
-            .callbacks_count = metrics.callbacks_count,
-            .missing_buffers_count = metrics.missing_buffers_count,
-            .clipped_samples_count = metrics.clipped_samples_count,
-            .header_metadata_buffers_count = metrics.header_metadata_buffers_count,
-            .header_gap_buffers_count = metrics.header_gap_buffers_count,
-            .header_gap_samples_count = metrics.header_gap_samples_count,
-            .samples_range = metrics.samples_range,
-            .duration_ns_max = metrics.duration_ns_max,
-            .gap_ns_max = metrics.gap_ns_max,
-            .activity = audio.realtime.activity_detector.report(),
-        }
-    else
-        null;
-
-    const logical_report: Report = .{
-        .end = end,
-        .teardown_failure = teardown_failure,
-        .timeline_validation = timeline_validation,
-        .pipewire_headers_version = native_environment.headers_version,
-        .pipewire_headers_version_size = @intCast(
-            native_environment.headers_version_size,
-        ),
-        .pipewire_library_version = native_environment.library_version,
-        .pipewire_library_version_size = @intCast(
-            native_environment.library_version_size,
-        ),
-        .pipewire_server_version = audio.server_observer.version,
-        .pipewire_server_version_size = @intCast(
-            audio.server_observer.version_size,
-        ),
-        .source_identity = source_identity,
-        .negotiated_format = audio.negotiated_format,
-        .samples_count = audio.realtime.samples_count,
-        .published_samples_count = audio.realtime.published_samples_count,
-        .slot_publications_count = audio.realtime.publications_count,
-        .memory_lock = memory_lock,
-        .main_loop_thread_id = audio.realtime.main_loop_thread_id,
-        .callback = callback,
-    };
-
-    // Project the preconditions into a local assertion-only view. This does not
-    // cross the function boundary; it lets the detailed double-sided contracts
-    // below continue naming the raw observations while `Report` itself exposes
-    // only payload-shaped logical state.
-    const report = .{
-        .outcome = outcome,
-        .runtime_error = runtime_error,
-        .error_message = audio.error_message,
-        .error_message_size = audio.error_message_size,
-        .teardown_error = audio.teardown_error,
-        .teardown_error_message = audio.teardown_error_message,
-        .teardown_error_message_size = audio.teardown_error_message_size,
-        .timeline_validation = timeline_validation,
-        .pipewire_headers_version = native_environment.headers_version,
-        .pipewire_headers_version_size = native_environment.headers_version_size,
-        .pipewire_library_version = native_environment.library_version,
-        .pipewire_library_version_size = native_environment.library_version_size,
-        .pipewire_server_version = audio.server_observer.version,
-        .pipewire_server_version_size = audio.server_observer.version_size,
-        .source_identity = .{
-            .is_resolved = audio.source_identity.is_resolved == 1,
-            .node_id = audio.source_identity.node_id,
-            .node_name = audio.source_identity.node_name,
-            .node_name_size = audio.source_identity.node_name_size,
-            .node_description = audio.source_identity.node_description,
-            .node_description_size = audio.source_identity.node_description_size,
-            .device_serial = audio.source_identity.device_serial,
-            .device_serial_size = audio.source_identity.device_serial_size,
-            .device_description = audio.source_identity.device_description,
-            .device_description_size = audio.source_identity.device_description_size,
-        },
-        .negotiated_sample_rate_hz = if (audio.negotiated_format) |format|
-            format.sample_rate_hz
-        else
-            0,
-        .negotiated_channels_count = if (audio.negotiated_format) |format|
-            format.channels_count
-        else
-            0,
-        .samples_count = audio.realtime.samples_count,
-        .published_samples_count = audio.realtime.published_samples_count,
-        .slot_publications_count = audio.realtime.publications_count,
-        .shared_memory_is_locked = shared_memory_is_locked,
-        .shared_memory_lock_error_code = shared_memory_lock_error_code,
-        .shared_memory_lock_limit_bytes = memory_lock_limits.cur,
-        .main_loop_thread_id = audio.realtime.main_loop_thread_id,
-        .callback_thread_id = if (callback) |value| value.thread_id else 0,
-        .callbacks_count = if (callback_metrics) |metrics| metrics.callbacks_count else 0,
-        .missing_buffers_count = if (callback_metrics) |metrics| metrics.missing_buffers_count else 0,
-        .clipped_samples_count = if (callback_metrics) |metrics| metrics.clipped_samples_count else 0,
-        .header_metadata_buffers_count = if (callback_metrics) |metrics| metrics.header_metadata_buffers_count else 0,
-        .header_gap_buffers_count = if (callback_metrics) |metrics| metrics.header_gap_buffers_count else 0,
-        .header_gap_samples_count = if (callback_metrics) |metrics| metrics.header_gap_samples_count else 0,
-        .block_samples_count_min = if (callback) |value|
-            if (value.samples_range) |range| range.minimum else 0
-        else
-            0,
-        .block_samples_count_max = if (callback) |value|
-            if (value.samples_range) |range| range.maximum else 0
-        else
-            0,
-        .activity = audio.realtime.activity_detector.report(),
-    };
-    assert(setup_error.stage == .none);
-    assert(setup_error.domain == .none);
-    assert(setup_error.code == 0);
-    assert(setup_error.message_size == 0);
-    assert(setup_error.pipewire_version_size == 0);
-    assert(report.error_message_size <= report.error_message.len);
-    assert(report.teardown_error_message_size <= report.teardown_error_message.len);
-    assert(report.pipewire_headers_version_size > 0);
-    assert(report.pipewire_headers_version_size <=
-        report.pipewire_headers_version.len);
-    assert(report.pipewire_library_version_size > 0);
-    assert(report.pipewire_library_version_size <=
-        report.pipewire_library_version.len);
-    assert(report.pipewire_server_version_size <=
-        report.pipewire_server_version.len);
-    assert(report.source_identity.node_name_size <=
-        report.source_identity.node_name.len);
-    assert(report.source_identity.node_description_size <=
-        report.source_identity.node_description.len);
-    assert(report.source_identity.device_serial_size <=
-        report.source_identity.device_serial.len);
-    assert(report.source_identity.device_description_size <=
-        report.source_identity.device_description.len);
-    if (report.source_identity.is_resolved) {
-        assert(report.source_identity.node_id != pipewire.PW_ID_ANY);
-    } else {
-        assert(report.source_identity.node_id == pipewire.PW_ID_ANY);
-    }
-    if (configured_device_serial) |device_serial| {
-        if (report.samples_count > 0) {
-            assert(report.source_identity.is_resolved);
-            assert(report.source_identity.device_serial_size == device_serial.len);
-            assert(std.mem.eql(
-                u8,
-                report.source_identity.device_serial[0..report.source_identity.device_serial_size],
-                device_serial,
-            ));
-        }
-    }
-    assert(report.shared_memory_lock_limit_bytes == memory_lock_limits.cur);
-    if (report.shared_memory_is_locked) {
-        assert(report.shared_memory_lock_error_code == 0);
-    } else {
-        assert(report.shared_memory_lock_error_code > 0);
-    }
-    switch (report.timeline_validation) {
-        .header_only => {
-            assert(audio.realtime.timeline_state == .header_only);
-        },
-        .full => {},
-    }
-    switch (report.outcome) {
-        .completed, .automatic_stop, .stopped, .cancelled => {
-            assert(report.runtime_error.stage == .none);
-            assert(report.runtime_error.domain == .none);
-            assert(report.runtime_error.code == 0);
-            assert(report.error_message_size == 0);
-        },
-        .control_error => {
-            assert(report.runtime_error.stage == .supervisor_control);
-            assert(report.runtime_error.domain == .linux_errno or
-                report.runtime_error.domain == .voiced_audio);
-            assert(report.runtime_error.code > 0);
-            assert(report.error_message_size > 0);
-        },
-        .pipeline_full => {
-            assert(report.runtime_error.stage == .exchange_publication);
-            assert(report.runtime_error.domain == .voiced_audio);
-            assert(report.runtime_error.code == @intFromEnum(AudioErrorCode.exchange_full));
-            assert(report.error_message_size > 0);
-        },
-        .format_parse_error => {
-            assert(report.runtime_error.stage == .format_negotiation);
-            switch (report.runtime_error.domain) {
-                .voiced_audio => assert(report.runtime_error.code ==
-                    @intFromEnum(AudioErrorCode.format_parameter_removed)),
-                .boundary_validation => assert(report.runtime_error.code > 0),
-                .pipewire_result => assert(report.runtime_error.code < 0),
-                else => unreachable,
-            }
-            assert(report.error_message_size > 0);
-        },
-        .unexpected_format => {
-            assert(report.runtime_error.stage == .format_negotiation);
-            assert(report.runtime_error.domain == .voiced_audio);
-            assert(report.runtime_error.code == @intFromEnum(AudioErrorCode.unexpected_format));
-            assert(report.error_message_size > 0);
-        },
-        .buffer_configuration_error => {
-            assert(report.runtime_error.stage == .buffer_negotiation);
-            assert(report.runtime_error.domain == .pipewire_result);
-            assert(report.runtime_error.code < 0);
-            assert(report.error_message_size > 0);
-        },
-        .timeline_error => {
-            assert(report.runtime_error.stage == .timeline_continuity);
-            switch (report.runtime_error.domain) {
-                .pipewire_result => assert(report.runtime_error.code < 0),
-                .voiced_audio => {
-                    const timeline_error_code: TimelineErrorCode = @enumFromInt(
-                        @as(u32, @intCast(report.runtime_error.code)),
-                    );
-                    switch (timeline_error_code) {
-                        .invalid_rate,
-                        .invalid_graph_time,
-                        .buffer_from_future,
-                        .tick_underflow,
-                        .rate_changed,
-                        .ticks_regressed,
-                        => {},
-                        .none, .discontinuity => unreachable,
-                    }
-                },
-                else => unreachable,
-            }
-            assert(report.error_message_size > 0);
-        },
-        .timeline_discontinuity => {
-            assert(report.runtime_error.stage == .timeline_continuity);
-            switch (report.runtime_error.domain) {
-                .spa_buffer => assert(report.runtime_error.code ==
-                    @intFromEnum(BufferErrorCode.timeline_discontinuity)),
-                .voiced_audio => assert(report.runtime_error.code ==
-                    @intFromEnum(TimelineErrorCode.discontinuity)),
-                else => unreachable,
-            }
-            assert(report.error_message_size > 0);
-        },
-        .stream_error => {
-            switch (report.runtime_error.stage) {
-                .main_loop => {
-                    assert(report.runtime_error.domain == .pipewire_result);
-                    assert(report.runtime_error.code < 0);
-                },
-                .callback_event => {
-                    assert(report.runtime_error.domain == .linux_errno or
-                        report.runtime_error.domain == .voiced_audio);
-                    assert(report.runtime_error.code > 0);
-                },
-                .stream_state => {
-                    assert(report.runtime_error.domain == .pipewire_callback);
-                    assert(report.runtime_error.code == 0);
-                },
-                else => unreachable,
-            }
-            assert(report.error_message_size > 0);
-        },
-        .stream_disconnected => {
-            assert(report.runtime_error.stage == .stream_state);
-            assert(report.runtime_error.domain == .pipewire_callback);
-            assert(report.runtime_error.code == 0);
-            assert(report.error_message_size > 0);
-        },
-        .source_disconnected => {
-            assert(report.runtime_error.stage == .source_identity);
-            assert(report.runtime_error.domain == .voiced_audio);
-            assert(report.runtime_error.code ==
-                @intFromEnum(AudioErrorCode.source_link_removed) or
-                report.runtime_error.code ==
-                    @intFromEnum(AudioErrorCode.source_node_removed) or
-                report.runtime_error.code ==
-                    @intFromEnum(AudioErrorCode.source_device_removed));
-            assert(report.source_identity.is_resolved);
-            assert(report.error_message_size > 0);
-        },
-        .source_changed => {
-            assert(report.runtime_error.stage == .source_identity);
-            assert(report.runtime_error.domain == .voiced_audio);
-            assert(report.runtime_error.code ==
-                @intFromEnum(AudioErrorCode.source_changed));
-            assert(report.source_identity.is_resolved);
-            assert(report.error_message_size > 0);
-        },
-        .source_observation_error => {
-            assert(report.runtime_error.stage == .source_identity);
-            assert(report.runtime_error.domain == .boundary_validation or
-                report.runtime_error.domain == .pipewire_result);
-            if (report.runtime_error.domain == .boundary_validation) {
-                assert(report.runtime_error.code > 0);
-            } else {
-                assert(report.runtime_error.code < 0);
-            }
-            assert(report.error_message_size > 0);
-        },
-        .invalid_buffer => {
-            assert(report.runtime_error.stage == .buffer_metadata or
-                report.runtime_error.stage == .buffer_data or
-                report.runtime_error.stage == .sample_validation);
-            assert(report.runtime_error.domain == .spa_buffer);
-            assert(report.runtime_error.code > 0);
-            assert(report.error_message_size > 0);
-        },
-        .corrupted_buffer => {
-            assert(report.runtime_error.stage == .buffer_metadata or
-                report.runtime_error.stage == .buffer_data);
-            assert(report.runtime_error.domain == .spa_buffer);
-            assert(report.runtime_error.code ==
-                @intFromEnum(BufferErrorCode.header_corrupted) or
-                report.runtime_error.code ==
-                    @intFromEnum(BufferErrorCode.chunk_corrupted));
-            assert(report.error_message_size > 0);
-        },
-        .buffer_return_error => {
-            assert(report.runtime_error.stage == .buffer_return);
-            assert(report.runtime_error.domain == .pipewire_result);
-            assert(report.runtime_error.code < 0);
-            assert(report.error_message_size > 0);
-        },
-    }
-    if (report.teardown_error.stage == .none) {
-        assert(report.teardown_error.domain == .none);
-        assert(report.teardown_error.code == 0);
-        assert(report.teardown_error_message_size == 0);
-    } else {
-        assert(report.teardown_error.stage == .stream_disconnect);
-        assert(report.teardown_error.domain == .pipewire_result);
-        assert(report.teardown_error.code < 0);
-        assert(report.teardown_error_message_size > 0);
-    }
-    assert(report.main_loop_thread_id > 0);
-    assert(report.samples_count <=
-        launch.recording_samples_target + audio_exchange.callback_samples_count_max);
-    assert(report.published_samples_count <= report.samples_count);
-    assert(report.slot_publications_count <= report.published_samples_count);
-    assert(report.missing_buffers_count <= report.callbacks_count);
-    assert(report.clipped_samples_count <= report.samples_count);
-    assert(report.header_metadata_buffers_count <= report.callbacks_count);
-    assert(report.header_gap_buffers_count <= report.header_metadata_buffers_count);
-    assert(report.header_gap_samples_count <= report.samples_count);
-    assert(report.callbacks_count ==
-        audio_exchange.acquireAudioCallbacksCount(launch.exchange));
-    assert(report.samples_count ==
-        audio_exchange.acquireAudioSamplesCount(launch.exchange));
-    if (report.callbacks_count == 0) {
-        assert(report.callback_thread_id == 0);
-    } else {
-        assert(report.callback_thread_id > 0);
-    }
-    if (report.samples_count == 0) {
-        assert(report.published_samples_count == 0);
-        assert(report.slot_publications_count == 0);
-        assert(report.clipped_samples_count == 0);
-        assert(report.header_gap_samples_count == 0);
-        assert(report.block_samples_count_min == 0);
-        assert(report.block_samples_count_max == 0);
-    } else {
-        assert(report.source_identity.is_resolved);
-        assert(report.negotiated_sample_rate_hz == audio_exchange.sample_rate_hz);
-        assert(report.negotiated_channels_count == audio_exchange.channels_count);
-        assert(report.block_samples_count_min > 0);
-        assert(report.block_samples_count_min <= report.block_samples_count_max);
-        assert(report.block_samples_count_max <= audio_exchange.callback_samples_count_max);
-        assert(report.block_samples_count_max <= launch.slot_samples_boundary);
-    }
-    switch (report.outcome) {
-        .completed => {
-            assert(report.source_identity.is_resolved);
-            assert(report.samples_count >= launch.recording_samples_target);
-            assert(report.published_samples_count == report.samples_count);
-        },
-        .automatic_stop => {
-            assert(launch.automatic_stop == .after_quiet);
-            assert(report.source_identity.is_resolved);
-            assert(report.samples_count < launch.recording_samples_target);
-            assert(report.activity.active_samples_count > 0);
-            assert(report.activity.activity == .quiet);
-            assert(report.activity.activity_samples_count >=
-                audio_policy.automatic_stop_quiet_samples_count);
-            assert(report.samples_count - report.published_samples_count <=
-                audio_policy.automatic_stop_quiet_samples_count +
-                    audio_exchange.callback_samples_count_max);
-        },
-        .stopped => assert(report.published_samples_count == report.samples_count),
-        .cancelled => assert(report.samples_count - report.published_samples_count <=
-            launch.slot_samples_boundary),
-        else => assert(report.published_samples_count == report.samples_count),
-    }
-    if (report.published_samples_count == 0) {
-        assert(report.slot_publications_count == 0);
-    } else {
-        assert(report.slot_publications_count > 0);
-    }
-    return logical_report;
-}
-
-fn controlSocketEventReceived(
-    context: ?*anyopaque,
-    file_descriptor: c_int,
-    mask: u32,
-) callconv(.c) void {
-    assert(context != null);
-    const audio: *Audio = @ptrCast(@alignCast(context.?));
-    assert(file_descriptor == audio.control_socket);
-    assert(mask & (pipewire.SPA_IO_IN | pipewire.SPA_IO_ERR | pipewire.SPA_IO_HUP) != 0);
-
-    // Read the command before interpreting HUP: SOCK_SEQPACKET may report both
-    // when a final complete record was queued immediately before peer closure.
-    // `MSG_TRUNC` exposes the record's actual size, while `DONTWAIT` prevents a
-    // spurious readiness notification from ever blocking the PipeWire loop.
-    if (mask & pipewire.SPA_IO_IN != 0) {
-        var packet: ControlPacket = undefined;
-        while (true) {
-            const receive_result = linux.recvfrom(
-                file_descriptor,
-                std.mem.asBytes(&packet).ptr,
-                @sizeOf(ControlPacket),
-                linux.MSG.TRUNC | linux.MSG.DONTWAIT,
-                null,
-                null,
-            );
-            switch (linux.errno(receive_result)) {
-                .SUCCESS => {
-                    if (receive_result == 0) {
-                        if (claimMainLoopOutcome(audio, .control_error)) {
-                            recordRuntimeError(
-                                &audio.runtime_error,
-                                .supervisor_control,
-                                .voiced_audio,
-                                @intFromEnum(AudioErrorCode.control_socket_closed),
-                            );
-                            writeErrorMessage(
-                                audio,
-                                "supervisor control socket closed without a stop or cancel command",
-                                .{},
-                            );
-                        }
-                        _ = pipewire.pw_main_loop_quit(audio.main_loop);
-                        return;
-                    }
-
-                    // Both processes run the same executable and this packet is
-                    // trusted internal state. A wrong size, reserved value, or
-                    // command is a protocol defect—not hostile input to recover.
-                    assert(receive_result == @sizeOf(ControlPacket));
-                    assert(packet.reserved == 0);
-                    const requested_outcome: Outcome = switch (packet.command) {
-                        @intFromEnum(ControlCommand.stop) => .stopped,
-                        @intFromEnum(ControlCommand.cancel) => .cancelled,
-                        else => unreachable,
-                    };
-
-                    // Completion, a PipeWire failure, and supervisor control can
-                    // arrive together. The atomic terminal latch preserves the
-                    // first event. Only a winning control command closes the
-                    // source gate and quits the owner loop itself; a losing one
-                    // leaves the already-latched callback event to do so.
-                    if (claimMainLoopOutcome(audio, requested_outcome)) {
-                        audio.source_is_linked_atomic.store(false, .release);
-                        _ = pipewire.pw_main_loop_quit(audio.main_loop);
-                    }
-                    return;
-                },
-                .INTR => continue,
-                .AGAIN => break,
-                else => |receive_errno| {
-                    if (claimMainLoopOutcome(audio, .control_error)) {
-                        recordRuntimeError(
-                            &audio.runtime_error,
-                            .supervisor_control,
-                            .linux_errno,
-                            @intFromEnum(receive_errno),
-                        );
-                        writeErrorMessage(
-                            audio,
-                            "supervisor control receive failed: errno={s}",
-                            .{@tagName(receive_errno)},
-                        );
-                    }
-                    _ = pipewire.pw_main_loop_quit(audio.main_loop);
-                    return;
-                },
-            }
-        }
-    }
-
-    if (mask & (pipewire.SPA_IO_ERR | pipewire.SPA_IO_HUP) != 0) {
-        if (claimMainLoopOutcome(audio, .control_error)) {
-            recordRuntimeError(
-                &audio.runtime_error,
-                .supervisor_control,
-                .voiced_audio,
-                @intFromEnum(AudioErrorCode.control_socket_source_error),
-            );
-            writeErrorMessage(
-                audio,
-                "supervisor control socket failed: fd={d}, mask=0x{x}",
-                .{ file_descriptor, mask },
-            );
-        }
-        _ = pipewire.pw_main_loop_quit(audio.main_loop);
-    }
-}
-
-fn callbackEventReceived(
-    context: ?*anyopaque,
-    file_descriptor: c_int,
-    mask: u32,
-) callconv(.c) void {
-    assert(context != null);
-    const audio: *Audio = @ptrCast(@alignCast(context.?));
-
-    // The descriptor is bound to this callback when the source is registered;
-    // PipeWire may report operating HUP/ERR events, but it may not substitute a
-    // different descriptor for Voiced's callback context.
-    assert(file_descriptor == audio.callback_event_fd);
-    if (mask & (pipewire.SPA_IO_ERR | pipewire.SPA_IO_HUP) != 0) {
-        if (claimMainLoopOutcome(audio, .stream_error)) {
-            recordRuntimeError(
-                &audio.runtime_error,
-                .callback_event,
-                .voiced_audio,
-                @intFromEnum(AudioErrorCode.callback_event_source_error),
-            );
-            writeErrorMessage(
-                audio,
-                "callback event source failed: fd={d}, mask=0x{x}",
-                .{ file_descriptor, mask },
-            );
-        }
-        _ = pipewire.pw_main_loop_quit(audio.main_loop);
-        return;
-    }
-    assert(mask & pipewire.SPA_IO_IN != 0);
-
-    var signals_count: u64 = 0;
-    const signal_bytes = std.mem.asBytes(&signals_count);
-    while (true) {
-        const read_result = linux.read(file_descriptor, signal_bytes.ptr, signal_bytes.len);
-        const read_errno = linux.errno(read_result);
-        if (read_errno == .INTR) continue;
-        if (read_errno != .SUCCESS or read_result != signal_bytes.len) {
-            if (claimMainLoopOutcome(audio, .stream_error)) {
-                if (read_errno != .SUCCESS) {
-                    recordRuntimeError(
-                        &audio.runtime_error,
-                        .callback_event,
-                        .linux_errno,
-                        @intFromEnum(read_errno),
-                    );
-                } else {
-                    recordRuntimeError(
-                        &audio.runtime_error,
-                        .callback_event,
-                        .voiced_audio,
-                        @intFromEnum(AudioErrorCode.callback_event_short_read),
-                    );
-                }
-                writeErrorMessage(
-                    audio,
-                    "callback event read failed: errno={s}, raw_result=0x{x}, expected={d}",
-                    .{ @tagName(read_errno), read_result, signal_bytes.len },
-                );
-            }
-        }
-        break;
-    }
-
-    _ = pipewire.pw_main_loop_quit(audio.main_loop);
-}
-
-fn decodeSourceEvent(
-    event_value: u32,
-    previous_source_node_id: u32,
-    current_source_node_id: u32,
-    native_error: *const pipewire.voiced_audio_pipewire_error,
-) ?SourceEvent {
-    if (native_error.message_size > native_error.message.len) return null;
-    const has_no_native_error =
-        native_error.stage == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_NONE and
-        native_error.domain == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_NONE and
-        native_error.code == 0 and native_error.message_size == 0;
-
-    return switch (event_value) {
-        pipewire.VOICED_AUDIO_PIPEWIRE_SOURCE_EVENT_LINKED => if (has_no_native_error and
-            previous_source_node_id == pipewire.PW_ID_ANY and
-            current_source_node_id != pipewire.PW_ID_ANY)
-            .{ .linked = current_source_node_id }
-        else
-            null,
-        pipewire.VOICED_AUDIO_PIPEWIRE_SOURCE_EVENT_LINK_REMOVED => if (has_no_native_error and
-            previous_source_node_id != pipewire.PW_ID_ANY and
-            current_source_node_id == pipewire.PW_ID_ANY)
-            .{ .link_removed = previous_source_node_id }
-        else
-            null,
-        pipewire.VOICED_AUDIO_PIPEWIRE_SOURCE_EVENT_NODE_REMOVED => if (has_no_native_error and
-            previous_source_node_id != pipewire.PW_ID_ANY and
-            current_source_node_id == pipewire.PW_ID_ANY)
-            .{ .node_removed = previous_source_node_id }
-        else
-            null,
-        pipewire.VOICED_AUDIO_PIPEWIRE_SOURCE_EVENT_DEVICE_REMOVED => if (has_no_native_error and
-            previous_source_node_id != pipewire.PW_ID_ANY and
-            current_source_node_id == pipewire.PW_ID_ANY)
-            .{ .device_removed = previous_source_node_id }
-        else
-            null,
-        pipewire.VOICED_AUDIO_PIPEWIRE_SOURCE_EVENT_CHANGED => if (has_no_native_error and
-            previous_source_node_id != pipewire.PW_ID_ANY and
-            current_source_node_id != pipewire.PW_ID_ANY and
-            current_source_node_id != previous_source_node_id)
-            .{ .changed = .{
-                .previous_node_id = previous_source_node_id,
-                .current_node_id = current_source_node_id,
-            } }
-        else
-            null,
-        pipewire.VOICED_AUDIO_PIPEWIRE_SOURCE_EVENT_OBSERVATION_ERROR => error_event: {
-            if (native_error.stage !=
-                pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_CAPTURE_SOURCE_OBSERVATION)
-            {
-                break :error_event null;
-            }
-            const domain: ErrorDomain = switch (native_error.domain) {
-                pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_PIPEWIRE_RESULT => if (native_error.code < 0) .pipewire_result else break :error_event null,
-                pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_BOUNDARY_VALIDATION => if (native_error.code > 0) .boundary_validation else break :error_event null,
-                else => break :error_event null,
-            };
-            if (native_error.message_size == 0) break :error_event null;
-            break :error_event .{ .observation_error = .{
-                .domain = domain,
-                .code = native_error.code,
-                .message = native_error.message[0..native_error.message_size],
-            } };
-        },
-        else => null,
-    };
-}
-
-fn sourceEventReceived(
-    context: ?*anyopaque,
-    event_value: u32,
-    previous_source_node_id: u32,
-    current_source_node_id: u32,
-    native_error: [*c]const pipewire.voiced_audio_pipewire_error,
-) callconv(.c) void {
-    assert(context != null);
-    assert(native_error != null);
-    const audio: *Audio = @ptrCast(@alignCast(context.?));
-    const source_event = decodeSourceEvent(
-        event_value,
-        previous_source_node_id,
-        current_source_node_id,
-        native_error,
-    ) orelse {
-        audio.source_is_linked_atomic.store(false, .release);
-        if (claimMainLoopOutcome(audio, .source_observation_error)) {
-            recordRuntimeError(
-                &audio.runtime_error,
-                .source_identity,
-                .boundary_validation,
-                @intFromEnum(AudioErrorCode.malformed_source_event),
-            );
-            writeErrorMessage(
-                audio,
-                "PipeWire source observer returned malformed event={d}, previous_node={d}, current_node={d}",
-                .{ event_value, previous_source_node_id, current_source_node_id },
-            );
-        }
-        _ = pipewire.pw_main_loop_quit(audio.main_loop);
-        return;
-    };
-
-    // The first incoming Link is the authorization boundary for sample copying,
-    // not merely a diagnostic discovered after capture. Registry observation
-    // was installed before connect, so release-opening this gate means C has
-    // locked the stream node to one concrete source node. If another terminal
-    // callback won first, leave the gate closed and retain that earlier cause.
-    if (source_event == .linked) {
-        assert(native_error.*.stage == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_NONE);
-        assert(native_error.*.domain == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_NONE);
-        assert(native_error.*.code == 0);
-        assert(native_error.*.message_size == 0);
-        assert(previous_source_node_id == pipewire.PW_ID_ANY);
-        assert(current_source_node_id != pipewire.PW_ID_ANY);
-        if (audio.realtime.terminal_outcome_atomic.load(.acquire) == .none) {
-            assert(!audio.source_is_linked_atomic.load(.acquire));
-            audio.source_is_linked_atomic.store(true, .release);
-            assert(audio.source_is_linked_atomic.load(.acquire));
-        }
-        return;
-    }
-
-    // A Link removal may be followed immediately by a new default-source Link.
-    // Close the realtime gate before recording the event so no callback that
-    // starts afterward can copy from the replacement. The current callback may
-    // still finish a buffer borrowed from the original graph; stream teardown
-    // and the first-wins terminal latch contain that bounded overlap.
-    audio.source_is_linked_atomic.store(false, .release);
-    const outcome: Outcome = switch (source_event) {
-        .link_removed, .node_removed, .device_removed => .source_disconnected,
-        .changed => .source_changed,
-        .observation_error => .source_observation_error,
-        .linked => unreachable,
-    };
-    if (claimMainLoopOutcome(audio, outcome)) {
-        switch (source_event) {
-            .link_removed => |node_id| {
-                recordRuntimeError(
-                    &audio.runtime_error,
-                    .source_identity,
-                    .voiced_audio,
-                    @intFromEnum(AudioErrorCode.source_link_removed),
-                );
-                writeErrorMessage(
-                    audio,
-                    "the Link from PipeWire source node {d} disappeared",
-                    .{node_id},
-                );
-            },
-            .node_removed => |node_id| {
-                recordRuntimeError(
-                    &audio.runtime_error,
-                    .source_identity,
-                    .voiced_audio,
-                    @intFromEnum(AudioErrorCode.source_node_removed),
-                );
-                writeErrorMessage(
-                    audio,
-                    "PipeWire source node {d} disappeared",
-                    .{node_id},
-                );
-            },
-            .device_removed => |node_id| {
-                recordRuntimeError(
-                    &audio.runtime_error,
-                    .source_identity,
-                    .voiced_audio,
-                    @intFromEnum(AudioErrorCode.source_device_removed),
-                );
-                writeErrorMessage(
-                    audio,
-                    "the Device behind PipeWire source node {d} disappeared",
-                    .{node_id},
-                );
-            },
-            .changed => |change| {
-                recordRuntimeError(
-                    &audio.runtime_error,
-                    .source_identity,
-                    .voiced_audio,
-                    @intFromEnum(AudioErrorCode.source_changed),
-                );
-                writeErrorMessage(
-                    audio,
-                    "PipeWire replaced source node {d} with source node {d}",
-                    .{ change.previous_node_id, change.current_node_id },
-                );
-            },
-            .observation_error => |observation_error| {
-                recordRuntimeError(
-                    &audio.runtime_error,
-                    .source_identity,
-                    observation_error.domain,
-                    observation_error.code,
-                );
-                writeErrorMessage(
-                    audio,
-                    "PipeWire source observation failed: {s}",
-                    .{observation_error.message},
-                );
-            },
-            .linked => unreachable,
-        }
-    }
-
-    assert(!audio.source_is_linked_atomic.load(.acquire));
-    assert(audio.realtime.terminal_outcome_atomic.load(.acquire) != .none);
-    _ = pipewire.pw_main_loop_quit(audio.main_loop);
-}
-
-fn streamStateChanged(
-    context: ?*anyopaque,
-    old_state: pipewire.pw_stream_state,
-    new_state: pipewire.pw_stream_state,
-    native_error: [*c]const pipewire.voiced_audio_pipewire_error,
-) callconv(.c) void {
-    assert(context != null);
-    assert(native_error != null);
-    assert(native_error.*.code == 0);
-    assert(native_error.*.message_size <= native_error.*.message.len);
-
-    if (native_error.*.stage == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_CAPTURE_STREAM_STATE) {
-        assert(native_error.*.domain == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_PIPEWIRE_CALLBACK);
-    } else {
-        assert(native_error.*.stage == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_NONE);
-        assert(native_error.*.domain == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_NONE);
-        assert(native_error.*.message_size == 0);
-    }
-    const audio: *Audio = @ptrCast(@alignCast(context.?));
-
-    // `CONNECTING`, `PAUSED`, and even `STREAMING` describe PipeWire's graph
-    // state; none proves that a Format or process buffer will arrive. They are
-    // deliberately nonterminal here and must be paired with the supervisor's
-    // setup/progress deadlines rather than promoted to a ready acknowledgement.
-    if (new_state == pipewire.PW_STREAM_STATE_ERROR) {
-        audio.source_is_linked_atomic.store(false, .release);
-        audio.negotiated_format_is_accepted_atomic.store(false, .release);
-        if (claimMainLoopOutcome(audio, .stream_error)) {
-            recordRuntimeError(
-                &audio.runtime_error,
-                .stream_state,
-                .pipewire_callback,
-                native_error.*.code,
-            );
-            if (native_error.*.message_size == 0) {
-                writeErrorMessage(audio, "PipeWire entered ERROR without a diagnostic", .{});
-            } else {
-                copyNativeErrorMessage(audio, native_error);
-            }
-        }
-        assert(!audio.negotiated_format_is_accepted_atomic.load(.acquire));
-        assert(audio.realtime.terminal_outcome_atomic.load(.acquire) != .none);
-        _ = pipewire.pw_main_loop_quit(audio.main_loop);
-        return;
-    }
-
-    if (new_state == pipewire.PW_STREAM_STATE_UNCONNECTED and
-        old_state != pipewire.PW_STREAM_STATE_UNCONNECTED and
-        audio.stream == .live)
-    {
-        audio.source_is_linked_atomic.store(false, .release);
-        audio.negotiated_format_is_accepted_atomic.store(false, .release);
-        if (claimMainLoopOutcome(audio, .stream_disconnected)) {
-            recordRuntimeError(
-                &audio.runtime_error,
-                .stream_state,
-                .pipewire_callback,
-                native_error.*.code,
-            );
-            if (native_error.*.message_size == 0) {
-                writeErrorMessage(
-                    audio,
-                    "PipeWire became UNCONNECTED without a diagnostic",
-                    .{},
-                );
-            } else {
-                copyNativeErrorMessage(audio, native_error);
-            }
-        }
-        assert(!audio.negotiated_format_is_accepted_atomic.load(.acquire));
-        assert(audio.realtime.terminal_outcome_atomic.load(.acquire) != .none);
-        _ = pipewire.pw_main_loop_quit(audio.main_loop);
-    }
-}
-
-fn streamFormatChanged(
-    context: ?*anyopaque,
-    parameter_id: u32,
-    parameter: ?*const pipewire.spa_pod,
-) callconv(.c) void {
-    assert(context != null);
-    const audio: *Audio = @ptrCast(@alignCast(context.?));
-
-    if (parameter_id != pipewire.SPA_PARAM_Format) {
-        return;
-    }
-
-    // `pw_stream_disconnect` clears the stream's Format by delivering a null
-    // parameter. Capture has already stopped and the accepted format remains
-    // the one that governed every published sample, so this teardown event must
-    // not replace the realtime callback's completed outcome with a format error.
-    if (audio.stream == .disconnecting or audio.stream == .destroyed) {
-        return;
-    }
-
-    // Every runtime Format event replaces the authorization established by the
-    // previous one. Close that gate before inspecting the new pod; only a fully
-    // parsed float32/16 kHz/mono format below may reopen it. A callback already
-    // in flight still owns a buffer negotiated under the preceding format, but
-    // subsequent callbacks cannot copy through stale acceptance.
-    const previous_format_was_accepted =
-        audio.negotiated_format_is_accepted_atomic.load(.acquire);
-    audio.negotiated_format_is_accepted_atomic.store(false, .release);
-
-    if (parameter == null) {
-        // PipeWire 0.3.48 begins initial negotiation with a null Format event
-        // before publishing the selected pod. No capture contract exists yet
-        // for that event to revoke, so remain closed and wait for the pod. If
-        // none arrives, the supervisor's setup deadline reports the stalled
-        // negotiation. A null event after acceptance is different: the stream
-        // has removed the format governing live buffers, so capture must stop.
-        if (!previous_format_was_accepted) {
-            assert(!audio.negotiated_format_is_accepted_atomic.load(.acquire));
-            return;
-        }
-
-        if (claimMainLoopOutcome(audio, .format_parse_error)) {
-            recordRuntimeError(
-                &audio.runtime_error,
-                .format_negotiation,
-                .voiced_audio,
-                @intFromEnum(AudioErrorCode.format_parameter_removed),
-            );
-            writeErrorMessage(audio, "PipeWire removed the negotiated Format parameter", .{});
-        }
-        assert(!audio.negotiated_format_is_accepted_atomic.load(.acquire));
-        assert(audio.realtime.terminal_outcome_atomic.load(.acquire) != .none);
-        _ = pipewire.pw_main_loop_quit(audio.main_loop);
-        return;
-    }
-
-    var negotiated_format: pipewire.spa_audio_info_raw = undefined;
-    var native_error: pipewire.voiced_audio_pipewire_error = undefined;
-    if (!pipewire.voiced_audio_pipewire_parse_negotiated_format(
-        parameter,
-        &negotiated_format,
-        &native_error,
-    )) {
-        assert(native_error.stage ==
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_CAPTURE_FORMAT_PARSE);
-        assert(native_error.domain ==
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_BOUNDARY_VALIDATION or
-            native_error.domain ==
-                pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_PIPEWIRE_RESULT);
-        assert(native_error.message_size > 0);
-        assert(native_error.message_size <= native_error.message.len);
-        if (claimMainLoopOutcome(audio, .format_parse_error)) {
-            const error_domain: ErrorDomain = switch (native_error.domain) {
-                pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_BOUNDARY_VALIDATION => .boundary_validation,
-                pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_PIPEWIRE_RESULT => .pipewire_result,
-                else => unreachable,
-            };
-            recordRuntimeError(
-                &audio.runtime_error,
-                .format_negotiation,
-                error_domain,
-                native_error.code,
-            );
-            writeErrorMessage(
-                audio,
-                "PipeWire returned an invalid raw-audio Format pod: {s}",
-                .{native_error.message[0..native_error.message_size]},
-            );
-        }
-        assert(!audio.negotiated_format_is_accepted_atomic.load(.acquire));
-        assert(audio.realtime.terminal_outcome_atomic.load(.acquire) != .none);
-        _ = pipewire.pw_main_loop_quit(audio.main_loop);
-        return;
-    }
-    assert(native_error.stage == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_NONE);
-    assert(native_error.domain == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_NONE);
-    assert(native_error.code == 0);
-    assert(native_error.message_size == 0);
-
-    if (negotiated_format.format != pipewire.SPA_AUDIO_FORMAT_F32 or
-        negotiated_format.rate != audio_exchange.sample_rate_hz or
-        negotiated_format.channels != audio_exchange.channels_count or
-        negotiated_format.position[0] != pipewire.SPA_AUDIO_CHANNEL_MONO)
-    {
-        if (claimMainLoopOutcome(audio, .unexpected_format)) {
-            recordRuntimeError(
-                &audio.runtime_error,
-                .format_negotiation,
-                .voiced_audio,
-                @intFromEnum(AudioErrorCode.unexpected_format),
-            );
-            writeErrorMessage(
-                audio,
-                "PipeWire negotiated format={d}, rate={d}, channels={d}, position={d}; " ++
-                    "Voiced requires native float32, 16000 Hz, one MONO-positioned channel",
-                .{
-                    negotiated_format.format,
-                    negotiated_format.rate,
-                    negotiated_format.channels,
-                    negotiated_format.position[0],
-                },
-            );
-        }
-        assert(!audio.negotiated_format_is_accepted_atomic.load(.acquire));
-        assert(audio.realtime.terminal_outcome_atomic.load(.acquire) != .none);
-        _ = pipewire.pw_main_loop_quit(audio.main_loop);
-        return;
-    }
-
-    // Buffer negotiation follows format negotiation. Ask PipeWire to attach a
-    // complete SPA Header before opening the format gate. When supplied, it
-    // carries authoritative gap, corruption, and discontinuity flags. PipeWire
-    // may omit this requested metadata, so per-buffer graph-clock validation in
-    // the process callback independently detects lost timeline intervals. This
-    // update runs synchronously inside the asynchronous Format callback and uses
-    // the same fixed error-output contract as setup operations.
-    assert(audio.stream == .live);
-    const buffer_configuration_result =
-        pipewire.voiced_audio_pipewire_capture_stream_configure_buffers(
-            audio.stream.pointer().?,
-            audio_exchange.callback_samples_count_max,
-            &native_error,
-        );
-    if (buffer_configuration_result < 0) {
-        assert(native_error.stage ==
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_CAPTURE_BUFFERS_CONFIGURE);
-        assert(native_error.domain ==
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_PIPEWIRE_RESULT);
-        assert(native_error.code == buffer_configuration_result);
-        assert(native_error.message_size > 0);
-        assert(native_error.message_size <= native_error.message.len);
-        if (claimMainLoopOutcome(audio, .buffer_configuration_error)) {
-            recordRuntimeError(
-                &audio.runtime_error,
-                .buffer_negotiation,
-                .pipewire_result,
-                native_error.code,
-            );
-            writeErrorMessage(
-                audio,
-                "PipeWire rejected bounded audio-buffer and SPA Header negotiation " ++
-                    "with result {d}: {s}",
-                .{
-                    buffer_configuration_result,
-                    native_error.message[0..native_error.message_size],
-                },
-            );
-        }
-        assert(!audio.negotiated_format_is_accepted_atomic.load(.acquire));
-        assert(audio.realtime.terminal_outcome_atomic.load(.acquire) != .none);
-        _ = pipewire.pw_main_loop_quit(audio.main_loop);
-        return;
-    }
-    assert(native_error.stage == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_NONE);
-    assert(native_error.domain == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_NONE);
-    assert(native_error.code == 0);
-    assert(native_error.message_size == 0);
-
-    // Publish the complete accepted format last. The realtime callback's
-    // acquire-load prevents it from observing acceptance before the format and
-    // metadata requirements above are complete.
-    audio.negotiated_format = .{
-        .sample_rate_hz = negotiated_format.rate,
-        .channels_count = negotiated_format.channels,
-    };
-    audio.negotiated_format_is_accepted_atomic.store(true, .release);
-    assert(audio.negotiated_format.?.sample_rate_hz == audio_exchange.sample_rate_hz);
-    assert(audio.negotiated_format.?.channels_count == audio_exchange.channels_count);
-    assert(audio.negotiated_format_is_accepted_atomic.load(.acquire));
-}
-
-fn decodeCaptureGate(encoded: i32) CaptureGate {
-    return switch (encoded) {
-        capture_gate_preparing => .preparing,
-        capture_gate_ready => .ready,
-        else => {
-            assert(encoded < 0);
-            return .{ .early_buffer_return_failed = encoded };
-        },
-    };
-}
-
-fn processAudio(context: ?*anyopaque) callconv(.c) void {
-    assert(context != null);
-    const audio: *Audio = @ptrCast(@alignCast(context.?));
-    const realtime = &audio.realtime;
-    assert(realtime.exchange.version == audio_exchange.format_version);
-    assert(realtime.exchange.session_id > 0);
-    assert(realtime.recording_samples_target > 0);
-    assert(realtime.slot_samples_boundary >= audio_exchange.callback_samples_count_max);
-
-    // `pw_stream_connect` is callback-capable before source/server observation
-    // has completed on every supported runtime. Such an early invocation is not
-    // evidence of a usable capture session and must not contradict a subsequent
-    // setup-failure report by publishing the shared heartbeat.
-    switch (decodeCaptureGate(realtime.capture_gate_atomic.load(.acquire))) {
-        .ready => {},
-        .early_buffer_return_failed => return,
-        .preparing => {
-            const stream = realtime.stream orelse unreachable;
-            const early_buffer = pipewire.pw_stream_dequeue_buffer(stream) orelse return;
-            const queue_result = pipewire.pw_stream_queue_buffer(stream, early_buffer);
-            if (queue_result >= 0) return;
-
-            const preparing_gate = realtime.capture_gate_atomic.cmpxchgStrong(
-                capture_gate_preparing,
-                queue_result,
-                .acq_rel,
-                .acquire,
-            );
-            if (preparing_gate) |encoded_gate| {
-                const gate = decodeCaptureGate(encoded_gate);
-                if (gate == .ready) {
-                    realtime.queue_buffer_result = queue_result;
-                    publishRealtimeOutcome(realtime, .buffer_return_error);
-                } else {
-                    assert(gate == .early_buffer_return_failed);
-                }
-            }
-            return;
-        },
-    }
-
-    const callback_started_ns = monotonicNanoseconds();
-    if (realtime.callback_state == .unobserved) {
-        var metrics: CallbackMetrics = .{
-            .thread_id = linux.gettid(),
-            .scheduler_policy = null,
-            .scheduler_priority = null,
-            .started_ns_previous = callback_started_ns,
-            .samples_range = null,
-            .callbacks_count = 0,
-            .missing_buffers_count = 0,
-            .clipped_samples_count = 0,
-            .header_metadata_buffers_count = 0,
-            .header_gap_buffers_count = 0,
-            .header_gap_samples_count = 0,
-            .duration_ns_max = 0,
-            .gap_ns_max = 0,
-        };
-        const scheduler_policy_result = linux.sched_getscheduler(0);
-        if (linux.errno(scheduler_policy_result) == .SUCCESS) {
-            // PipeWire's realtime module adds `SCHED_RESET_ON_FORK` to the
-            // scheduler result. That bit controls inheritance rather than
-            // scheduling behavior, so retain only the mode for stable reporting
-            // and policy decisions.
-            const scheduler: linux.SCHED = @bitCast(
-                @as(i32, @intCast(scheduler_policy_result)),
-            );
-            metrics.scheduler_policy = @intFromEnum(scheduler.mode);
-        }
-
-        var scheduler_parameters: linux.sched_param = undefined;
-        const scheduler_parameters_result = linux.sched_getparam(0, &scheduler_parameters);
-        if (linux.errno(scheduler_parameters_result) == .SUCCESS) {
-            metrics.scheduler_priority = scheduler_parameters.priority;
-        }
-        realtime.callback_state = .{ .observed = metrics };
-    }
-
-    const callback = &realtime.callback_state.observed;
-    if (callback.callbacks_count > 0) {
-        callback.gap_ns_max = @max(
-            callback.gap_ns_max,
-            callback_started_ns -| callback.started_ns_previous,
-        );
-        callback.started_ns_previous = callback_started_ns;
-    }
-    callback.callbacks_count += 1;
-    defer {
-        const callback_duration_ns = monotonicNanoseconds() -| callback_started_ns;
-        callback.duration_ns_max = @max(callback.duration_ns_max, callback_duration_ns);
-    }
-
-    // Publish liveness before dequeueing. Even a callback that finds no buffer
-    // proves that PipeWire's data path is scheduling this worker; sample access
-    // remains governed separately by each slot's publication state.
-    audio_exchange.publishAudioCallbacksCount(
-        realtime.exchange,
-        callback.callbacks_count,
-    );
-
-    const stream = realtime.stream orelse unreachable;
-    const pipewire_buffer = pipewire.pw_stream_dequeue_buffer(stream) orelse {
-        callback.missing_buffers_count += 1;
-        return;
-    };
-
-    // Publishing a terminal result wakes the main-loop thread, but it cannot
-    // synchronously prevent PipeWire from scheduling another process callback.
-    // Completion and pipeline pressure both publish the active slot and leave
-    // no producer-owned destination, so processing another block would reach an
-    // impossible-state trap. Once a result is latched, only return any buffer
-    // PipeWire still lends us; the first terminal callback remains authoritative.
-    if (realtime.terminal_outcome_atomic.load(.acquire) != .none) {
-        _ = pipewire.pw_stream_queue_buffer(stream, pipewire_buffer);
-        return;
-    }
-
-    // Registry observation opens this gate only after identifying the first
-    // concrete source Link and closes it before reporting removal or replacement.
-    // Return any buffer borrowed outside that authorization window: PipeWire
-    // buffers contain samples but no source identity, so copying first and
-    // diagnosing the graph later could silently mix microphones.
-    if (!realtime.source_is_linked_atomic.load(.acquire)) {
-        const queue_result = pipewire.pw_stream_queue_buffer(stream, pipewire_buffer);
-        if (queue_result < 0) {
-            realtime.queue_buffer_result = queue_result;
-            publishRealtimeOutcome(realtime, .buffer_return_error);
-        }
-        return;
-    }
-
-    // A Format callback closes this gate before rejecting or replacing the
-    // negotiated layout. PipeWire can still lend one buffer while that main-
-    // loop callback and this data-thread callback overlap. Return it untouched:
-    // treating the short authorization gap as malformed audio would turn a
-    // harmless repeated Format event into a terminal capture buffer_error.
-    if (!realtime.negotiated_format_is_accepted_atomic.load(.acquire)) {
-        const queue_result = pipewire.pw_stream_queue_buffer(stream, pipewire_buffer);
-        if (queue_result < 0) {
-            realtime.queue_buffer_result = queue_result;
-            publishRealtimeOutcome(realtime, .buffer_return_error);
-        }
-        return;
-    }
-
-    var terminal_outcome: TerminalOutcome = .none;
-    const block = validatePipeWireBuffer(realtime, pipewire_buffer) catch |buffer_error| block: {
-        terminal_outcome = switch (buffer_error) {
-            error.InvalidBuffer => .invalid_buffer,
-            error.CorruptedBuffer => .corrupted_buffer,
-            error.TimelineDiscontinuity => .timeline_discontinuity,
-        };
-        break :block ValidatedAudioBlock.empty;
-    };
-
-    const block_samples_count = block.samplesCount();
-    if (block_samples_count > 0) {
-        switch (realtime.timeline_state) {
-            .header_only => {},
-            .full_initial, .full_tracking => validateBufferTimeline(
-                realtime,
-                stream,
-                pipewire_buffer,
-                block_samples_count,
-            ) catch |timeline_error| {
-                terminal_outcome = switch (timeline_error) {
-                    error.TimelineError => .timeline_error,
-                    error.TimelineDiscontinuity => .timeline_discontinuity,
-                };
-            },
-            .failed => unreachable,
-        }
-        if (terminal_outcome == .none) {
-            terminal_outcome = publishCompleteBlock(realtime, block);
-        }
-    }
-
-    // A borrowed buffer must return to PipeWire before the callback wakes the
-    // main loop. Waking first would allow stream teardown to race this queue.
-    const queue_result = pipewire.pw_stream_queue_buffer(stream, pipewire_buffer);
-    if (queue_result < 0) {
-        realtime.queue_buffer_result = queue_result;
-        terminal_outcome = .buffer_return_error;
-    }
-
-    if (terminal_outcome != .none) {
-        // The terminal publisher must win the shared latch before exposing its
-        // final slot. In particular, a concurrent cancel may already own the
-        // outcome and requires this callback's private partial slot to remain
-        // unpublished. `publishRealtimeOutcome` performs that atomic decision,
-        // publishes only for a winning callback, and wakes the main loop last.
-        publishRealtimeOutcome(realtime, terminal_outcome);
-    }
-}
-
-fn validatePipeWireBuffer(
-    realtime: *RealtimeCapture,
-    pipewire_buffer: *pipewire.pw_buffer,
-) error{ InvalidBuffer, CorruptedBuffer, TimelineDiscontinuity }!ValidatedAudioBlock {
-    assert(realtime.negotiated_format_is_accepted_atomic.load(.acquire));
-    assert(realtime.slot_samples_boundary >= audio_exchange.callback_samples_count_max);
-
-    var buffer_error = BufferError{
-        .reason = .none,
-        .data_planes_count = 0,
-        .data_flags = 0,
-        .data_max_size = 0,
-        .metadata_count = 0,
-        .metadata_size = 0,
-        .header_flags = 0,
-        .header_sequence = 0,
-        .header_presentation_timestamp_ns = 0,
-        .chunk_offset = 0,
-        .chunk_size = 0,
-        .chunk_stride = 0,
-        .invalid_sample_index = 0,
-    };
-
-    const buffer = pipewire_buffer.*.buffer orelse {
-        buffer_error.reason = .missing_spa_buffer;
-        realtime.buffer_error = buffer_error;
-        return error.InvalidBuffer;
-    };
-
-    // ParamMeta is a request, not a guarantee. PipeWire 1.0.5 accepted Voiced's
-    // Header proposal yet omitted metadata on a valid audio-converter stream, so
-    // absence cannot make otherwise usable microphone audio fail. When a Header
-    // is present, however, its array, size, alignment, and flags remain external
-    // input and are validated before any field controls capture policy. The
-    // report counts accepted Headers so this capability gap stays observable.
-    const metadata_count_max: u32 = 16;
-    buffer_error.metadata_count = buffer.*.n_metas;
-    if (buffer.*.n_metas > metadata_count_max) {
-        buffer_error.reason = .metadata_count_exceeds_realtime_limit;
-        realtime.buffer_error = buffer_error;
-        return error.InvalidBuffer;
-    }
-    if (buffer.*.n_metas > 0 and buffer.*.metas == null) {
-        buffer_error.reason = .missing_metadata_array;
-        realtime.buffer_error = buffer_error;
-        return error.InvalidBuffer;
-    }
-
-    var header_optional: ?*const pipewire.spa_meta_header = null;
-    for (0..buffer.*.n_metas) |metadata_index| {
-        const metadata = &buffer.*.metas[metadata_index];
-        if (metadata.*.type != pipewire.SPA_META_Header) continue;
-        if (header_optional != null) {
-            buffer_error.reason = .duplicate_header_metadata;
-            realtime.buffer_error = buffer_error;
-            return error.InvalidBuffer;
-        }
-
-        buffer_error.metadata_size = metadata.*.size;
-        if (metadata.*.size < @sizeOf(pipewire.spa_meta_header)) {
-            buffer_error.reason = .undersized_header_metadata;
-            realtime.buffer_error = buffer_error;
-            return error.InvalidBuffer;
-        }
-        if (metadata.*.data == null) {
-            buffer_error.reason = .missing_header_metadata_data;
-            realtime.buffer_error = buffer_error;
-            return error.InvalidBuffer;
-        }
-        if (@intFromPtr(metadata.*.data) % @alignOf(pipewire.spa_meta_header) != 0) {
-            buffer_error.reason = .misaligned_header_metadata_data;
-            realtime.buffer_error = buffer_error;
-            return error.InvalidBuffer;
-        }
-        header_optional = @ptrCast(@alignCast(metadata.*.data.?));
-    }
-
-    var header_marks_silence = false;
-    if (header_optional) |header| {
-        buffer_error.header_flags = header.*.flags;
-        buffer_error.header_sequence = header.*.seq;
-        buffer_error.header_presentation_timestamp_ns = header.*.pts;
-
-        // Known flags that matter to encoded media (MARKER, HEADER, and
-        // DELTA_UNIT) are harmless for raw float32 audio. Unknown future bits
-        // cannot silently acquire policy; GAP, CORRUPTED, and DISCONT are the
-        // three flags with explicit behavior below.
-        const header_flags_known: u32 = pipewire.SPA_META_HEADER_FLAG_DISCONT |
-            pipewire.SPA_META_HEADER_FLAG_CORRUPTED |
-            pipewire.SPA_META_HEADER_FLAG_MARKER |
-            pipewire.SPA_META_HEADER_FLAG_HEADER |
-            pipewire.SPA_META_HEADER_FLAG_GAP |
-            pipewire.SPA_META_HEADER_FLAG_DELTA_UNIT;
-        if (header.*.flags & ~header_flags_known != 0) {
-            buffer_error.reason = .unsupported_header_flags;
-            realtime.buffer_error = buffer_error;
-            return error.InvalidBuffer;
-        }
-
-        realtime.callback_state.observed.header_metadata_buffers_count += 1;
-        realtime.buffer_error = buffer_error;
-        if (header.*.flags & pipewire.SPA_META_HEADER_FLAG_CORRUPTED != 0) {
-            buffer_error.reason = .header_corrupted;
-            realtime.buffer_error = buffer_error;
-            return error.CorruptedBuffer;
-        }
-        if (header.*.flags & pipewire.SPA_META_HEADER_FLAG_DISCONT != 0) {
-            // DISCONT identifies an unknown interval, but does not say how many
-            // samples disappeared. Inventing zeroes would create a plausible but
-            // false timeline, so retain the valid prefix and stop this capture.
-            buffer_error.reason = .timeline_discontinuity;
-            realtime.buffer_error = buffer_error;
-            return error.TimelineDiscontinuity;
-        }
-        header_marks_silence =
-            header.*.flags & pipewire.SPA_META_HEADER_FLAG_GAP != 0;
-    }
-
-    buffer_error.data_planes_count = buffer.*.n_datas;
-    if (buffer.*.n_datas != 1) {
-        buffer_error.reason = .unexpected_data_planes;
-        realtime.buffer_error = buffer_error;
-        return error.InvalidBuffer;
-    }
-    if (buffer.*.datas == null) {
-        buffer_error.reason = .missing_data_planes;
-        realtime.buffer_error = buffer_error;
-        return error.InvalidBuffer;
-    }
-
-    const data = &buffer.*.datas[0];
-    buffer_error.data_flags = data.*.flags;
-    buffer_error.data_max_size = data.*.maxsize;
-    if (data.*.chunk == null) {
-        buffer_error.reason = .missing_chunk;
-        realtime.buffer_error = buffer_error;
-        return error.InvalidBuffer;
-    }
-
-    const chunk = data.*.chunk.?;
-    buffer_error.chunk_offset = chunk.*.offset;
-    buffer_error.chunk_size = chunk.*.size;
-    buffer_error.chunk_stride = chunk.*.stride;
-
-    if (chunk.*.flags & pipewire.SPA_CHUNK_FLAG_CORRUPTED != 0) {
-        buffer_error.reason = .chunk_corrupted;
-        realtime.buffer_error = buffer_error;
-        return error.CorruptedBuffer;
-    }
-    if (data.*.maxsize == 0) {
-        buffer_error.reason = .empty_data_capacity;
-        realtime.buffer_error = buffer_error;
-        return error.InvalidBuffer;
-    }
-    // PipeWire 0.3.48's audio adapter leaves the per-chunk stride at zero even
-    // after accepting our four-byte ParamBuffers stride. That zero means the
-    // producer did not restate a dynamic stride; the negotiated packed mono F32
-    // format still defines one contiguous four-byte sample per frame. Accept
-    // either representation, but reject any contradictory nonzero stride.
-    if (chunk.*.stride != 0 and chunk.*.stride != @sizeOf(f32)) {
-        buffer_error.reason = .invalid_stride;
-        realtime.buffer_error = buffer_error;
-        return error.InvalidBuffer;
-    }
-
-    // SPA defines the readable region as `offset mod maxsize` and clamps its
-    // size to `maxsize`. The region may cross the allocation's end, so the
-    // callback returns two borrowed byte slices rather than manufacturing one
-    // out-of-bounds slice.
-    const available_size = @min(chunk.*.size, data.*.maxsize);
-    if (available_size % @sizeOf(f32) != 0) {
-        buffer_error.reason = .incomplete_sample;
-        realtime.buffer_error = buffer_error;
-        return error.InvalidBuffer;
-    }
-    if (chunk.*.offset % @alignOf(f32) != 0) {
-        buffer_error.reason = .misaligned_sample_offset;
-        realtime.buffer_error = buffer_error;
-        return error.InvalidBuffer;
-    }
-
-    const samples_count = available_size / @sizeOf(f32);
-    if (samples_count > audio_exchange.callback_samples_count_max) {
-        buffer_error.reason = .block_exceeds_realtime_limit;
-        realtime.buffer_error = buffer_error;
-        return error.InvalidBuffer;
-    }
-
-    // Both SPA Header GAP and chunk EMPTY mean that this block's represented
-    // duration contains media-neutral audio. Unlike DISCONT, the chunk still
-    // states exactly how many samples occupy that interval, so writing the same
-    // number of zeroes preserves the recording timeline without reading a
-    // payload that PipeWire is permitted to omit. Corruption deliberately took
-    // precedence over both silence signals.
-    if (header_marks_silence or
-        chunk.*.flags & pipewire.VOICED_AUDIO_PIPEWIRE_CHUNK_FLAG_EMPTY != 0)
-    {
-        realtime.buffer_error = buffer_error;
-        if (samples_count == 0) return .empty;
-        return .{ .silence = .{
-            .samples_count = @intCast(samples_count),
-            .header_marked_gap = header_marks_silence,
-        } };
-    }
-    if (data.*.data == null) {
-        buffer_error.reason = .missing_mapped_data;
-        realtime.buffer_error = buffer_error;
-        return error.InvalidBuffer;
-    }
-    if (data.*.flags & pipewire.SPA_DATA_FLAG_READABLE == 0) {
-        buffer_error.reason = .unreadable_data;
-        realtime.buffer_error = buffer_error;
-        return error.InvalidBuffer;
-    }
-
-    const source_offset = chunk.*.offset % data.*.maxsize;
-    const first_size = @min(available_size, data.*.maxsize - source_offset);
-    const second_size = available_size - first_size;
-    const source: [*]const u8 = @ptrCast(data.*.data.?);
-
-    // Retain the successful structural metadata too. Content validation runs
-    // after the bytes reach aligned owned memory; if it finds NaN or infinity,
-    // its diagnostic must describe the actual PipeWire plane and chunk rather
-    // than the zero-initialized error record from process startup.
-    realtime.buffer_error = buffer_error;
-    if (samples_count == 0) return .empty;
-    return .{ .samples = .{
-        .first_bytes = source[source_offset..][0..first_size],
-        .second_bytes = source[0..second_size],
-    } };
-}
-
-fn validateBufferTimeline(
-    realtime: *RealtimeCapture,
-    stream: *pipewire.pw_stream,
-    pipewire_buffer: *const pipewire.pw_buffer,
-    block_samples_count: u32,
-) error{ TimelineError, TimelineDiscontinuity }!void {
-    assert(realtime.timeline_state == .full_initial or
-        realtime.timeline_state == .full_tracking);
-    assert(block_samples_count > 0);
-    assert(block_samples_count <= audio_exchange.callback_samples_count_max);
-    if (realtime.timeline_state == .full_tracking) {
-        const previous = realtime.timeline_state.full_tracking;
-        assert(previous.graph_rate_num > 0);
-        assert(previous.graph_rate_denom > 0);
-    }
-
-    // SPA Header metadata is optional in practice. In full mode, the C boundary
-    // safely reads the versioned PipeWire fields that bind this dequeued buffer
-    // to one graph cycle. Their documented relationship lets an overloaded
-    // main-loop consumer recover the buffer's own tick even when newer graph
-    // cycles and buffers are already queued behind it.
-    var observation: TimelineObservation = std.mem.zeroes(TimelineObservation);
-    observation.block_samples_count = block_samples_count;
-
-    var timeline: pipewire.voiced_audio_pipewire_timeline = undefined;
-    var native_error: pipewire.voiced_audio_pipewire_error = undefined;
-    if (!pipewire.voiced_audio_pipewire_capture_buffer_timeline(
-        stream,
-        pipewire_buffer,
-        pipewire.VOICED_AUDIO_PIPEWIRE_TIMELINE_VALIDATION_FULL,
-        &timeline,
-        &native_error,
-    )) {
-        assert(native_error.stage ==
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_CAPTURE_TIMELINE_QUERY);
-        assert(native_error.domain ==
-            pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_PIPEWIRE_RESULT);
-        assert(native_error.code < 0);
-        assert(native_error.message_size > 0);
-        assert(native_error.message_size <= native_error.message.len);
-        realtime.timeline_state = .{ .failed = .{ .query_failed = .{
-            .result = native_error.code,
-            .block_samples_count = block_samples_count,
-        } } };
-        return error.TimelineError;
-    }
-    assert(native_error.stage == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_NONE);
-    assert(native_error.domain == pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_NONE);
-    assert(native_error.code == 0);
-    assert(native_error.message_size == 0);
-
-    observation.graph_now_ns = timeline.graph_now_ns;
-    observation.graph_rate_num = timeline.graph_rate_num;
-    observation.graph_rate_denom = timeline.graph_rate_denom;
-    observation.graph_ticks = timeline.graph_ticks;
-    observation.buffer_cycle_ns = timeline.buffer_cycle_ns;
-    if (timeline.graph_rate_num == 0 or timeline.graph_rate_denom == 0) {
-        realtime.timeline_state = .{ .failed = .{ .invalid = .{
-            .code = .invalid_rate,
-            .observation = observation,
-        } } };
-        return error.TimelineError;
-    }
-    if (timeline.graph_now_ns < 0) {
-        realtime.timeline_state = .{ .failed = .{ .invalid = .{
-            .code = .invalid_graph_time,
-            .observation = observation,
-        } } };
-        return error.TimelineError;
-    }
-
-    const graph_now_ns: u64 = @intCast(timeline.graph_now_ns);
-    if (timeline.buffer_cycle_ns > graph_now_ns) {
-        realtime.timeline_state = .{ .failed = .{ .invalid = .{
-            .code = .buffer_from_future,
-            .observation = observation,
-        } } };
-        return error.TimelineError;
-    }
-
-    // Convert the nanoseconds between this buffer and the latest graph report
-    // back into graph ticks using the formula documented for `pw_time`. Round to
-    // the nearest tick: hardware clock timestamps can drift by fractions of a
-    // graph sample even though the graph tick counter itself remains integral.
-    const elapsed_ns = graph_now_ns - timeline.buffer_cycle_ns;
-    const elapsed_ticks_numerator =
-        @as(u128, elapsed_ns) * @as(u128, timeline.graph_rate_denom);
-    const elapsed_ticks_denominator =
-        @as(u128, timeline.graph_rate_num) * @as(u128, std.time.ns_per_s);
-    const elapsed_ticks = (elapsed_ticks_numerator + elapsed_ticks_denominator / 2) /
-        elapsed_ticks_denominator;
-    if (elapsed_ticks > timeline.graph_ticks) {
-        realtime.timeline_state = .{ .failed = .{ .invalid = .{
-            .code = .tick_underflow,
-            .observation = observation,
-        } } };
-        return error.TimelineError;
-    }
-    const buffer_ticks = timeline.graph_ticks - @as(u64, @intCast(elapsed_ticks));
-    observation.buffer_ticks_current = buffer_ticks;
-
-    if (realtime.timeline_state == .full_initial) {
-        realtime.timeline_state = .{ .full_tracking = .{
-            .buffer_ticks = buffer_ticks,
-            .graph_rate_num = timeline.graph_rate_num,
-            .graph_rate_denom = timeline.graph_rate_denom,
-        } };
-        assert(realtime.timeline_state.full_tracking.buffer_ticks == buffer_ticks);
-        return;
-    }
-    const previous = realtime.timeline_state.full_tracking;
-    observation.buffer_ticks_previous = previous.buffer_ticks;
-    assert(previous.graph_rate_num > 0);
-    assert(previous.graph_rate_denom > 0);
-
-    if (timeline.graph_rate_num != previous.graph_rate_num or
-        timeline.graph_rate_denom != previous.graph_rate_denom)
-    {
-        realtime.timeline_state = .{ .failed = .{ .invalid = .{
-            .code = .rate_changed,
-            .observation = observation,
-        } } };
-        return error.TimelineError;
-    }
-    if (buffer_ticks < previous.buffer_ticks) {
-        realtime.timeline_state = .{ .failed = .{ .invalid = .{
-            .code = .ticks_regressed,
-            .observation = observation,
-        } } };
-        return error.TimelineError;
-    }
-
-    // Compare durations without floating point. The left side is the elapsed
-    // graph duration scaled by Voiced's 16 kHz output rate; the right side is
-    // this block's duration scaled by the graph rate denominator. One output
-    // sample covers the resampler's integral rounding.
-    //
-    // `pw_buffer.time` names the graph cycle that queued the buffer, not the
-    // first sample carried by it. Under load, PipeWire may legitimately combine
-    // two ready graph quanta into one dequeued block: its sample duration then
-    // exceeds the time since the preceding buffer even though no audio was
-    // duplicated. Reject only the opposite relation, where graph time advanced
-    // farther than the received samples can cover. Header `DISCONT` remains the
-    // authoritative signal for discontinuities that this one-sided fallback
-    // cannot prove.
-    const buffer_ticks_delta = buffer_ticks - previous.buffer_ticks;
-    const graph_duration_scaled = @as(u128, buffer_ticks_delta) *
-        @as(u128, timeline.graph_rate_num) *
-        @as(u128, audio_exchange.sample_rate_hz);
-    const block_duration_scaled = @as(u128, block_samples_count) *
-        @as(u128, timeline.graph_rate_denom);
-    const one_output_sample_tolerance = @as(u128, timeline.graph_rate_denom);
-    if (graph_duration_scaled >
-        block_duration_scaled + one_output_sample_tolerance)
-    {
-        realtime.timeline_state = .{ .failed = .{
-            .discontinuity = observation,
-        } };
-        return error.TimelineDiscontinuity;
-    }
-
-    realtime.timeline_state = .{ .full_tracking = .{
-        .buffer_ticks = buffer_ticks,
-        .graph_rate_num = timeline.graph_rate_num,
-        .graph_rate_denom = timeline.graph_rate_denom,
-    } };
-
-    assert(realtime.timeline_state.full_tracking.buffer_ticks >= previous.buffer_ticks);
-    assert(realtime.timeline_state.full_tracking.graph_rate_num == timeline.graph_rate_num);
-    assert(realtime.timeline_state.full_tracking.graph_rate_denom == timeline.graph_rate_denom);
-}
-
 fn publishCompleteBlock(
     realtime: *RealtimeCapture,
     block: ValidatedAudioBlock,
@@ -3551,16 +759,9 @@ fn publishCompleteBlock(
         .empty => unreachable,
         .silence => @memset(destination_samples, 0),
         .samples => |samples| {
-            // PipeWire lends normalized native F32 bytes, while the shared
-            // exchange retains signed 16-bit PCM. Validate and quantize directly
-            // into the private slot: a separate float block would add callback
-            // scratch and another complete memory pass. The activity detector
-            // consumes the same int16 destination after the block is complete.
-            //
-            // Float32 also permits NaN, infinity, and enormous finite values.
-            // Reject non-finite input; clamp ordinary overdrive before conversion
-            // and count it for diagnostics. No written sample becomes visible to
-            // another process until the slot's count is release-published.
+            // Retain normalized Float32 samples in the private shared slot.
+            // Clamp overdrive and count it before release-publication; the
+            // activity detector consumes exactly the retained samples.
             var destination_index: usize = 0;
             var block_clipped_samples_count: u32 = 0;
             for ([_][]const u8{ samples.first_bytes, samples.second_bytes }) |source_bytes| {
@@ -3572,8 +773,6 @@ fn publishCompleteBlock(
                         source_bytes[source_offset..][0..@sizeOf(f32)],
                     );
                     if (!std.math.isFinite(sample)) {
-                        realtime.buffer_error.reason = .non_finite_sample;
-                        realtime.buffer_error.invalid_sample_index = @intCast(destination_index);
                         return .invalid_buffer;
                     }
                     if (sample > 1.0) {
@@ -3734,170 +933,6 @@ fn abandonUnpublishedActiveSlot(realtime: *RealtimeCapture) void {
     assert(realtime.published_samples_count <= realtime.samples_count);
 }
 
-fn publishRealtimeOutcome(
-    realtime: *RealtimeCapture,
-    outcome: TerminalOutcome,
-) void {
-    assert(outcome != .none);
-    assert(realtime.runtime_error.stage == .none);
-    assert(realtime.runtime_error.domain == .none);
-    assert(realtime.runtime_error.code == 0);
-
-    // The realtime callback cannot format text or allocate, so it publishes one
-    // bounded numeric error beside the terminal outcome. The main-loop thread
-    // turns callback-owned buffer details into prose only after stream teardown.
-    switch (outcome) {
-        .completed, .automatic_stop => {},
-        .pipeline_full => recordRuntimeError(
-            &realtime.runtime_error,
-            .exchange_publication,
-            .voiced_audio,
-            @intFromEnum(AudioErrorCode.exchange_full),
-        ),
-        .invalid_buffer => {
-            const error_stage: RuntimeErrorStage = switch (realtime.buffer_error.reason) {
-                .none,
-                .header_corrupted,
-                .timeline_discontinuity,
-                .chunk_corrupted,
-                => unreachable,
-                .metadata_count_exceeds_realtime_limit,
-                .missing_metadata_array,
-                .duplicate_header_metadata,
-                .undersized_header_metadata,
-                .missing_header_metadata_data,
-                .misaligned_header_metadata_data,
-                .unsupported_header_flags,
-                => .buffer_metadata,
-                .missing_spa_buffer,
-                .unexpected_data_planes,
-                .missing_data_planes,
-                .missing_chunk,
-                .missing_mapped_data,
-                .unreadable_data,
-                .empty_data_capacity,
-                .invalid_stride,
-                .incomplete_sample,
-                .misaligned_sample_offset,
-                .block_exceeds_realtime_limit,
-                => .buffer_data,
-                .non_finite_sample => .sample_validation,
-            };
-            recordRuntimeError(
-                &realtime.runtime_error,
-                error_stage,
-                .spa_buffer,
-                @intFromEnum(realtime.buffer_error.reason),
-            );
-        },
-        .corrupted_buffer => {
-            const error_stage: RuntimeErrorStage = switch (realtime.buffer_error.reason) {
-                .header_corrupted => .buffer_metadata,
-                .chunk_corrupted => .buffer_data,
-                else => unreachable,
-            };
-            recordRuntimeError(
-                &realtime.runtime_error,
-                error_stage,
-                .spa_buffer,
-                @intFromEnum(realtime.buffer_error.reason),
-            );
-        },
-        .timeline_error => switch (realtime.timeline_state.failed) {
-            .query_failed => |failure| recordRuntimeError(
-                &realtime.runtime_error,
-                .timeline_continuity,
-                .pipewire_result,
-                failure.result,
-            ),
-            .invalid => |failure| recordRuntimeError(
-                &realtime.runtime_error,
-                .timeline_continuity,
-                .voiced_audio,
-                @intFromEnum(failure.code),
-            ),
-            .discontinuity => unreachable,
-        },
-        .timeline_discontinuity => {
-            if (realtime.timeline_state == .failed) {
-                assert(realtime.timeline_state.failed == .discontinuity);
-                recordRuntimeError(
-                    &realtime.runtime_error,
-                    .timeline_continuity,
-                    .voiced_audio,
-                    @intFromEnum(TimelineErrorCode.discontinuity),
-                );
-            } else {
-                assert(realtime.buffer_error.reason == .timeline_discontinuity);
-                recordRuntimeError(
-                    &realtime.runtime_error,
-                    .timeline_continuity,
-                    .spa_buffer,
-                    @intFromEnum(realtime.buffer_error.reason),
-                );
-            }
-        },
-        .buffer_return_error => {
-            assert(realtime.queue_buffer_result < 0);
-            recordRuntimeError(
-                &realtime.runtime_error,
-                .buffer_return,
-                .pipewire_result,
-                realtime.queue_buffer_result,
-            );
-        },
-        .stopped,
-        .cancelled,
-        .control_error,
-        .format_parse_error,
-        .unexpected_format,
-        .buffer_configuration_error,
-        .stream_error,
-        .stream_disconnected,
-        .source_disconnected,
-        .source_changed,
-        .source_observation_error,
-        => unreachable,
-        .none => unreachable,
-    }
-
-    const outcome_previous = realtime.terminal_outcome_atomic.cmpxchgStrong(
-        .none,
-        outcome,
-        .release,
-        .monotonic,
-    );
-    if (outcome_previous != null) {
-        assert(outcome_previous.? != .none);
-        assert(realtime.terminal_outcome_atomic.load(.acquire) != .none);
-        return;
-    }
-    assert(realtime.terminal_outcome_atomic.load(.acquire) == outcome);
-    if (outcome == .completed or outcome == .automatic_stop) {
-        assert(realtime.runtime_error.stage == .none);
-        assert(realtime.runtime_error.domain == .none);
-        assert(realtime.runtime_error.code == 0);
-    } else {
-        assert(realtime.runtime_error.stage != .none);
-        assert(realtime.runtime_error.domain != .none);
-    }
-
-    // Winning the latch establishes this callback as the terminal owner. Normal
-    // completion publishes its complete callback-block prefix. Automatic stop
-    // does the same unless a natural boundary already published the utterance;
-    // in that case the current private slot contains only the additional quiet
-    // needed to confirm the stop and must never become a Whisper chunk.
-    if (outcome == .automatic_stop and
-        realtime.automatic_stop_confirmation_tail_is_private)
-    {
-        abandonUnpublishedActiveSlot(realtime);
-    } else {
-        publishActiveSlotIfNonEmpty(realtime);
-    }
-
-    writeEventCounter(realtime.callback_event_fd);
-}
-
 fn writeEventCounter(event_fd: std.posix.fd_t) void {
     assert(event_fd >= 0);
 
@@ -3928,188 +963,6 @@ fn writeEventCounter(event_fd: std.posix.fd_t) void {
     }
 }
 
-fn claimMainLoopOutcome(audio: *Audio, outcome: Outcome) bool {
-    // PipeWire dispatches state, format, graph, and eventfd callbacks on the loop
-    // thread while processAudio may finish concurrently on the data thread.
-    // All terminal paths compete through this one atomic latch, so a teardown
-    // notification cannot rewrite an earlier completion or error merely
-    // because its callback ran last.
-    const terminal_outcome: TerminalOutcome = switch (outcome) {
-        .completed => .completed,
-        .automatic_stop => .automatic_stop,
-        .stopped => .stopped,
-        .cancelled => .cancelled,
-        .control_error => .control_error,
-        .pipeline_full => .pipeline_full,
-        .format_parse_error => .format_parse_error,
-        .unexpected_format => .unexpected_format,
-        .buffer_configuration_error => .buffer_configuration_error,
-        .timeline_error => .timeline_error,
-        .timeline_discontinuity => .timeline_discontinuity,
-        .stream_error => .stream_error,
-        .stream_disconnected => .stream_disconnected,
-        .source_disconnected => .source_disconnected,
-        .source_changed => .source_changed,
-        .source_observation_error => .source_observation_error,
-        .invalid_buffer => .invalid_buffer,
-        .corrupted_buffer => .corrupted_buffer,
-        .buffer_return_error => .buffer_return_error,
-    };
-    const outcome_previous = audio.realtime.terminal_outcome_atomic.cmpxchgStrong(
-        .none,
-        terminal_outcome,
-        .release,
-        .monotonic,
-    );
-    const outcome_was_claimed = outcome_previous == null;
-    if (outcome_was_claimed) {
-        assert(audio.realtime.terminal_outcome_atomic.load(.acquire) == terminal_outcome);
-    } else {
-        assert(outcome_previous.? != .none);
-        assert(audio.realtime.terminal_outcome_atomic.load(.acquire) != .none);
-    }
-    return outcome_was_claimed;
-}
-
-fn recordRuntimeError(
-    runtime_error: *RuntimeError,
-    stage: RuntimeErrorStage,
-    domain: ErrorDomain,
-    code: i64,
-) void {
-    assert(runtime_error.stage == .none);
-    assert(runtime_error.domain == .none);
-    assert(runtime_error.code == 0);
-    assert(stage != .none);
-    assert(domain != .none);
-
-    runtime_error.* = .{
-        .stage = stage,
-        .domain = domain,
-        .code = code,
-    };
-
-    assert(runtime_error.stage == stage);
-    assert(runtime_error.domain == domain);
-    assert(runtime_error.code == code);
-}
-
-fn recordSetupError(
-    setup_error: *SetupError,
-    stage: SetupErrorStage,
-    domain: ErrorDomain,
-    code: i64,
-    native_message: []const u8,
-    comptime detail_format: []const u8,
-    detail_arguments: anytype,
-) void {
-    assert(setup_error.stage == .none);
-    assert(setup_error.domain == .none);
-    assert(stage != .none);
-    assert(domain != .none);
-    assert(native_message.len <= pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_MESSAGE_CAPACITY);
-
-    var detail_buffer: [setup_error_message_capacity]u8 = undefined;
-    const detail = std.fmt.bufPrint(
-        &detail_buffer,
-        detail_format,
-        detail_arguments,
-    ) catch @panic("audio setup detail exceeded its fixed buffer");
-    const message = if (native_message.len == 0)
-        std.fmt.bufPrint(
-            &setup_error.message,
-            "{s}",
-            .{detail},
-        ) catch @panic("audio setup diagnostic exceeded its fixed buffer")
-    else
-        std.fmt.bufPrint(
-            &setup_error.message,
-            "{s}; native code {d}: {s}",
-            .{ detail, code, native_message },
-        ) catch @panic("audio setup diagnostic exceeded its fixed buffer");
-
-    const pipewire_version_pointer = pipewire.pw_get_library_version();
-    assert(pipewire_version_pointer != null);
-    const pipewire_version = std.mem.span(pipewire_version_pointer);
-    const pipewire_version_size = @min(
-        pipewire_version.len,
-        setup_error.pipewire_version.len,
-    );
-    @memcpy(
-        setup_error.pipewire_version[0..pipewire_version_size],
-        pipewire_version[0..pipewire_version_size],
-    );
-
-    setup_error.stage = stage;
-    setup_error.domain = domain;
-    setup_error.code = code;
-    setup_error.message_size = @intCast(message.len);
-    setup_error.pipewire_version_size = @intCast(pipewire_version_size);
-
-    assert(setup_error.message_size > 0);
-    assert(setup_error.message_size <= setup_error.message.len);
-    assert(setup_error.pipewire_version_size > 0);
-    assert(setup_error.pipewire_version_size <= setup_error.pipewire_version.len);
-}
-
-fn copyNativeErrorMessage(
-    audio: *Audio,
-    native_error: [*c]const pipewire.voiced_audio_pipewire_error,
-) void {
-    // The C callback adapter has already copied PipeWire's borrowed string into
-    // this bounded value. Zig copies it once more because the adapter's value is
-    // stack-local to the callback, while `Audio` must retain the diagnostic until
-    // stream teardown completes and the worker constructs its final report.
-    assert(native_error != null);
-    assert(native_error.*.stage ==
-        pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_STAGE_CAPTURE_STREAM_STATE);
-    assert(native_error.*.domain ==
-        pipewire.VOICED_AUDIO_PIPEWIRE_ERROR_DOMAIN_PIPEWIRE_CALLBACK);
-    assert(native_error.*.code == 0);
-    assert(native_error.*.message_size > 0);
-    assert(native_error.*.message_size <= native_error.*.message.len);
-    assert(native_error.*.message_size <= audio.error_message.len);
-
-    const message_size = native_error.*.message_size;
-    @memcpy(
-        audio.error_message[0..message_size],
-        native_error.*.message[0..message_size],
-    );
-    audio.error_message_size = @intCast(message_size);
-    assert(audio.error_message_size > 0);
-    assert(audio.error_message_size <= audio.error_message.len);
-}
-
-fn writeErrorMessage(
-    audio: *Audio,
-    comptime format: []const u8,
-    arguments: anytype,
-) void {
-    const message = std.fmt.bufPrint(
-        &audio.error_message,
-        format,
-        arguments,
-    ) catch @panic("audio diagnostic exceeded its fixed buffer");
-    audio.error_message_size = @intCast(message.len);
-    assert(audio.error_message_size > 0);
-    assert(audio.error_message_size <= audio.error_message.len);
-}
-
-fn writeTeardownErrorMessage(
-    audio: *Audio,
-    comptime format: []const u8,
-    arguments: anytype,
-) void {
-    const message = std.fmt.bufPrint(
-        &audio.teardown_error_message,
-        format,
-        arguments,
-    ) catch @panic("audio teardown diagnostic exceeded its fixed buffer");
-    audio.teardown_error_message_size = @intCast(message.len);
-    assert(audio.teardown_error_message_size > 0);
-    assert(audio.teardown_error_message_size <= audio.teardown_error_message.len);
-}
-
 fn monotonicNanoseconds() u64 {
     var timestamp: linux.timespec = undefined;
     const result = linux.clock_gettime(.MONOTONIC, &timestamp);
@@ -4120,55 +973,6 @@ fn monotonicNanoseconds() u64 {
     return @as(u64, @intCast(timestamp.sec)) * std.time.ns_per_s +
         @as(u64, @intCast(timestamp.nsec));
 }
-
-fn closeFileDescriptor(file_descriptor: std.posix.fd_t) void {
-    assert(file_descriptor >= 0);
-    const result = linux.close(file_descriptor);
-    assert(linux.errno(result) == .SUCCESS);
-}
-
-fn configuredSourceResolutionIsValid(
-    resolution: *const pipewire.voiced_audio_pipewire_source_resolution,
-    expected_device_serial: []const u8,
-) bool {
-    if (resolution.reserved != 0) return false;
-    if (resolution.sources_count > source_catalog_capacity) return false;
-    if (resolution.matches_count > resolution.sources_count) return false;
-
-    for (resolution.sources[0..resolution.sources_count]) |source| {
-        if (source.is_resolved != 1) return false;
-        if (source.node_name_size > source.node_name.len) return false;
-        if (source.node_description_size > source.node_description.len) return false;
-        if (source.device_serial_size > source.device_serial.len) return false;
-        if (source.device_description_size > source.device_description.len) return false;
-    }
-
-    return switch (resolution.status) {
-        pipewire.VOICED_AUDIO_PIPEWIRE_SOURCE_RESOLUTION_NOT_FOUND => resolution.matches_count == 0,
-        pipewire.VOICED_AUDIO_PIPEWIRE_SOURCE_RESOLUTION_AMBIGUOUS => resolution.matches_count > 1,
-        pipewire.VOICED_AUDIO_PIPEWIRE_SOURCE_RESOLUTION_RESOLVED => resolved: {
-            const source = &resolution.resolved_source;
-            if (resolution.matches_count != 1) break :resolved false;
-            if (source.is_resolved != 1) break :resolved false;
-            if (source.node_name_size == 0 or
-                source.node_name_size >= source.node_name.len)
-            {
-                break :resolved false;
-            }
-            if (source.node_name[source.node_name_size] != 0) break :resolved false;
-            if (source.device_serial_size != expected_device_serial.len) {
-                break :resolved false;
-            }
-            break :resolved std.mem.eql(
-                u8,
-                source.device_serial[0..source.device_serial_size],
-                expected_device_serial,
-            );
-        },
-        else => false,
-    };
-}
-
 pub fn schedulerPolicyName(policy: i32) []const u8 {
     const name = switch (policy) {
         @intFromEnum(linux.SCHED.Mode.FIFO) => "FIFO",
