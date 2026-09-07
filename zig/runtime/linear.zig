@@ -376,49 +376,7 @@ inline fn projectOutputBlocksWithLayout(comptime rows_count: usize, comptime out
         },
     }
 
-    const weight_layout = weight.layout();
-    var accumulators: [rows_count][output_blocks_count]I32x8 = undefined;
-    inline for (0..output_blocks_count) |block_offset| {
-        const output_begin = (output_block_begin + block_offset) * output_rows_per_block;
-        const compensation: I32x8 = weight.compensation[output_begin..][0..output_rows_per_block].*;
-        inline for (0..rows_count) |tile_row| {
-            accumulators[tile_row][block_offset] = compensation;
-        }
-    }
-
-    var depth_begin: usize = 0;
-    while (depth_begin < weight.input_values_count) : (depth_begin += depth_values_per_group) {
-
-        // PERFORMANCE: One-row tiles let LLVM fold the weight load into VNNI,
-        // rather than spending a separate instruction and YMM register on it.
-        // Fourteen output accumulators hide dot-product latency. Multi-row tiles
-        // instead pin each weight in a register and reuse it across rows;
-        // folding those loads would reread a weight for every activation row.
-        if (rows_count == 1) {
-            const activation_bytes = quantized_rows[depth_begin..][0..depth_values_per_group].*;
-            const activations: I32x8 = @splat(@as(i32, @bitCast(activation_bytes)));
-            inline for (0..output_blocks_count) |block_offset| {
-                const packed_block_index = output_block_begin + block_offset;
-                const packed_offset = weight_layout.groupOffset(packed_block_index, depth_begin);
-                const weights = weight.values[packed_offset..][0..bytes_per_weight_group];
-                accumulators[0][block_offset] = dotUnsignedSignedBytesFromMemory(accumulators[0][block_offset], activations, weights);
-            }
-        } else {
-            var weights: [output_blocks_count]I8x32 = undefined;
-            inline for (0..output_blocks_count) |block_offset| {
-                const packed_block_index = output_block_begin + block_offset;
-                const packed_offset = weight_layout.groupOffset(packed_block_index, depth_begin);
-                weights[block_offset] = weight.values[packed_offset..][0..bytes_per_weight_group].*;
-            }
-            inline for (0..rows_count) |tile_row| {
-                const activation_bytes = quantized_rows[tile_row * weight.input_values_count + depth_begin ..][0..depth_values_per_group].*;
-                const activations: I32x8 = @splat(@as(i32, @bitCast(activation_bytes)));
-                inline for (0..output_blocks_count) |block_offset| {
-                    accumulators[tile_row][block_offset] = dotUnsignedSignedBytes(accumulators[tile_row][block_offset], activations, weights[block_offset]);
-                }
-            }
-        }
-    }
+    const accumulators = calculateProjectionAccumulators(rows_count, output_blocks_count, quantized_rows, weight, output_block_begin);
 
     const reciprocal_input_scale: F32x8 = if (rows_count == 1) @splat(1.0 / input_scales[0]) else undefined;
 
@@ -460,6 +418,58 @@ inline fn projectOutputBlocksWithLayout(comptime rows_count: usize, comptime out
             }
         }
     }
+}
+
+// PERFORMANCE: This non-inlined integer tile is shared across output layouts
+// and residual modes. Comptime tile sizes keep VNNI accumulators in registers;
+// packed addressing must inline to avoid spills around depth-loop calls.
+// The boundary materializes one tile before layout-specific finishing instead
+// of duplicating the depth loop for each finishing mode.
+noinline fn calculateProjectionAccumulators(comptime rows_count: usize, comptime output_blocks_count: usize, quantized_rows: []const u8, weight: QuantizedWeight, output_block_begin: usize) [rows_count][output_blocks_count]I32x8 {
+    const weight_layout = @call(.always_inline, QuantizedWeight.layout, .{weight});
+    var accumulators: [rows_count][output_blocks_count]I32x8 = undefined;
+    inline for (0..output_blocks_count) |block_offset| {
+        const output_begin = (output_block_begin + block_offset) * output_rows_per_block;
+        const compensation: I32x8 = weight.compensation[output_begin..][0..output_rows_per_block].*;
+        inline for (0..rows_count) |tile_row| {
+            accumulators[tile_row][block_offset] = compensation;
+        }
+    }
+
+    var depth_begin: usize = 0;
+    while (depth_begin < weight.input_values_count) : (depth_begin += depth_values_per_group) {
+
+        // PERFORMANCE: One-row tiles let LLVM fold the weight load into VNNI,
+        // rather than spending a separate instruction and YMM register on it.
+        // Fourteen output accumulators hide dot-product latency. Multi-row tiles
+        // instead pin each weight in a register and reuse it across rows;
+        // folding those loads would reread a weight for every activation row.
+        if (rows_count == 1) {
+            const activation_bytes = quantized_rows[depth_begin..][0..depth_values_per_group].*;
+            const activations: I32x8 = @splat(@as(i32, @bitCast(activation_bytes)));
+            inline for (0..output_blocks_count) |block_offset| {
+                const packed_block_index = output_block_begin + block_offset;
+                const packed_offset = @call(.always_inline, vnni_weight.Layout.groupOffset, .{ weight_layout, packed_block_index, depth_begin });
+                const weights = weight.values[packed_offset..][0..bytes_per_weight_group];
+                accumulators[0][block_offset] = dotUnsignedSignedBytesFromMemory(accumulators[0][block_offset], activations, weights);
+            }
+        } else {
+            var weights: [output_blocks_count]I8x32 = undefined;
+            inline for (0..output_blocks_count) |block_offset| {
+                const packed_block_index = output_block_begin + block_offset;
+                const packed_offset = @call(.always_inline, vnni_weight.Layout.groupOffset, .{ weight_layout, packed_block_index, depth_begin });
+                weights[block_offset] = weight.values[packed_offset..][0..bytes_per_weight_group].*;
+            }
+            inline for (0..rows_count) |tile_row| {
+                const activation_bytes = quantized_rows[tile_row * weight.input_values_count + depth_begin ..][0..depth_values_per_group].*;
+                const activations: I32x8 = @splat(@as(i32, @bitCast(activation_bytes)));
+                inline for (0..output_blocks_count) |block_offset| {
+                    accumulators[tile_row][block_offset] = dotUnsignedSignedBytes(accumulators[tile_row][block_offset], activations, weights[block_offset]);
+                }
+            }
+        }
+    }
+    return accumulators;
 }
 
 inline fn finishProjection(accumulator: I32x8, reciprocal_input_scale: F32x8, output_scales: F32x8, output_bias: F32x8, activation: Activation) F32x8 {
