@@ -42,6 +42,17 @@ pub const Connection = struct {
         self.fd = -1;
     }
 
+    /// Initialize fresh storage or reset it after deinit. This does not close
+    /// descriptors; call before connect when using undefined storage.
+    pub fn initEmpty(self: *Connection) void {
+        // Counts guard buffer and descriptor-slot reads. Leave those arrays
+        // untouched instead of materializing a whole-connection default value.
+        inline for (std.meta.fields(Connection)) |field| {
+            if (comptime std.mem.eql(u8, field.name, "input") or std.mem.eql(u8, field.name, "output") or std.mem.eql(u8, field.name, "descriptors")) continue;
+            @field(self, field.name) = comptime field.defaultValue() orelse @compileError("Connection metadata requires a default: " ++ field.name);
+        }
+    }
+
     pub fn send(self: *Connection, object: u32, opcode: u8, payload: []const u8) Error!void {
         if (payload.len > bytes_max - 16) return error.MessageTooLarge;
         if (self.output_sent > 0) {
@@ -284,3 +295,37 @@ pub const Writer = struct {
         return self.bytes[0..self.size];
     }
 };
+
+test "connection initialization survives poisoned storage, failed connect and reuse" {
+    for ([_]u8{ 0, 0xa5, 0xff }) |poison| {
+        var connection: Connection = undefined;
+        @memset(std.mem.asBytes(&connection), poison);
+        connection.initEmpty();
+        try std.testing.expectError(error.ConnectFailed, connection.connect(""));
+        connection.deinit();
+
+        for (0..2) |_| {
+            connection.initEmpty();
+            var sockets: [2]linux.fd_t = undefined;
+            try std.testing.expectEqual(.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0, &sockets)));
+            defer _ = linux.close(sockets[1]);
+            connection.fd = sockets[0];
+            defer connection.deinit();
+
+            try connection.send(7, 3, "abcd");
+            try connection.flush();
+            var frame: [20]u8 = undefined;
+            try std.testing.expectEqual(frame.len, linux.read(sockets[1], &frame, frame.len));
+            try std.testing.expectEqual(7, std.mem.readInt(u32, frame[0..4], endian));
+            try std.testing.expectEqual(0x03000004, std.mem.readInt(u32, frame[4..8], endian));
+            try std.testing.expectEqual(0, std.mem.readInt(u32, frame[8..12], endian));
+            try std.testing.expectEqual(0, std.mem.readInt(u32, frame[12..16], endian));
+            try std.testing.expectEqualStrings("abcd", frame[16..]);
+
+            // Closing with queued output must not leak it into the next session.
+            try connection.send(8, 4, "stale");
+            connection.deinit();
+            try std.testing.expectEqual(0, linux.read(sockets[1], &frame, frame.len));
+        }
+    }
+}

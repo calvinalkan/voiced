@@ -35,7 +35,9 @@ pub fn main(init: std.process.Init) !void {
     defer _ = linux.close(epoll_fd);
     var input: linux.epoll_event = .{ .events = linux.EPOLL.IN, .data = .{ .u64 = 2 } };
     if (linux.errno(linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, 0, &input)) != .SUCCESS) return error.Epoll;
-    var client: clipboard.Client = .{};
+    var client: clipboard.Client = undefined;
+    // Exercise initialization independently of zero-filled or previously used storage.
+    @memset(std.mem.asBytes(&client), 0xa5);
     defer client.deinit();
     switch (client.init(epoll_fd, 1, .{ .runtime_directory = init.environ_map.get("XDG_RUNTIME_DIR"), .display = init.environ_map.get("WAYLAND_DISPLAY") }, fallback, now())) {
         .ok => {},

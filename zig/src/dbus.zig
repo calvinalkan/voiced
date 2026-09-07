@@ -84,6 +84,17 @@ pub const Connection = struct {
         self.output_sent = 0;
     }
 
+    /// Initialize fresh storage or reset it after close. This does not close
+    /// descriptors; call before connect when using undefined storage.
+    pub fn initEmpty(self: *Connection) void {
+        // Counts guard all buffer reads. Assign metadata defaults separately
+        // so initialization does not materialize the large buffer arrays.
+        inline for (std.meta.fields(Connection)) |field| {
+            if (comptime std.mem.eql(u8, field.name, "input") or std.mem.eql(u8, field.name, "output")) continue;
+            @field(self, field.name) = comptime field.defaultValue() orelse @compileError("Connection metadata requires a default: " ++ field.name);
+        }
+    }
+
     pub fn flush(self: *Connection) Error!void {
         if (self.output_size == 0) return;
         const bytes = self.output[self.output_sent..self.output_size];

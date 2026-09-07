@@ -82,7 +82,21 @@ pub const Client = struct {
     transfers_expired: u64 = 0,
     transfers_rejected: u64 = 0,
 
+    /// Initializes fresh storage or a deinitialized client. Call deinit even
+    /// when initialization fails; existing connections must be closed first.
     pub fn init(self: *Client, epoll_fd: i32, tag: u64, environment: Environment, fallback_only: bool, now_ns: u64) Result(void) {
+        // PERFORMANCE: Initialize fields, not a buffer-containing Client value.
+        // Whole-value construction can emit a large read-only memcpy template,
+        // including undefined wire buffers. Declaration defaults keep metadata
+        // complete when fields are added; the connection leaves storage alone.
+        inline for (std.meta.fields(Client)) |field| {
+            if (comptime std.mem.eql(u8, field.name, "connection")) {
+                self.connection.initEmpty();
+            } else {
+                @field(self, field.name) = comptime field.defaultValue() orelse @compileError("Client metadata requires a default: " ++ field.name);
+            }
+        }
+
         self.epoll_fd = epoll_fd;
         self.tag = tag;
         self.fallback_only = fallback_only;

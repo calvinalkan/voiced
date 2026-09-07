@@ -31,6 +31,16 @@ pub const Connection = struct {
         self.fds_count = 0;
         self.output_fd = null;
     }
+    /// Initializes fresh storage or resets it after deinit. This does not close
+    /// descriptors; call before connect when using undefined storage.
+    pub fn initEmpty(self: *Connection) void {
+        // Counts guard every buffer/descriptor-slot read. Leave those arrays
+        // untouched instead of materializing a whole-connection default value.
+        inline for (std.meta.fields(Connection)) |field| {
+            if (comptime std.mem.eql(u8, field.name, "input") or std.mem.eql(u8, field.name, "output") or std.mem.eql(u8, field.name, "fds")) continue;
+            @field(self, field.name) = comptime field.defaultValue() orelse @compileError("Connection metadata requires a default: " ++ field.name);
+        }
+    }
     pub fn check(self: *Connection, result: usize) Error!usize {
         self.errno = linux.errno(result);
         if (self.errno != .SUCCESS) return error.System;

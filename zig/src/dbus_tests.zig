@@ -109,7 +109,12 @@ test "nonblocking writes retain bytes across backpressure and report a closed pe
     const linux = std.os.linux;
     var sockets: [2]i32 = undefined;
     try std.testing.expectEqual(.SUCCESS, linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0, &sockets)));
-    var connection: dbus.Connection = .{ .fd = sockets[0] };
+    var connection: dbus.Connection = undefined;
+    @memset(std.mem.asBytes(&connection), 0xa5);
+    connection.initEmpty();
+    connection.close();
+    connection.initEmpty();
+    connection.fd = sockets[0];
     defer connection.close();
     const capacity: c_int = 1024;
     try std.testing.expectEqual(.SUCCESS, linux.errno(linux.setsockopt(sockets[0], linux.SOL.SOCKET, linux.SO.SNDBUF, std.mem.asBytes(&capacity), @sizeOf(c_int))));

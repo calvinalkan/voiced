@@ -1895,7 +1895,7 @@ fn beginDelivery(supervisor: *Supervisor, problem: ?notifications.Problem) void 
 }
 
 fn openClipboard(supervisor: *Supervisor) void {
-    supervisor.clipboard = .{ .connected = .{} };
+    supervisor.clipboard = .{ .connected = undefined };
     switch (supervisor.clipboard.connected.init(supervisor.epoll_fd, @intFromEnum(EventSource.clipboard), supervisor.clipboard_environment, false, monotonicNanoseconds())) {
         .ok => {},
         .err => |err| clipboardError(supervisor, err),

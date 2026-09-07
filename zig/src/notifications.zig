@@ -116,30 +116,22 @@ pub const Client = struct {
         // PERFORMANCE: Initialize metadata, not a buffer-containing aggregate.
         // Both Supervisor startup and deinit must use this path: a self.* = .{}
         // reset alone can retain the same 21,208-byte template as construction.
-        // Keep every Client and dbus.Connection metadata default synchronized
-        // here when adding fields. Buffer contents become valid only as their
-        // counts advance; optional payloads remain unreadable while null.
+        // Declaration defaults keep metadata complete when fields are added;
+        // the connection leaves its buffers untouched. Buffer contents become
+        // valid only as counts advance; optional payloads stay unreadable while null.
         // Measured 2026-09-07 with stock Zig 0.16.0/LLVM, host x86-64, ReleaseSafe
         // application/inference, static PIE, -Dcrash-diagnostics=false and GNU
         // strip --strip-all: 22,624 bytes saved, including reduced generated code.
         // This preserves buffer capacities and adds no allocation. The combined
         // initializer prototype passed private capture, inference, notification
         // lifecycle and output integration; RAM/timing changes were not measured.
-        self.connection.fd = null;
-        self.connection.input_size = 0;
-        self.connection.output_size = 0;
-        self.connection.output_sent = 0;
-        self.connection.errno = .SUCCESS;
-        self.address = .{};
-        self.phase = .disabled;
-        self.request = null;
-        self.pending = null;
-        self.last_problem = null;
-        self.notification = null;
-        self.serial = 0;
-        self.events = 0;
-        self.operation_deadline_ns = std.math.maxInt(u64);
-        self.deadline_monotonic_ns = std.math.maxInt(u64);
+        inline for (std.meta.fields(Client)) |field| {
+            if (comptime std.mem.eql(u8, field.name, "connection")) {
+                self.connection.initEmpty();
+            } else {
+                @field(self, field.name) = comptime field.defaultValue() orelse @compileError("Client metadata requires a default: " ++ field.name);
+            }
+        }
     }
 
     fn configure(self: *Client, address: ?[]const u8, runtime_directory: ?[]const u8) !void {

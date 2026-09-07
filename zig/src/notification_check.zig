@@ -12,7 +12,12 @@ pub fn main(init: std.process.Init) !void {
     defer _ = linux.close(fd);
     var event: linux.epoll_event = .{ .events = linux.EPOLL.IN, .data = .{ .u64 = 2 } };
     std.debug.assert(linux.errno(linux.epoll_ctl(fd, linux.EPOLL.CTL_ADD, 0, &event)) == .SUCCESS);
-    var client: notifications.Client = .{};
+    var client: notifications.Client = undefined;
+    // Match supervisor construction, including cleanup with notifications off.
+    // Poison storage so zero-filled pages cannot hide a missed metadata reset.
+    @memset(std.mem.asBytes(&client), 0xa5);
+    client.initEmpty();
+    client.deinit(fd);
     client.init(fd, 1, init.environ_map.get("DBUS_SESSION_BUS_ADDRESS"), init.environ_map.get("XDG_RUNTIME_DIR"));
     defer client.deinit(fd);
     while (true) {

@@ -323,17 +323,9 @@ pub fn run(launch: Launch) RunResult {
         .node_name => |value| .{ .node_name = value },
         .device_serial => |value| .{ .device_serial = value },
     } };
-    // Keep these fields in sync with protocol.Connection's metadata defaults.
-    // Buffers/descriptors are readable only after writes advance their counts.
     // Establish a closed, empty connection before cleanup or any fallible work;
     // otherwise an early error could close an uninitialized descriptor.
-    client.connection.fd = -1;
-    client.connection.errno = .SUCCESS;
-    client.connection.input_size = 0;
-    client.connection.descriptors_count = 0;
-    client.connection.output_size = 0;
-    client.connection.output_sent = 0;
-    client.connection.sequence = 0;
+    client.connection.initEmpty();
     defer client.deinit();
     var report: Report = undefined;
     // Keep the large Report out of the error union: constant error returns must
