@@ -10,6 +10,7 @@
 //! deadlines; they do not identify an earlier deadline instance.
 
 const std = @import("std");
+const decimal = @import("decimal.zig");
 const logging = @import("logging.zig");
 const log = logging.scoped(.supervisor);
 const notifications = @import("notifications.zig");
@@ -395,6 +396,9 @@ pub fn runService(init: std.process.Init, options: ServiceOptions) !void {
     defer if (transcript_directory) |path| init.gpa.free(path);
 
     var supervisor: Supervisor = .{
+        // initEmpty below establishes all notification metadata without the
+        // buffer-containing aggregate template; see notifications.Client.initEmpty.
+        .notifications = undefined,
         .io = init.io,
         .audio = .{ .options = configuration, .process = null },
         .epoll_fd = epoll_fd,
@@ -422,6 +426,9 @@ pub fn runService(init: std.process.Init, options: ServiceOptions) !void {
             .bytes_count = 0,
         },
     };
+
+    // Initialize even when notifications are off: cleanup still uses the client.
+    supervisor.notifications.initEmpty();
 
     try register(epoll_fd, publication_event_fd, .audio_publication);
     try register(epoll_fd, timer_fd, .deadline);
@@ -961,9 +968,9 @@ fn observePipeWireProgress(supervisor: *Supervisor) !void {
     }
 
     if (capture_is_starting) {
-        log.info(.{ .recording_ordinal = supervisor.recording_ordinal }, "Capture started: recording_ordinal={d}, capture_start_duration_ms={d:.3}", .{
+        log.info(.{ .recording_ordinal = supervisor.recording_ordinal }, "Capture started: recording_ordinal={d}, capture_start_duration_ms={f}", .{
             supervisor.recording_ordinal,
-            @as(f64, @floatFromInt(monotonicNanoseconds() - supervisor.recording_requested_monotonic_ns)) / std.time.ns_per_ms,
+            decimal.fmt(@as(f64, @floatFromInt(monotonicNanoseconds() - supervisor.recording_requested_monotonic_ns)) / std.time.ns_per_ms, 3),
         });
         const timeline_validation = switch (audio_exchange.acquireTimelineValidation(
             supervisor.audio_exchange,
@@ -1015,14 +1022,14 @@ fn drainTranscriptionPackets(supervisor: *Supervisor) !void {
                         log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Transcription error: recording_ordinal={d}, model={s}, stage={t}, detail=\"{f}\"", .{ supervisor.recording_ordinal, supervisor.audio.options.transcription.model.name(), std.meta.activeTag(err), std.zig.fmtString(detail.messageBytes()) });
                         const evidence = detail.evidence;
                         if (evidence.chunk_available == 1) {
-                            log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Transcription error evidence: recording_ordinal={d}, chunk_ordinal={d}, audio_samples_count={d}, audio_duration_seconds={d:.3}, tokens_count_max={d}, features_duration_ms={d:.3}, encoder_duration_ms={d:.3}, cross_key_values_duration_ms={d:.3}, decoder_duration_ms={d:.3}", .{
-                                supervisor.recording_ordinal,                                      evidence.chunk,                                                             evidence.samples,
-                                @as(f64, @floatFromInt(evidence.samples)) / 16000,                 evidence.token_limit,                                                       @as(f64, @floatFromInt(evidence.log_mel_ns)) / std.time.ns_per_ms,
-                                @as(f64, @floatFromInt(evidence.encoder_ns)) / std.time.ns_per_ms, @as(f64, @floatFromInt(evidence.cross_key_values_ns)) / std.time.ns_per_ms, @as(f64, @floatFromInt(evidence.decoder_ns)) / std.time.ns_per_ms,
+                            log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Transcription error evidence: recording_ordinal={d}, chunk_ordinal={d}, audio_samples_count={d}, audio_duration_seconds={f}, tokens_count_max={d}, features_duration_ms={f}, encoder_duration_ms={f}, cross_key_values_duration_ms={f}, decoder_duration_ms={f}", .{
+                                supervisor.recording_ordinal,                                                      evidence.chunk,                                                                             evidence.samples,
+                                decimal.fmt(@as(f64, @floatFromInt(evidence.samples)) / 16000, 3),                 evidence.token_limit,                                                                       decimal.fmt(@as(f64, @floatFromInt(evidence.log_mel_ns)) / std.time.ns_per_ms, 3),
+                                decimal.fmt(@as(f64, @floatFromInt(evidence.encoder_ns)) / std.time.ns_per_ms, 3), decimal.fmt(@as(f64, @floatFromInt(evidence.cross_key_values_ns)) / std.time.ns_per_ms, 3), decimal.fmt(@as(f64, @floatFromInt(evidence.decoder_ns)) / std.time.ns_per_ms, 3),
                             });
-                            if (evidence.decoding_available == 1) log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Decoder error evidence: recording_ordinal={d}, chunk_ordinal={d}, tokens_count={d}, tokens_count_max={d}, encoder_positions_count={d}, no_speech_probability={d:.6}, average_log_probability={d:.6}", .{
-                                supervisor.recording_ordinal, evidence.chunk,                 evidence.tokens,                  evidence.token_limit,
-                                evidence.encoder_positions,   evidence.no_speech_probability, evidence.average_log_probability,
+                            if (evidence.decoding_available == 1) log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Decoder error evidence: recording_ordinal={d}, chunk_ordinal={d}, tokens_count={d}, tokens_count_max={d}, encoder_positions_count={d}, no_speech_probability={f}, average_log_probability={f}", .{
+                                supervisor.recording_ordinal, evidence.chunk,                                 evidence.tokens,                                  evidence.token_limit,
+                                evidence.encoder_positions,   decimal.fmt(evidence.no_speech_probability, 6), decimal.fmt(evidence.average_log_probability, 6),
                             });
                         }
                     },
@@ -1038,8 +1045,8 @@ fn drainTranscriptionPackets(supervisor: *Supervisor) !void {
                     if (ready.model_prepare_duration_ns > 0) {
                         log.info(
                             .{ .recording_ordinal = supervisor.recording_ordinal },
-                            "Model prepared: recording_ordinal={d}, model_prepare_duration_ms={d:.3}\n",
-                            .{ supervisor.recording_ordinal, @as(f64, @floatFromInt(ready.model_prepare_duration_ns)) / std.time.ns_per_ms },
+                            "Model prepared: recording_ordinal={d}, model_prepare_duration_ms={f}\n",
+                            .{ supervisor.recording_ordinal, decimal.fmt(@as(f64, @floatFromInt(ready.model_prepare_duration_ns)) / std.time.ns_per_ms, 3) },
                         );
                     }
                     transcription.operation = .{ .idle = starting.retry_work };
@@ -1181,13 +1188,13 @@ fn consumeTranscript(supervisor: *Supervisor, work: TranscriptionWork, timings: 
         var speed_buffer: [32]u8 = undefined;
         log.info(
             .{ .recording_ordinal = supervisor.recording_ordinal },
-            "Transcription chunk: recording_ordinal={d}, chunk_ordinal={d}, audio_duration_seconds={d:.3}, audio_samples_count={d}, " ++
+            "Transcription chunk: recording_ordinal={d}, chunk_ordinal={d}, audio_duration_seconds={f}, audio_samples_count={d}, " ++
                 "features_duration_ms={s}, inference_duration_ms={s}, transcription_compute_duration_ms={s}, transcription_compute_speed_ratio={s}, " ++
-                "transcript_size={d}, disposition={s}, chunk_limit={t}, recording_size_exceeded={}, activity_observed={}, text_empty={}, no_speech_probability={d:.6}, no_speech_inactive_probability_min={d:.2}, average_log_probability={d:.6}\n",
+                "transcript_size={d}, disposition={s}, chunk_limit={t}, recording_size_exceeded={}, activity_observed={}, text_empty={}, no_speech_probability={f}, no_speech_inactive_probability_min={f}, average_log_probability={f}\n",
             .{
                 supervisor.recording_ordinal,
                 result.publication_ordinal,
-                @as(f64, @floatFromInt(result.samples_count)) / audio_process.sample_rate_hz,
+                decimal.fmt(@as(f64, @floatFromInt(result.samples_count)) / audio_process.sample_rate_hz, 3),
                 result.samples_count,
                 formatDurationMilliseconds(&features_buffer, if (timings) |measured| measured.features_duration_ns else null),
                 formatDurationMilliseconds(&inference_buffer, if (timings) |measured| measured.inference_duration_ns else null),
@@ -1199,9 +1206,9 @@ fn consumeTranscript(supervisor: *Supervisor, work: TranscriptionWork, timings: 
                 !output_fits,
                 result.contains_activity,
                 std.mem.trim(u8, result.bytes, " \t\r\n").len == 0,
-                result.no_speech_probability,
-                transcription_process.no_activity_no_speech_probability_reject_min,
-                result.average_log_probability,
+                decimal.fmt(result.no_speech_probability, 6),
+                decimal.fmt(transcription_process.no_activity_no_speech_probability_reject_min, 2),
+                decimal.fmt(result.average_log_probability, 6),
             },
         );
     }
@@ -1741,8 +1748,8 @@ fn finishSession(supervisor: *Supervisor) !void {
             }
             // No process can still publish into cancelled storage. The next
             // service recording resets both exchanges before either role starts.
-            log.write(if (reason == .user_cancelled or reason == .service_signal) .info else .warn, .{ .recording_ordinal = supervisor.recording_ordinal }, "Recording discarded: recording_ordinal={d}, reason={s}, audio_duration_seconds={d:.3}, transcription_compute_duration_ms={s}, transcription_compute_speed_ratio={s}, transcript_size=0, recording_stop_origin={s}, recording_stop_elapsed_ms={s}", .{
-                supervisor.recording_ordinal, @tagName(std.meta.activeTag(reason)),                             audio_seconds, processing, realtime_speed,
+            log.write(if (reason == .user_cancelled or reason == .service_signal) .info else .warn, .{ .recording_ordinal = supervisor.recording_ordinal }, "Recording discarded: recording_ordinal={d}, reason={s}, audio_duration_seconds={f}, transcription_compute_duration_ms={s}, transcription_compute_speed_ratio={s}, transcript_size=0, recording_stop_origin={s}, recording_stop_elapsed_ms={s}", .{
+                supervisor.recording_ordinal, @tagName(std.meta.activeTag(reason)),                             decimal.fmt(audio_seconds, 3), processing, realtime_speed,
                 stop_origin,                  formatRecordingStopElapsedMilliseconds(&stop_buffer, supervisor),
             });
             switch (reason) {
@@ -1764,19 +1771,19 @@ fn finishSession(supervisor: *Supervisor) !void {
                     log.err(
                         .{ .recording_ordinal = supervisor.recording_ordinal },
                         "Transcription evidence: recording_ordinal={d}, model={s}, chunk_ordinal={d}, audio_samples_count={d}, " ++
-                            "activity_observed={}, no_speech_probability={d:.6}, " ++
-                            "no_speech_inactive_probability_min={d:.2}, no_speech_active_probability_min={d:.2}, " ++
-                            "average_log_probability={d:.6}\n",
+                            "activity_observed={}, no_speech_probability={f}, " ++
+                            "no_speech_inactive_probability_min={f}, no_speech_active_probability_min={f}, " ++
+                            "average_log_probability={f}\n",
                         .{
                             supervisor.recording_ordinal,
                             rejection.model.name(),
                             rejection.publication_ordinal,
                             rejection.samples_count,
                             rejection.contains_activity,
-                            rejection.no_speech_probability,
-                            transcription_process.no_activity_no_speech_probability_reject_min,
-                            transcription_process.active_no_speech_probability_conflict_min,
-                            rejection.average_log_probability,
+                            decimal.fmt(rejection.no_speech_probability, 6),
+                            decimal.fmt(transcription_process.no_activity_no_speech_probability_reject_min, 2),
+                            decimal.fmt(transcription_process.active_no_speech_probability_conflict_min, 2),
+                            decimal.fmt(rejection.average_log_probability, 6),
                         },
                     );
                 },
@@ -1809,13 +1816,13 @@ fn finishTranscription(supervisor: *Supervisor, outcome_name: []const u8, proble
         supervisor.transcript.bytes[0..supervisor.transcript.bytes_count],
         " \t\r\n",
     );
-    log.write(if (limited) .warn else .info, .{ .recording_ordinal = supervisor.recording_ordinal }, "Transcription complete: recording_ordinal={d}, outcome={s}, chunks_accepted_count={d}, chunks_no_speech_count={d}, chunks_count={d}, audio_duration_seconds={d:.3}, transcription_compute_duration_ms={s}, transcription_compute_speed_ratio={s}, transcript_size={d}, recording_stop_origin={s}, recording_stop_elapsed_ms={s}", .{
+    log.write(if (limited) .warn else .info, .{ .recording_ordinal = supervisor.recording_ordinal }, "Transcription complete: recording_ordinal={d}, outcome={s}, chunks_accepted_count={d}, chunks_no_speech_count={d}, chunks_count={d}, audio_duration_seconds={f}, transcription_compute_duration_ms={s}, transcription_compute_speed_ratio={s}, transcript_size={d}, recording_stop_origin={s}, recording_stop_elapsed_ms={s}", .{
         supervisor.recording_ordinal,
         outcome_name,
         supervisor.transcript.accepted_chunks_count,
         supervisor.transcript.no_speech_chunks_count,
         supervisor.transcript.next_publication_ordinal,
-        audio_seconds,
+        decimal.fmt(audio_seconds, 3),
         processing,
         realtime_speed,
         transcript.len,
@@ -1838,7 +1845,7 @@ fn finishTranscription(supervisor: *Supervisor, outcome_name: []const u8, proble
 
 fn formatDurationMilliseconds(buffer: *[32]u8, elapsed_ns: ?u64) []const u8 {
     const elapsed = elapsed_ns orelse return "unavailable";
-    return std.fmt.bufPrint(buffer, "{d:.3}", .{@as(f64, @floatFromInt(elapsed)) / std.time.ns_per_ms}) catch unreachable;
+    return std.fmt.bufPrint(buffer, "{f}", .{decimal.fmt(@as(f64, @floatFromInt(elapsed)) / std.time.ns_per_ms, 3)}) catch unreachable;
 }
 
 fn formatComputeSpeedRatio(buffer: *[32]u8, samples_count: u64, compute_duration_ns: ?u64) []const u8 {
@@ -1846,7 +1853,7 @@ fn formatComputeSpeedRatio(buffer: *[32]u8, samples_count: u64, compute_duration
     if (elapsed_ns == 0 or samples_count == 0) return "unavailable";
     const audio_seconds = @as(f64, @floatFromInt(samples_count)) / audio_process.sample_rate_hz;
     const processing_seconds = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_s;
-    return std.fmt.bufPrint(buffer, "{d:.2}", .{audio_seconds / processing_seconds}) catch unreachable;
+    return std.fmt.bufPrint(buffer, "{f}", .{decimal.fmt(audio_seconds / processing_seconds, 2)}) catch unreachable;
 }
 
 // Explicit diagnostic mode: synchronous stdout after capture/inference drain.
@@ -1910,9 +1917,9 @@ fn advanceOutput(supervisor: *Supervisor) !void {
             .acquired => {
                 assert(supervisor.phase == .delivering and supervisor.phase.delivering.slot == index);
                 if (supervisor.clipboard[1 - index]) |*previous| previous.process.stop(supervisor.epoll_fd, now_ns);
-                log.info(.{ .recording_ordinal = owner.recording_ordinal }, "Clipboard acquired: recording_ordinal={d}, transcript_size={d}, recording_stop_origin={s}, recording_stop_elapsed_ms={s}, clipboard_acquire_duration_ms={d:.3}", .{
-                    owner.recording_ordinal,                                                                                  text.len, stop_origin, formatRecordingStopElapsedMilliseconds(&stop_buffer, supervisor),
-                    @as(f64, @floatFromInt(now_ns - supervisor.phase.delivering.boundary_monotonic_ns)) / std.time.ns_per_ms,
+                log.info(.{ .recording_ordinal = owner.recording_ordinal }, "Clipboard acquired: recording_ordinal={d}, transcript_size={d}, recording_stop_origin={s}, recording_stop_elapsed_ms={s}, clipboard_acquire_duration_ms={f}", .{
+                    owner.recording_ordinal,                                                                                                  text.len, stop_origin, formatRecordingStopElapsedMilliseconds(&stop_buffer, supervisor),
+                    decimal.fmt(@as(f64, @floatFromInt(now_ns - supervisor.phase.delivering.boundary_monotonic_ns)) / std.time.ns_per_ms, 3),
                 });
                 supervisor.phase.delivering.boundary_monotonic_ns = now_ns;
                 if (supervisor.service.output == .desktop and supervisor.keyboard == null)
@@ -1952,9 +1959,9 @@ fn advanceOutput(supervisor: *Supervisor) !void {
             },
         };
         if (complete) {
-            log.info(.{ .recording_ordinal = supervisor.recording_ordinal }, "Paste shortcut sent: recording_ordinal={d}, recording_stop_origin={s}, recording_stop_elapsed_ms={s}, paste_duration_ms={d:.3}", .{
-                supervisor.recording_ordinal,                                                          stop_origin, formatRecordingStopElapsedMilliseconds(&stop_buffer, supervisor),
-                @as(f64, @floatFromInt(now_ns - delivery.boundary_monotonic_ns)) / std.time.ns_per_ms,
+            log.info(.{ .recording_ordinal = supervisor.recording_ordinal }, "Paste shortcut sent: recording_ordinal={d}, recording_stop_origin={s}, recording_stop_elapsed_ms={s}, paste_duration_ms={f}", .{
+                supervisor.recording_ordinal,                                                                          stop_origin, formatRecordingStopElapsedMilliseconds(&stop_buffer, supervisor),
+                decimal.fmt(@as(f64, @floatFromInt(now_ns - delivery.boundary_monotonic_ns)) / std.time.ns_per_ms, 3),
             });
             delivery.paste = .done;
         }
@@ -2132,9 +2139,9 @@ fn logCaptureReport(recording_ordinal: u64, report: *const audio_process.Capture
     else
         -1;
 
-    log.info(.{ .recording_ordinal = recording_ordinal }, "Capture ended: recording_ordinal={d}, outcome={s}, audio_duration_seconds={d:.3}, audio_samples_published_count={d}, audio_samples_captured_count={d}, microphone_description=\"{f}\"", .{ recording_ordinal, outcome_name, @as(f64, @floatFromInt(report.samples_count)) / audio_process.sample_rate_hz, report.published_samples_count, report.samples_count, std.zig.fmtString(source_description) });
+    log.info(.{ .recording_ordinal = recording_ordinal }, "Capture ended: recording_ordinal={d}, outcome={s}, audio_duration_seconds={f}, audio_samples_published_count={d}, audio_samples_captured_count={d}, microphone_description=\"{f}\"", .{ recording_ordinal, outcome_name, decimal.fmt(@as(f64, @floatFromInt(report.samples_count)) / audio_process.sample_rate_hz, 3), report.published_samples_count, report.samples_count, std.zig.fmtString(source_description) });
 
-    log.info(.{ .recording_ordinal = recording_ordinal }, "Capture protocol: recording_ordinal={d}, pipewire_server_version=\"{f}\", client_node_version_advertised={d}, client_node_version_selected={d}, graph_rate_hz={d}, graph_channels_count={d}, callback_duration_ms_max={d:.3}, callback_gap_ms_max={d:.3}", .{ recording_ordinal, std.zig.fmtString(report.pipewire_server_version[0..report.pipewire_server_version_size]), report.client_node_version_advertised, report.client_node_version_selected, if (report.negotiated_format) |format| format.sample_rate_hz else 0, if (report.negotiated_format) |format| format.channels_count else 0, if (report.callback) |callback| @as(f64, @floatFromInt(callback.duration_ns_max)) / std.time.ns_per_ms else 0, if (report.callback) |callback| @as(f64, @floatFromInt(callback.gap_ns_max)) / std.time.ns_per_ms else 0 });
+    log.info(.{ .recording_ordinal = recording_ordinal }, "Capture protocol: recording_ordinal={d}, pipewire_server_version=\"{f}\", client_node_version_advertised={d}, client_node_version_selected={d}, graph_rate_hz={d}, graph_channels_count={d}, callback_duration_ms_max={f}, callback_gap_ms_max={f}", .{ recording_ordinal, std.zig.fmtString(report.pipewire_server_version[0..report.pipewire_server_version_size]), report.client_node_version_advertised, report.client_node_version_selected, if (report.negotiated_format) |format| format.sample_rate_hz else 0, if (report.negotiated_format) |format| format.channels_count else 0, decimal.fmt(if (report.callback) |callback| @as(f64, @floatFromInt(callback.duration_ns_max)) / std.time.ns_per_ms else 0, 3), decimal.fmt(if (report.callback) |callback| @as(f64, @floatFromInt(callback.gap_ns_max)) / std.time.ns_per_ms else 0, 3) });
 
     if (report.end == .failed or report.teardown_failure != null) {
         if (report.source_identity) |source| log.err(.{ .recording_ordinal = recording_ordinal }, "Capture source: recording_ordinal={d}, node_id={d}, node_object_serial={d}, device_id={d}, device_object_serial={d}, node_name=\"{f}\", node_description=\"{f}\", device_serial=\"{f}\", device_description=\"{f}\"", .{ recording_ordinal, source.node_id, source.node_object_serial, source.device_id, source.device_object_serial, std.zig.fmtString(source.node_name[0..source.node_name_size]), std.zig.fmtString(source.node_description[0..source.node_description_size]), std.zig.fmtString(source.device_serial[0..source.device_serial_size]), std.zig.fmtString(source.device_description[0..source.device_description_size]) });

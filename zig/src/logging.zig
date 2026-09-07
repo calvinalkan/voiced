@@ -115,22 +115,39 @@ fn emit(severity: Level, comptime component: []const u8, context: Context, compt
     comptime std.debug.assert(component.len <= 64);
     var message_buffer: [message_bytes_max]u8 = undefined;
     var message = std.Io.Writer.fixed(&message_buffer);
-    const marker = " [truncated]";
-    message.print(format, args) catch {
-        const end = @min(message.end, message_buffer.len - marker.len);
-        @memcpy(message_buffer[end..][0..marker.len], marker);
-        message.end = end + marker.len;
+    const truncated = failed: {
+        message.print(format, args) catch break :failed true;
+        break :failed false;
     };
-    const text = std.mem.trimEnd(u8, message.buffered(), "\n");
-    // Delivery borrows the stack buffer synchronously; it must not retain text.
-    sendRecord(severity, component, context, text);
+    // The sender borrows and finalizes this fixed writer synchronously; neither
+    // the writer nor its stack buffer may be retained after the call returns.
+    sendRecord(severity, component, context, &message, truncated);
 }
 
 // Keep delivery non-generic and out-of-line so journal framing and syscalls are
 // not copied into every message-format specialization. The extra call is on the
 // logging cold path, not capture/inference hot paths. Measured with Zig 0.16 on
 // x86-64 ReleaseSafe: ~151 KiB saved, a ~10% smaller whole stripped daemon.
-noinline fn sendRecord(severity: Level, component: []const u8, context: Context, text: []const u8) void {
+noinline fn sendRecord(severity: Level, component: []const u8, context: Context, message: *std.Io.Writer, truncated: bool) void {
+    // PERFORMANCE: Finalize here, not in generic emit: otherwise every message
+    // format can get another copy of trimming and truncation code. Measured
+    // 2026-09-07 with stock Zig 0.16.0/LLVM, host x86-64, ReleaseSafe application
+    // and inference, static PIE, -Dcrash-diagnostics=false, GNU strip --strip-all:
+    // this change alone reduced 1,161,416 to 1,147,032 bytes (14,384 saved).
+    // Together with decimal.zig, the applied worktree went from 1,323,960 to
+    // 1,301,832 bytes (22,128 saved). The isolated baseline also had initializer
+    // optimizations; do not add savings across baselines or compiler versions.
+    // The combined prototype passed control, logging and real-model output
+    // integration, including truncation, metadata injection and receiver drops.
+    // Only emit's fixed writer enters. Append the marker before trimming so a
+    // truncated message retains embedded/trailing newlines before the marker.
+    if (truncated) {
+        const marker = " [truncated]";
+        const end = @min(message.end, message.buffer.len - marker.len);
+        @memcpy(message.buffer[end..][0..marker.len], marker);
+        message.end = end + marker.len;
+    }
+    const text = std.mem.trimEnd(u8, message.buffered(), "\n");
     if (sink == .cli) {
         var line_buffer: [record_bytes_max]u8 = undefined;
         const line = std.fmt.bufPrint(&line_buffer, "{s}: {s}\n", .{ levelName(severity), text }) catch unreachable;

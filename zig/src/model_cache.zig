@@ -3,6 +3,7 @@
 //! the runtime itself remains independent of filesystems and XDG policy.
 
 const std = @import("std");
+const decimal = @import("decimal.zig");
 const logging = @import("logging.zig");
 const log = logging.scoped(.model_cache);
 const inference = @import("inference");
@@ -65,7 +66,7 @@ pub fn loadModel(init: std.process.Init, selected: models.Model) !LoadedModel {
 
     if (directory) |dir| {
         if (tryReadCached(init.io, dir, kind, source_digest)) |loaded| {
-            log.info(.{}, "Model cache loaded: model={s}, model_cache_load_duration_ms={d:.3}", .{ selected.name(), @as(f64, @floatFromInt(cache_started.untilNow(init.io, .awake).nanoseconds)) / std.time.ns_per_ms });
+            log.info(.{}, "Model cache loaded: model={s}, model_cache_load_duration_ms={f}", .{ selected.name(), decimal.fmt(@as(f64, @floatFromInt(cache_started.untilNow(init.io, .awake).nanoseconds)) / std.time.ns_per_ms, 3) });
             return loaded;
         }
     }
@@ -74,7 +75,7 @@ pub fn loadModel(init: std.process.Init, selected: models.Model) !LoadedModel {
     // Unmap the source before inference workspace allocation. Keeping both
     // model representations for the worker's lifetime doubles retained data.
 
-    log.debug(.{}, "Model cache lookup completed: model={s}, cache_available={}, cache_hit=false, model_cache_lookup_duration_ms={d:.3}", .{ selected.name(), directory != null, @as(f64, @floatFromInt(cache_started.untilNow(init.io, .awake).nanoseconds)) / std.time.ns_per_ms });
+    log.debug(.{}, "Model cache lookup completed: model={s}, cache_available={}, cache_hit=false, model_cache_lookup_duration_ms={f}", .{ selected.name(), directory != null, decimal.fmt(@as(f64, @floatFromInt(cache_started.untilNow(init.io, .awake).nanoseconds)) / std.time.ns_per_ms, 3) });
     const conversion_started = std.Io.Clock.awake.now(init.io);
     var loaded: LoadedModel = block: {
         const model_directory = try models.allocInstalledDirectoryPath(init, selected);
@@ -99,7 +100,7 @@ pub fn loadModel(init: std.process.Init, selected: models.Model) !LoadedModel {
         break :block .{ .model = try inference.Model.fromPristineWeights(allocator, kind, mapping) };
     };
     errdefer loaded.deinit();
-    log.info(.{}, "Model converted: model={s}, model_convert_duration_ms={d:.3}", .{ selected.name(), @as(f64, @floatFromInt(conversion_started.untilNow(init.io, .awake).nanoseconds)) / std.time.ns_per_ms });
+    log.info(.{}, "Model converted: model={s}, model_convert_duration_ms={f}", .{ selected.name(), decimal.fmt(@as(f64, @floatFromInt(conversion_started.untilNow(init.io, .awake).nanoseconds)) / std.time.ns_per_ms, 3) });
 
     // ── Publish One Complete Cache Entry ──
     // The envelope and image share one atomic rename; there is no separately
@@ -111,10 +112,10 @@ pub fn loadModel(init: std.process.Init, selected: models.Model) !LoadedModel {
             log.warn(.{}, "Model cache save failed: error={s}\n", .{@errorName(err)});
             return loaded;
         };
-        log.debug(.{}, "Model cache published: model={s}, model_cache_publish_duration_ms={d:.3}", .{ selected.name(), @as(f64, @floatFromInt(publication_started.untilNow(init.io, .awake).nanoseconds)) / std.time.ns_per_ms });
+        log.debug(.{}, "Model cache published: model={s}, model_cache_publish_duration_ms={f}", .{ selected.name(), decimal.fmt(@as(f64, @floatFromInt(publication_started.untilNow(init.io, .awake).nanoseconds)) / std.time.ns_per_ms, 3) });
         const remap_started = std.Io.Clock.awake.now(init.io);
         if (tryReadCached(init.io, dir, kind, source_digest)) |mapped| {
-            log.debug(.{}, "Model cache remapped: model={s}, model_cache_remap_duration_ms={d:.3}", .{ selected.name(), @as(f64, @floatFromInt(remap_started.untilNow(init.io, .awake).nanoseconds)) / std.time.ns_per_ms });
+            log.debug(.{}, "Model cache remapped: model={s}, model_cache_remap_duration_ms={f}", .{ selected.name(), decimal.fmt(@as(f64, @floatFromInt(remap_started.untilNow(init.io, .awake).nanoseconds)) / std.time.ns_per_ms, 3) });
             loaded.deinit();
             return mapped;
         }

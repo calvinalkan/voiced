@@ -107,7 +107,40 @@ pub const Client = struct {
 
     pub fn deinit(self: *Client, epoll_fd: std.posix.fd_t) void {
         self.close(epoll_fd);
-        self.* = .{};
+        self.initEmpty();
+    }
+
+    /// Initialize fresh storage, or reset it after its socket has been closed.
+    /// This does not close an existing connection. Call before init or any other
+    /// client operation when constructing the client from undefined storage.
+    pub fn initEmpty(self: *Client) void {
+        // PERFORMANCE: Initialize metadata, not a buffer-containing aggregate.
+        // Both Supervisor startup and deinit must use this path: a self.* = .{}
+        // reset alone can retain the same 21,208-byte template as construction.
+        // Keep every Client and dbus.Connection metadata default synchronized
+        // here when adding fields. Buffer contents become valid only as their
+        // counts advance; optional payloads remain unreadable while null.
+        // Measured 2026-09-07 with stock Zig 0.16.0/LLVM, host x86-64, ReleaseSafe
+        // application/inference, static PIE, -Dcrash-diagnostics=false and GNU
+        // strip --strip-all: 22,624 bytes saved, including reduced generated code.
+        // This preserves buffer capacities and adds no allocation. The combined
+        // initializer prototype passed private capture, inference, notification
+        // lifecycle and output integration; RAM/timing changes were not measured.
+        self.connection.fd = null;
+        self.connection.input_size = 0;
+        self.connection.output_size = 0;
+        self.connection.output_sent = 0;
+        self.connection.errno = .SUCCESS;
+        self.address = .{};
+        self.phase = .disabled;
+        self.request = null;
+        self.pending = null;
+        self.last_problem = null;
+        self.notification = null;
+        self.serial = 0;
+        self.events = 0;
+        self.operation_deadline_ns = std.math.maxInt(u64);
+        self.deadline_monotonic_ns = std.math.maxInt(u64);
     }
 
     fn configure(self: *Client, address: ?[]const u8, runtime_directory: ?[]const u8) !void {

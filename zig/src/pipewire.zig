@@ -303,11 +303,36 @@ pub const RunResult = union(enum) { captured: Report, setup_failed: SetupFailure
 /// for one worker session. No other thread accesses this client. Control work is
 /// interleaved one message at a time with graph wakes and supervisor commands.
 pub fn run(launch: Launch) RunResult {
-    var client: native.Client = .{ .source = switch (launch.source) {
+    // PERFORMANCE: Do not restore aggregate defaults for connection or ports.
+    // Zig can materialize their large buffer-containing initializers in .rodata
+    // even though the buffers themselves are undefined. Initialize connection
+    // metadata below; native.Client.createStream writes each complete Port before
+    // increasing ports_count, and readers use only that initialized prefix.
+    // Measured 2026-09-07 with stock Zig 0.16.0/LLVM, host x86-64, ReleaseSafe
+    // application/inference, static PIE, -Dcrash-diagnostics=false and GNU strip:
+    // connection metadata-only initialization saved about 131 KB; leaving unused
+    // port slots untouched removed an 8,576-byte template. Capacities, layouts
+    // and allocation policy are unchanged; no resident-memory saving is claimed.
+    // Applied together with notifications.Client.initEmpty on the same size
+    // basis after the formatting/logging changes, these three initializer fixes
+    // reduced 1,301,832 to 1,139,208 bytes (162,624 saved). All three templates
+    // disappeared. Historical savings are not additive across compiler builds.
+    var client: native.Client = .{ .ports = undefined, .connection = undefined, .source = switch (launch.source) {
         .default => .default,
         .node_name => |value| .{ .node_name = value },
         .device_serial => |value| .{ .device_serial = value },
     } };
+    // Keep these fields in sync with protocol.Connection's metadata defaults.
+    // Buffers/descriptors are readable only after writes advance their counts.
+    // Establish a closed, empty connection before cleanup or any fallible work;
+    // otherwise an early error could close an uninitialized descriptor.
+    client.connection.fd = -1;
+    client.connection.errno = .SUCCESS;
+    client.connection.input_size = 0;
+    client.connection.descriptors_count = 0;
+    client.connection.output_size = 0;
+    client.connection.output_sent = 0;
+    client.connection.sequence = 0;
     defer client.deinit();
     var report: Report = undefined;
     // Keep the large Report out of the error union: constant error returns must

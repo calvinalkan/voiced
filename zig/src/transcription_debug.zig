@@ -1,6 +1,7 @@
 //! One private, replaceable failed chunk. The worker borrows sealed audio and
 //! decoder storage; only this error path hashes weights and writes files.
 const std = @import("std");
+const decimal = @import("decimal.zig");
 const logging = @import("logging.zig");
 const log = logging.scoped(.transcription_capture);
 const builtin = @import("builtin");
@@ -212,18 +213,19 @@ fn writeMetadata(io: std.Io, dir: std.Io.Dir, metadata: Metadata) !void {
             "stage={f}\nerror_name={f}\n" ++
             "evidence.chunk_available={d}\nevidence.decoding_available={d}\n" ++
             "evidence.chunk={d}\nevidence.samples={d}\nevidence.tokens={d}\nevidence.token_limit={d}\n" ++
-            "evidence.encoder_positions={d}\nevidence.no_speech_probability={d}\nevidence.average_log_probability={d}\n" ++
+            "evidence.encoder_positions={d}\nevidence.no_speech_probability={f}\nevidence.average_log_probability={f}\n" ++
             "evidence.reserved={d}\nevidence.log_mel_ns={d}\nevidence.encoder_ns={d}\n" ++
             "evidence.cross_key_values_ns={d}\nevidence.decoder_ns={d}\n",
         .{
-            metadata.format_version,                  metadata.session_id,                        metadata.captured_unix_seconds,
-            std.zig.fmtString(metadata.stage),        std.zig.fmtString(metadata.error_name),     evidence.chunk_available,
-            evidence.decoding_available,              evidence.chunk,                             evidence.samples,
-            evidence.tokens,                          evidence.token_limit,                       evidence.encoder_positions,
+            metadata.format_version,                                     metadata.session_id,                                           metadata.captured_unix_seconds,
+            std.zig.fmtString(metadata.stage),                           std.zig.fmtString(metadata.error_name),                        evidence.chunk_available,
+            evidence.decoding_available,                                 evidence.chunk,                                                evidence.samples,
+            evidence.tokens,                                             evidence.token_limit,                                          evidence.encoder_positions,
             // Widen before formatting so an f64 reader recovers the exact f32
             // evidence value, rather than only a decimal that rounds back to it.
-            @as(f64, evidence.no_speech_probability), @as(f64, evidence.average_log_probability), evidence.reserved,
-            evidence.log_mel_ns,                      evidence.encoder_ns,                        evidence.cross_key_values_ns,
+            // Null precision is intentional: fixed log precision loses evidence.
+            decimal.fmt(@as(f64, evidence.no_speech_probability), null), decimal.fmt(@as(f64, evidence.average_log_probability), null), evidence.reserved,
+            evidence.log_mel_ns,                                         evidence.encoder_ns,                                           evidence.cross_key_values_ns,
             evidence.decoder_ns,
         },
     ) catch return writer.err.?;

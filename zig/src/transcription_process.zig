@@ -5,6 +5,7 @@
 //! sealed audio slot.
 
 const std = @import("std");
+const decimal = @import("decimal.zig");
 const logging = @import("logging.zig");
 const log = logging.scoped(.transcription);
 const audio_exchange = @import("audio_exchange.zig");
@@ -398,14 +399,14 @@ pub fn runModelWorker(
         return;
     };
     defer loaded.deinit();
-    log.debug(.{ .recording_ordinal = audio.session_id }, "Model weights loaded: recording_ordinal={d}, model_weights_load_duration_ms={d:.3}", .{ audio.session_id, @as(f64, @floatFromInt(monotonicNanoseconds() - model_load_started_ns)) / std.time.ns_per_ms });
+    log.debug(.{ .recording_ordinal = audio.session_id }, "Model weights loaded: recording_ordinal={d}, model_weights_load_duration_ms={f}", .{ audio.session_id, decimal.fmt(@as(f64, @floatFromInt(monotonicNanoseconds() - model_load_started_ns)) / std.time.ns_per_ms, 3) });
     const vocabulary_started_ns = monotonicNanoseconds();
     const vocabulary = model_cache.loadVocabulary(init, selected_model.?) catch |err| {
         try sendDiagnostic(control_socket, .model_load, @errorName(err), .{});
         return;
     };
     defer allocator.free(vocabulary);
-    log.debug(.{ .recording_ordinal = audio.session_id }, "Model vocabulary loaded: recording_ordinal={d}, model_vocabulary_load_duration_ms={d:.3}", .{ audio.session_id, @as(f64, @floatFromInt(monotonicNanoseconds() - vocabulary_started_ns)) / std.time.ns_per_ms });
+    log.debug(.{ .recording_ordinal = audio.session_id }, "Model vocabulary loaded: recording_ordinal={d}, model_vocabulary_load_duration_ms={f}", .{ audio.session_id, decimal.fmt(@as(f64, @floatFromInt(monotonicNanoseconds() - vocabulary_started_ns)) / std.time.ns_per_ms, 3) });
     const runtime_started_ns = monotonicNanoseconds();
     const policy: inference.Policy = .{
         .samples_count_max = audio_exchange.slot_samples_capacity,
@@ -425,7 +426,7 @@ pub fn runModelWorker(
         return;
     };
     defer runtime.deinit();
-    log.debug(.{ .recording_ordinal = audio.session_id }, "Model runtime initialized: recording_ordinal={d}, model_runtime_init_duration_ms={d:.3}, model_runtime_size={d}", .{ audio.session_id, @as(f64, @floatFromInt(monotonicNanoseconds() - runtime_started_ns)) / std.time.ns_per_ms, memory_size });
+    log.debug(.{ .recording_ordinal = audio.session_id }, "Model runtime initialized: recording_ordinal={d}, model_runtime_init_duration_ms={f}, model_runtime_size={d}", .{ audio.session_id, decimal.fmt(@as(f64, @floatFromInt(monotonicNanoseconds() - runtime_started_ns)) / std.time.ns_per_ms, 3), memory_size });
     const model_prepare_duration_ns = monotonicNanoseconds() - model_load_started_ns;
 
     try sendReport(control_socket, .{ .ready = .{
