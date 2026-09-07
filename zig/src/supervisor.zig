@@ -494,10 +494,6 @@ pub fn runService(init: std.process.Init, options: ServiceOptions) !void {
     // replacement happens only in the final maintenance paragraph, after no old
     // event from this snapshot can be applied to the replacement.
     while (true) {
-        if (sessionIsComplete(&supervisor)) {
-            try finishSession(&supervisor);
-            if (supervisor.phase != .delivering) enterIdle(&supervisor);
-        }
         if (supervisor.service.shutdown_requested and supervisor.phase == .idle and
             supervisor.transcription == .absent and supervisor.audio.process == null and
             !supervisor.service.control.hasPendingReplies())
@@ -581,6 +577,13 @@ pub fn runService(init: std.process.Init, options: ServiceOptions) !void {
         // when a worker publishes text and dies before sending its report.
         try dispatchPublishedAudio(&supervisor);
         try maintainWorkersAndSession(&supervisor);
+        // Finish and start desktop delivery before the next epoll wait. A ready
+        // clipboard has no pending I/O or deadline until publication begins;
+        // sleeping between these operations can strand text until another command.
+        if (sessionIsComplete(&supervisor)) {
+            try finishSession(&supervisor);
+            if (supervisor.phase != .delivering) enterIdle(&supervisor);
+        }
         try advanceOutput(&supervisor);
         if (supervisor.audio.process == null and !supervisor.service.shutdown_requested)
             try initializeAudio(&supervisor, publication_event_fd);

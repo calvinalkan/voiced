@@ -166,6 +166,14 @@ def protocol_check(root, env):
     second = 'Replacement transcript\nSecond line.\n'
     (root / 'a').write_text(first)
     (root / 'b').write_text(second)
+    # The verifier poisons Client storage before init. Failed initialization
+    # must still leave every owned-descriptor field safe for deferred cleanup.
+    failed = subprocess.run([str(CHECK), str(root / 'a'), str(root / 'b')],
+                            env=dict(env, WAYLAND_DISPLAY='missing-wayland-test'),
+                            input='', capture_output=True, text=True, timeout=4)
+    assert failed.returncode == 1, (failed.returncode, failed.stderr)
+    assert failed.stdout.strip(), failed.stderr
+    assert json.loads(failed.stdout) == {'event': 'error', 'kind': 'transport'}, failed.stdout
     with (root / 'clipboard.log').open('w') as log:
         process = subprocess.Popen([str(CHECK), str(root / 'a'), str(root / 'b')], env=env,
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, bufsize=0)
@@ -185,7 +193,7 @@ def protocol_check(root, env):
     finally:
         stop(process)
         server.close()
-    print('Native clipboard: 24 replacements, 72 exact reads, malformed-frame rejection passed.')
+    print('Native clipboard: poisoned-storage init/failed-init cleanup, 24 replacements, 72 exact reads, malformed-frame rejection passed.')
 
 
 def model_check(root, env):
@@ -237,7 +245,15 @@ def model_check(root, env):
         pid = capture_pid()
         wait_for(lambda: len(list(Path(f'/proc/{pid}/fd').iterdir())) == 7)
         saved = root / 'state/voiced-test/transcript.txt'
-        for ordinal in range(1, 4):
+        for ordinal in range(1, 5):
+            if ordinal == 3:
+                # Refuse atomic replacement after successful clipboard delivery.
+                # Preserve the previous file separately, then restore it so the
+                # next recording proves recovery without a daemon restart.
+                previous = saved.with_name('previous-transcript.txt')
+                previous_text = saved.read_text()
+                saved.rename(previous)
+                saved.mkdir()
             cli('record')
             wait_for(lambda: f'Capture started: recording_ordinal={ordinal},' in log_path.read_text())
             playback = subprocess.Popen(['pw-cat', '--playback', '--target', '0', '--properties', 'node.name=voiced-fixture-playback', str(REPO / 'test-fixtures/hello_world.wav')], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -252,24 +268,51 @@ def model_check(root, env):
             subprocess.run(['pw-link', ports[0], 'voiced-test-source:input_MONO'], env=env, check=True, capture_output=True)
             assert playback.wait(timeout=8) == 0, playback.stderr.read()
             cli('stop')
-            wait_for(lambda: 'phase=idle' in cli('status'))
+            # Observe completion without waking the supervisor with status
+            # requests: ready clipboard work must advance on its own.
+            event = 'Transcript save error' if ordinal == 3 else 'Transcript saved'
+            wait_for(lambda: f'{event}: recording_ordinal={ordinal},' in log_path.read_text())
+            assert 'phase=idle' in cli('status')
             assert capture_pid() == pid
             text = server.text()
             assert 'hello' in text.lower(), text
-            assert saved.read_text() == text
+            if ordinal == 3:
+                wait_for(lambda: any(row['MESSAGE'].startswith('Transcript save error:') for row in log.records))
+                failure = next(row for row in log.records if row['MESSAGE'].startswith('Transcript save error:'))
+                assert failure['PRIORITY'] == '3' and failure['VOICED_RECORDING_ORDINAL'] == '3', failure
+                assert f'directory_path="{saved.parent}"' in failure['MESSAGE'], failure
+                for field in ('file_name="transcript.txt"', 'operation="replace"', 'error="IsDir"', 'transcript_save_duration_ms='):
+                    assert field in failure['MESSAGE'], failure
+                assert 'cleanup_error=' not in failure['MESSAGE'], failure
+                assert {entry.name for entry in saved.parent.iterdir()} == {'transcript.txt', 'previous-transcript.txt'}
+                assert previous.read_text() == previous_text
+                saved.rmdir()
+                previous.rename(saved)
+            else:
+                assert saved.read_text() == text
             assert len(list(Path(f'/proc/{pid}/fd').iterdir())) == 7
             assert len(children()) == 2
+            if ordinal == 1:
+                # The next delivery reconstructs Client in the same union
+                # storage after a real disconnect, not fresh process memory.
+                server.close()
+                wait_for(lambda: any(row['MESSAGE'].startswith('Clipboard error:') for row in log.records))
+                failure = next(row for row in log.records if row['MESSAGE'].startswith('Clipboard error:'))
+                for field in ('kind="transport"', 'error="', 'errno=', 'object=', 'opcode='):
+                    assert field in failure['MESSAGE'], failure
+                (root / 'wayland-test').unlink()
+                server = Compositor(root)
         os.kill(pid, 9)
         wait_for(lambda: capture_pid() is not None and capture_pid() != pid)
         assert server.text() == text
         cli('record')
-        wait_for(lambda: 'Capture started: recording_ordinal=4,' in log_path.read_text())
+        wait_for(lambda: 'Capture started: recording_ordinal=5,' in log_path.read_text())
         cli('cancel')
         wait_for(lambda: 'phase=idle' in cli('status'))
         assert saved.read_text() == text
         cli('kill')
         assert service.wait(timeout=4) == 0
-        print('Native capture/model/clipboard/save: repeated delivery, worker reuse, recovery and cancellation passed.')
+        print('Native capture/model/clipboard/save: repeated delivery, clipboard reconnect, save-error diagnostics/recovery, worker reuse and cancellation passed.')
     finally:
         for process in reversed(processes):
             stop(process)
