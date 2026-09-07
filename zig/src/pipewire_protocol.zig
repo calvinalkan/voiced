@@ -16,7 +16,9 @@ pub const Connection = struct {
     input_size: usize = 0,
     descriptors: [descriptors_max]linux.fd_t = undefined,
     descriptors_count: usize = 0,
-    output: [bytes_max]u8 = undefined,
+    // Input permits 64 KiB frames; our bounded request batches fit in 32 KiB.
+    // Socket backpressure retains this queue and reports exhaustion explicitly.
+    output: [32 * 1024]u8 = undefined,
     output_size: usize = 0,
     output_sent: usize = 0,
     sequence: u32 = 0,

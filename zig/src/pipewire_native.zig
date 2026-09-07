@@ -9,7 +9,7 @@ const invalid = std.math.maxInt(u32);
 const channels_max = 8;
 const buffers_max = 16;
 pub const samples_max = 16384;
-pub const Error = protocol.Error || error{ CatalogFull, SourceNotFound, SourceAmbiguous, SourceDisconnected, SourceChanged, SourcePortsUnavailable, UnsupportedVersion, UnsupportedFormat, UnsupportedIO, InvalidBuffer, CorruptedBuffer, TimelineDiscontinuity, GraphError, WakeFailed, TooManyChannels, TooManyBuffers, TooManyMemories, TooManyPeers };
+pub const Error = protocol.Error || error{ CatalogFull, CatalogTextFull, SourceNotFound, SourceAmbiguous, SourceDisconnected, SourceChanged, SourcePortsUnavailable, UnsupportedVersion, UnsupportedFormat, UnsupportedIO, InvalidBuffer, CorruptedBuffer, TimelineDiscontinuity, GraphError, WakeFailed, TooManyChannels, TooManyBuffers, TooManyMemories, TooManyPeers };
 pub const Source = union(enum) { default, node_name: []const u8, device_serial: []const u8 };
 pub const Text = struct {
     bytes: [256]u8 = @splat(0),
@@ -23,8 +23,9 @@ pub const Text = struct {
         self.size = @intCast(value.len);
     }
 };
+const ObjectKind = enum { node, device, port };
 pub const Object = struct {
-    kind: enum { node, device, port },
+    kind: ObjectKind,
     id: u32,
     serial: u64 = 0,
     proxy: u32 = invalid,
@@ -39,12 +40,60 @@ pub const Object = struct {
     channel: Text = .{},
 };
 pub const Identity = struct { node: Object, device: ?Object };
-pub const Block = struct { samples: []const f32, rate: u32, position: u64, header_present: bool, silence: bool };
+// Borrowed only between process() and finishCycle(). No sample allocation or
+// copy is needed to turn a planar/wrapped graph buffer into resampler input.
+pub const Block = struct {
+    channels: [channels_max]union(enum) {
+        silence,
+        samples: struct { first: []align(1) const f32, second: []align(1) const f32 },
+    },
+    channels_count: usize,
+    samples_count: usize,
+    rate: u32,
+    position: u64,
+    header_present: bool,
+    silence: bool,
+    client: *Client,
+
+    pub fn sample(self: *const Block, index: usize) Error!f32 {
+        var sum: f32 = 0;
+        for (self.channels[0..self.channels_count], 0..) |channel, channel_index| {
+            const value = switch (channel) {
+                .silence => 0,
+                .samples => |spans| if (index < spans.first.len) spans.first[index] else spans.second[index - spans.first.len],
+            };
+            if (!std.math.isFinite(value)) {
+                // Buffers remain borrowed until finishCycle. Recover details
+                // from the failing channel instead of retaining eight copies
+                // or accidentally reporting the last channel validated.
+                const port = self.client.ports[channel_index];
+                const id = load(u32, port.io.?, 4);
+                const buffer = port.buffers[id];
+                const chunk = buffer.chunk.?;
+                const diagnostic = &self.client.diagnostic;
+                diagnostic.channel = channel_index;
+                diagnostic.buffer_id = id;
+                diagnostic.chunk_offset = load(u32, chunk, 0);
+                diagnostic.chunk_size = load(u32, chunk, 4);
+                diagnostic.chunk_stride = load(i32, chunk, 8);
+                diagnostic.chunk_flags = load(u32, chunk, 12);
+                diagnostic.header_flags = if (buffer.header) |h| load(u32, h, 0) else 0;
+                diagnostic.header_sequence = if (buffer.header) |h| load(u64, h, 24) else 0;
+                diagnostic.header_pts_ns = if (buffer.header) |h| load(i64, h, 8) else 0;
+                diagnostic.invalid_sample_index = index;
+                return error.InvalidBuffer;
+            }
+            sum = if (channel_index == 0) value else sum + value;
+        }
+        return if (self.channels_count == 1) sum else sum / @as(f32, @floatFromInt(self.channels_count));
+    }
+};
 
 pub const Client = struct {
     connection: protocol.Connection = .{},
     source: Source,
-    catalog: [128]?Object = @splat(null),
+    catalog: [128]?StoredObject = @splat(null),
+    text: TextStorage = .{},
     selected: ?Identity = null,
     node_id: u32 = invalid,
     // Proxy IDs occupy the server's ordered object map. Allocate densely;
@@ -69,7 +118,6 @@ pub const Client = struct {
     wake_fd: linux.fd_t = -1,
     completion_fd: linux.fd_t = -1,
     previous: ?struct { position: u64, duration: u64, rate: u32, clock: u32 } = null,
-    samples: [samples_max]f32 = undefined,
     diagnostic: struct {
         wake_count: u64 = 0,
         graph_rate_num: u32 = 0,
@@ -203,6 +251,7 @@ pub const Client = struct {
                     }
                     for (self.ports[0..self.ports_count]) |port| if (id == port.source_global or id == port.link_global) return error.SourceDisconnected;
                     for (&self.catalog) |*entry| if (entry.* != null and entry.*.?.id == id) {
+                        self.text.releaseObject(entry.*.?);
                         entry.* = null;
                         break;
                     };
@@ -216,7 +265,11 @@ pub const Client = struct {
                     _ = try r.next();
                     const value = try r.next();
                     if (key.kind == 8 and std.mem.eql(u8, std.mem.trimEnd(u8, key.body, "\x00"), "default.audio.source") and value.kind == 8 and value.body.len > 0) {
-                        const parsed = std.json.parseFromSlice(struct { name: []const u8 }, std.heap.page_allocator, value.body[0 .. value.body.len - 1], .{ .ignore_unknown_fields = true }) catch return error.InvalidMessage;
+                        // Parsing escaped JSON strings and scanner nesting uses
+                        // bounded scratch, recycled for every metadata event.
+                        var json_bytes: [4096]u8 = undefined;
+                        var json_storage = std.heap.FixedBufferAllocator.init(&json_bytes);
+                        const parsed = std.json.parseFromSlice(struct { name: []const u8 }, json_storage.allocator(), value.body[0 .. value.body.len - 1], .{ .ignore_unknown_fields = true }) catch return error.InvalidMessage;
                         defer parsed.deinit();
                         try self.default_source.set(parsed.value.name);
                     }
@@ -225,7 +278,8 @@ pub const Client = struct {
                 for (&self.catalog) |*entry| {
                     if (entry.* == null or entry.*.?.proxy != message.object) continue;
                     if (message.opcode != 0) return error.InvalidMessage;
-                    var object = &entry.*.?;
+                    var expanded = entry.*.?.expand(&self.text);
+                    const object = &expanded;
                     if (try r.int() != object.id) return error.InvalidMessage;
                     if (object.kind == .node) {
                         _ = try r.int();
@@ -239,6 +293,7 @@ pub const Client = struct {
                         _ = try r.next();
                     }
                     try properties(object, try r.structure());
+                    entry.* = try self.text.replace(entry.*, expanded);
                     if (self.selected) |selected| {
                         if (object.id == selected.node.id and (object.serial != selected.node.serial or object.parent != selected.node.parent or !std.mem.eql(u8, object.name.get(), selected.node.name.get()))) return error.SourceChanged;
                         if (selected.device) |device| if (object.id == device.id and (object.serial != device.serial or !std.mem.eql(u8, object.device_serial.get(), device.device_serial.get()))) return error.SourceChanged;
@@ -272,23 +327,8 @@ pub const Client = struct {
         const activation = self.activation orelse return error.InvalidMemory;
         atomicStore(activation, 0, 2);
         store(u64, activation, 40, now());
-        // Completion must run even when validation rejects a cycle: otherwise
-        // the graph's driver waits for a client that already stopped reading.
-        defer {
-            for (self.ports[0..self.ports_count]) |port| if (port.io) |io| atomicStore(io, 0, 1);
-            atomicStore(activation, 8, 1);
-            store(u64, activation, 48, now());
-            atomicStore(activation, 0, 3);
-            for (self.peers) |entry| if (entry) |peer| {
-                const pending: *i32 = @ptrCast(@alignCast(peer.activation[16..].ptr));
-                if (@atomicRmw(i32, pending, .Sub, 1, .acq_rel) == 1) {
-                    store(u64, peer.activation, 32, now());
-                    atomicStore(peer.activation, 0, 1);
-                    const one: u64 = 1;
-                    _ = linux.write(peer.fd, std.mem.asBytes(&one).ptr, 8);
-                }
-            };
-        }
+        var handed_off = false;
+        defer if (!handed_off) self.finishCycle();
         if (!self.running) return null;
         const clock = self.position orelse return error.InvalidMemory;
         const rate_num = load(u32, clock, 80);
@@ -300,11 +340,11 @@ pub const Client = struct {
         self.diagnostic.graph_rate_hz = rate;
         self.diagnostic.graph_position = position;
         self.diagnostic.graph_duration = duration;
-        if (rate_num != 1 or rate < 8000 or rate > 192000 or duration == 0 or duration > self.samples.len) return error.UnsupportedFormat;
+        if (rate_num != 1 or rate < 8000 or rate > 192000 or duration == 0 or duration > samples_max) return error.UnsupportedFormat;
         if (self.previous) |previous| {
             if (count != 1 or (previous.clock == clock_id and previous.rate == rate and position != previous.position +% previous.duration)) return error.TimelineDiscontinuity;
         }
-        var samples_count: ?usize = null;
+        var block: Block = undefined;
         var header_present = false;
         var all_silent = true;
         for (self.ports[0..self.ports_count], 0..) |port, channel| {
@@ -361,24 +401,44 @@ pub const Client = struct {
             // leave chunk.size at its initial quantum when the graph quantum
             // changes; bound this cycle against the mapped capacity instead.
             const n: usize = @intCast(duration);
-            if (samples_count != null and samples_count.? != n) return error.InvalidBuffer;
-            samples_count = n;
+
             all_silent = all_silent and silent;
-            for (self.samples[0..n], 0..) |*dest, index| {
-                const value = if (silent) 0 else load(f32, data, (offset + index * 4) % data.len);
-                if (!std.math.isFinite(value)) {
-                    self.diagnostic.invalid_sample_index = index;
-                    return error.InvalidBuffer;
-                }
-                if (channel == 0) dest.* = value else dest.* += value;
-            }
+            const first_bytes = @min(n * 4, data.len - offset);
+            block.channels[channel] = if (silent) .silence else .{ .samples = .{
+                .first = std.mem.bytesAsSlice(f32, data[offset..][0..first_bytes]),
+                .second = std.mem.bytesAsSlice(f32, data[0 .. n * 4 - first_bytes]),
+            } };
         }
-        const n = samples_count orelse return null;
-        if (self.ports_count > 1) for (self.samples[0..n]) |*value| {
-            value.* /= @floatFromInt(self.ports_count);
-        };
+        if (self.ports_count == 0) return null;
         self.previous = .{ .position = position, .duration = duration, .rate = rate, .clock = clock_id };
-        return .{ .samples = self.samples[0..n], .rate = rate, .position = position, .header_present = header_present, .silence = all_silent };
+        block.channels_count = self.ports_count;
+        block.samples_count = @intCast(duration);
+        block.rate = rate;
+        block.position = position;
+        block.header_present = header_present;
+        block.silence = all_silent;
+        block.client = self;
+        handed_off = true;
+        return block;
+    }
+
+    // Release on every path, including conversion errors. Delaying this until
+    // the caller consumes Block prevents PipeWire from recycling borrowed PCM.
+    pub fn finishCycle(self: *Client) void {
+        const activation = self.activation.?;
+        for (self.ports[0..self.ports_count]) |port| if (port.io) |io| atomicStore(io, 0, 1);
+        atomicStore(activation, 8, 1);
+        store(u64, activation, 48, now());
+        atomicStore(activation, 0, 3);
+        for (self.peers) |entry| if (entry) |peer| {
+            const pending: *i32 = @ptrCast(@alignCast(peer.activation[16..].ptr));
+            if (@atomicRmw(i32, pending, .Sub, 1, .acq_rel) == 1) {
+                store(u64, peer.activation, 32, now());
+                atomicStore(peer.activation, 0, 1);
+                const one: u64 = 1;
+                _ = linux.write(peer.fd, std.mem.asBytes(&one).ptr, 8);
+            }
+        };
     }
 
     /// Publish the current graph format for stream observers. Call only when
@@ -496,7 +556,7 @@ pub const Client = struct {
             try self.bind(id, interface, @min(version, 3), object.proxy);
         }
         for (&self.catalog) |*entry| if (entry.* == null) {
-            entry.* = object;
+            entry.* = try self.text.replace(null, object);
             return;
         };
         return error.CatalogFull;
@@ -507,8 +567,9 @@ pub const Client = struct {
         var selected: ?Object = null;
         var matches: usize = 0;
         for (self.catalog) |entry| {
-            const object = entry orelse continue;
-            if (object.kind != .node or !object.is_source) continue;
+            const stored = entry orelse continue;
+            if (stored.data != .node or !stored.data.node.is_source) continue;
+            const object = stored.expand(&self.text);
             const device = self.find(object.parent);
             const matches_source = switch (self.source) {
                 .default => self.default_source.size == 0 or std.mem.eql(u8, object.name.get(), self.default_source.get()),
@@ -524,8 +585,9 @@ pub const Client = struct {
         const node = selected.?;
         self.selected = .{ .node = node, .device = self.find(node.parent) };
         for (self.catalog) |entry| {
-            const object = entry orelse continue;
-            if (object.kind != .port or object.parent != node.id or !object.is_output) continue;
+            const stored = entry orelse continue;
+            if (stored.data != .port or stored.data.port.parent != node.id or !stored.data.port.is_output) continue;
+            const object = stored.expand(&self.text);
             if (self.ports_count == self.ports.len) return error.TooManyChannels;
             self.ports[self.ports_count] = .{ .source_global = object.id, .source_port = object.port, .channel = object.channel };
             self.ports_count += 1;
@@ -569,8 +631,8 @@ pub const Client = struct {
         if (self.node_id == invalid) return;
         for (self.ports[0..self.ports_count], 0..) |_, index| {
             var found = false;
-            for (self.catalog) |entry| if (entry) |object| {
-                if (object.kind == .port and object.parent == self.node_id and object.port == index) {
+            for (self.catalog) |entry| if (entry) |stored| {
+                if (stored.data == .port and stored.data.port.parent == self.node_id and stored.data.port.number == index) {
                     found = true;
                     break;
                 }
@@ -877,7 +939,7 @@ pub const Client = struct {
     }
     fn find(self: *const Client, id: u32) ?Object {
         if (id == invalid) return null;
-        for (self.catalog) |entry| if (entry != null and entry.?.id == id) return entry;
+        for (self.catalog) |entry| if (entry != null and entry.?.id == id) return entry.?.expand(&self.text);
         return null;
     }
     fn bind(self: *Client, id: u32, interface: []const u8, version: u32, proxy: u32) Error!void {
@@ -896,6 +958,125 @@ pub const Client = struct {
         for (values) |value| try w.int(value);
         try w.finish(0);
         try self.connection.send(object, opcode, w.data());
+    }
+};
+
+// The catalog stores only the fields meaningful for each interface. Public
+// Object/Identity values are transient expanded views used by selection and
+// diagnostics; their fixed strings are never repeated in every catalog slot.
+const BlockIndex = enum(u16) { _ };
+const TextRef = struct { first: BlockIndex = @enumFromInt(0), size: u16 = 0 };
+const StoredObject = struct {
+    id: u32,
+    serial: u64,
+    proxy: u32,
+    data: union(ObjectKind) {
+        node: struct { parent: u32, priority: i32, is_source: bool, name: TextRef, description: TextRef },
+        device: struct { serial: TextRef, description: TextRef },
+        port: struct { parent: u32, number: u32, is_output: bool, channel: TextRef },
+    },
+
+    fn references(self: StoredObject) [2]TextRef {
+        return switch (self.data) {
+            .node => |n| .{ n.name, n.description },
+            .device => |d| .{ d.serial, d.description },
+            .port => |p| .{ p.channel, .{} },
+        };
+    }
+    pub fn expand(self: StoredObject, text: *const TextStorage) Object {
+        var object: Object = .{ .id = self.id, .serial = self.serial, .proxy = self.proxy, .kind = std.meta.activeTag(self.data) };
+        switch (self.data) {
+            .node => |n| {
+                object.parent = n.parent;
+                object.priority = n.priority;
+                object.is_source = n.is_source;
+                object.name = text.read(n.name);
+                object.description = text.read(n.description);
+            },
+            .device => |d| {
+                object.device_serial = text.read(d.serial);
+                object.description = text.read(d.description);
+            },
+            .port => |p| {
+                object.parent = p.parent;
+                object.port = p.number;
+                object.is_output = p.is_output;
+                object.channel = text.read(p.channel);
+            },
+        }
+        return object;
+    }
+};
+const TextStorage = struct {
+    // 128 objects × at most two meaningful strings × 256 bytes. This
+    // covers the full existing limits, including replacement at full capacity.
+    bytes: [1024][64]u8 = undefined,
+    next: [1024]BlockIndex = undefined,
+    free: std.StaticBitSet(1024) = .initFull(),
+
+    fn replace(self: *TextStorage, previous: ?StoredObject, object: Object) Error!StoredObject {
+        const strings: [2][]const u8 = switch (object.kind) {
+            .node => .{ object.name.get(), object.description.get() },
+            .device => .{ object.device_serial.get(), object.description.get() },
+            .port => .{ object.channel.get(), "" },
+        };
+        var available = self.free.count();
+        if (previous) |old| for (old.references()) |ref| {
+            available += blocks(ref.size);
+        };
+        if (blocks(strings[0].len) + blocks(strings[1].len) > available) return error.CatalogTextFull;
+        // Check before releasing old text: an exhausted pool preserves the
+        // previous catalog for the error report. No allocation can fail below.
+        if (previous) |old| self.releaseObject(old);
+        const a = self.store(strings[0]);
+        const b = self.store(strings[1]);
+        return .{ .id = object.id, .serial = object.serial, .proxy = object.proxy, .data = switch (object.kind) {
+            .node => .{ .node = .{ .parent = object.parent, .priority = object.priority, .is_source = object.is_source, .name = a, .description = b } },
+            .device => .{ .device = .{ .serial = a, .description = b } },
+            .port => .{ .port = .{ .parent = object.parent, .number = object.port, .is_output = object.is_output, .channel = a } },
+        } };
+    }
+    fn store(self: *TextStorage, text: []const u8) TextRef {
+        var ref: TextRef = .{ .size = @intCast(text.len) };
+        var link = &ref.first;
+        var offset: usize = 0;
+        while (offset < text.len) {
+            const index = self.free.findFirstSet().?;
+            self.free.unset(index);
+            link.* = @enumFromInt(index);
+            const count = @min(64, text.len - offset);
+            @memcpy(self.bytes[index][0..count], text[offset..][0..count]);
+            offset += count;
+            link = &self.next[index];
+        }
+        return ref;
+    }
+    fn releaseObject(self: *TextStorage, object: StoredObject) void {
+        for (object.references()) |ref| {
+            var index = ref.first;
+            for (0..blocks(ref.size)) |ordinal| {
+                const i = @intFromEnum(index);
+                std.debug.assert(!self.free.isSet(i));
+                self.free.set(i);
+                if (ordinal + 1 < blocks(ref.size)) index = self.next[i];
+            }
+        }
+    }
+    fn read(self: *const TextStorage, ref: TextRef) Text {
+        var result: Text = .{ .size = ref.size };
+        var offset: usize = 0;
+        var index = ref.first;
+        while (offset < ref.size) {
+            const i = @intFromEnum(index);
+            const count = @min(64, ref.size - offset);
+            @memcpy(result.bytes[offset..][0..count], self.bytes[i][0..count]);
+            offset += count;
+            if (offset < ref.size) index = self.next[i];
+        }
+        return result;
+    }
+    fn blocks(bytes: usize) usize {
+        return (bytes + 63) / 64;
     }
 };
 
@@ -969,4 +1150,79 @@ pub fn now() u64 {
     var ts: linux.timespec = undefined;
     _ = linux.clock_gettime(.MONOTONIC, &ts);
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+test "catalog text reuses full capacity on replacement and removal" {
+    var pool: TextStorage = .{};
+    var entries: [128]StoredObject = undefined;
+    var object: Object = .{ .kind = .node, .id = 1 };
+    try object.name.set(&(@as([256]u8, @splat('n'))));
+    try object.description.set(&(@as([256]u8, @splat('d'))));
+    for (&entries, 0..) |*entry, index| {
+        object.id = @intCast(index);
+        entry.* = try pool.replace(null, object);
+    }
+    try std.testing.expectEqual(@as(usize, 0), pool.free.count());
+    for (0..4096) |iteration| {
+        const slot = iteration % entries.len;
+        object.id = @intCast(slot);
+        object.name.bytes[0] = @truncate(iteration);
+        entries[slot] = try pool.replace(entries[slot], object);
+        const expanded = entries[slot].expand(&pool);
+        try std.testing.expectEqualSlices(u8, object.name.get(), expanded.name.get());
+    }
+    try std.testing.expectError(error.CatalogTextFull, pool.replace(null, object));
+    for (entries) |entry| pool.releaseObject(entry);
+    try std.testing.expectEqual(@as(usize, 1024), pool.free.count());
+}
+
+test "eight-channel setup and link request batches fit the output queue" {
+    var client: Client = .{ .source = .default, .client_node_version = 5 };
+    var source: Object = .{ .kind = .node, .id = 10, .is_source = true };
+    try source.name.set(&(@as([256]u8, @splat('n'))));
+    client.catalog[0] = try client.text.replace(null, source);
+    for (0..8) |channel| {
+        var port: Object = .{ .kind = .port, .id = @intCast(20 + channel), .parent = 10, .port = @intCast(channel), .is_output = true };
+        try port.channel.set("AUX0");
+        client.catalog[1 + channel] = try client.text.replace(null, port);
+    }
+    try client.createStream();
+    const setup_bytes = client.connection.output_size;
+    client.node_id = 50;
+    for (0..8) |channel| {
+        client.catalog[9 + channel] = try client.text.replace(null, .{ .kind = .port, .id = @intCast(60 + channel), .parent = 50, .port = @intCast(channel) });
+    }
+    // Include both batches together, without an intervening flush.
+    try client.createLinks();
+    try client.publishFormat(192000);
+    std.debug.print("request bytes: setup={d}, setup+links+format={d}, capacity={d}\n", .{ setup_bytes, client.connection.output_size, client.connection.output.len });
+    try std.testing.expect(client.links_created);
+}
+
+test "borrowed samples mix wrapped spans and silence and retain failing channel details" {
+    var client: Client = .{ .source = .default };
+    var io: [8]u8 = @splat(0);
+    var chunk: [16]u8 = @splat(0);
+    store(u32, &chunk, 0, 12);
+    store(u32, &chunk, 4, 16);
+    store(i32, &chunk, 8, 4);
+    client.ports[0].io = &io;
+    client.ports[0].buffers[0].chunk = &chunk;
+    var first = [_]f32{ 2, 4 };
+    const second = [_]f32{ 6, 8 };
+    var block: Block = undefined;
+    block.client = &client;
+    block.channels_count = 2;
+    block.samples_count = 4;
+    block.channels[0] = .{ .samples = .{ .first = &first, .second = &second } };
+    block.channels[1] = .silence;
+    for (0..4) |index| try std.testing.expectEqual(@as(f32, @floatFromInt(index + 1)), try block.sample(index));
+    first[1] = std.math.nan(f32);
+    client.diagnostic.channel = 1;
+    client.diagnostic.header_sequence = 99;
+    try std.testing.expectError(error.InvalidBuffer, block.sample(1));
+    try std.testing.expectEqual(@as(usize, 0), client.diagnostic.channel);
+    try std.testing.expectEqual(@as(?usize, 1), client.diagnostic.invalid_sample_index);
+    try std.testing.expectEqual(@as(u32, 12), client.diagnostic.chunk_offset);
+    try std.testing.expectEqual(@as(u64, 0), client.diagnostic.header_sequence);
 }

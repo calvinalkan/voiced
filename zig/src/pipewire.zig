@@ -389,7 +389,6 @@ fn runCapture(launch: Launch, client: *native.Client, report: *Report) !void {
     if (!beginNextAvailableSlot(&capture)) return error.AudioExchangeFull;
     defer abandonUnpublishedActiveSlot(&capture);
     var resampler: audio_resampler.Resampler = .{};
-    var converted: [audio_exchange.callback_samples_count_max]f32 = undefined;
     var negotiated: ?NegotiatedFormat = null;
     var outcome: TerminalOutcome = .none;
     var capture_error: ?anyerror = null;
@@ -411,8 +410,8 @@ fn runCapture(launch: Launch, client: *native.Client, report: *Report) !void {
             capture_error = error.CapturePollFailed;
             break;
         }
-        // A stop applies at the last completed graph cycle. The native client
-        // has already returned its buffers before exposing mono scratch here.
+        // A stop applies at the last completed graph cycle. Its borrowed
+        // buffers have been returned before re-entering this poll loop.
         if (fds[0].revents != 0) {
             var command: ControlPacket = undefined;
             const received = linux.recvfrom(launch.control_socket, std.mem.asBytes(&command).ptr, @sizeOf(ControlPacket), linux.MSG.DONTWAIT | linux.MSG.TRUNC, null, null);
@@ -437,43 +436,61 @@ fn runCapture(launch: Launch, client: *native.Client, report: *Report) !void {
             break;
         }
         if (fds[2].revents & linux.POLL.IN == 0) continue;
-        const start = monotonicNanoseconds();
-        const block = client.process() catch |err| {
-            capture_error = captureErrorAfterPendingEvents(client, err);
-            break;
-        } orelse {
-            if (capture.callback_state == .observed) {
-                observeCallback(&capture, start);
-                capture.callback_state.observed.missing_buffers_count += 1;
-            }
-            continue;
-        };
-        if (capture.callback_state == .unobserved) audio_exchange.publishTimelineValidation(launch.exchange, .full);
-        observeCallback(&capture, start);
-        if (block.header_present) capture.callback_state.observed.header_metadata_buffers_count += 1;
-        if (negotiated == null or negotiated.?.sample_rate_hz != block.rate) {
-            client.publishFormat(block.rate) catch |err| {
+        {
+            const start = monotonicNanoseconds();
+            const block = client.process() catch |err| {
+                capture_error = captureErrorAfterPendingEvents(client, err);
+                break;
+            } orelse {
+                if (capture.callback_state == .observed) {
+                    observeCallback(&capture, start);
+                    capture.callback_state.observed.missing_buffers_count += 1;
+                }
+                continue;
+            };
+            defer client.finishCycle();
+            if (capture.callback_state == .unobserved) audio_exchange.publishTimelineValidation(launch.exchange, .full);
+            observeCallback(&capture, start);
+            if (block.header_present) capture.callback_state.observed.header_metadata_buffers_count += 1;
+
+            resampler.configure(block.rate) catch |err| {
                 capture_error = err;
                 break;
             };
-        }
-        negotiated = .{ .sample_rate_hz = block.rate, .channels_count = @intCast(client.ports_count) };
-        resampler.configure(block.rate) catch |err| {
-            capture_error = err;
-            break;
-        };
-        const samples = resampler.process(block.samples, &converted) catch |err| {
-            capture_error = err;
-            break;
-        };
-        if (samples.len > 0) {
-            outcome = publishCompleteBlock(&capture, .{ .samples = .{ .first_bytes = std.mem.sliceAsBytes(samples), .second_bytes = &.{} } });
-            if (block.silence and block.header_present and outcome != .pipeline_full) {
-                capture.callback_state.observed.header_gap_buffers_count += 1;
-                capture.callback_state.observed.header_gap_samples_count += @intCast(samples.len);
+            const count = resampler.outputCount(block.samples_count);
+            if (count > audio_exchange.callback_samples_count_max) {
+                capture_error = error.OutputFull;
+                break;
             }
+            if (count > capture.slot_samples_boundary - capture.active_slot.?.samples_count) {
+                publishActiveSlotIfNonEmpty(&capture);
+                if (!beginNextAvailableSlot(&capture)) {
+                    outcome = .pipeline_full;
+                    break;
+                }
+            }
+            const active = capture.active_slot.?;
+            const destination = active.writer.slot.samples[active.samples_count..][0..count];
+            const samples = resampler.process(&block, destination) catch |err| {
+                capture_error = err;
+                break;
+            };
+            if (samples.len > 0) {
+                outcome = publishCompleteBlock(&capture, samples);
+                if (block.silence and block.header_present and outcome != .pipeline_full) {
+                    capture.callback_state.observed.header_gap_buffers_count += 1;
+                    capture.callback_state.observed.header_gap_samples_count += @intCast(samples.len);
+                }
+            }
+            capture.callback_state.observed.duration_ns_max = @max(capture.callback_state.observed.duration_ns_max, monotonicNanoseconds() -| start);
         }
-        capture.callback_state.observed.duration_ns_max = @max(capture.callback_state.observed.duration_ns_max, monotonicNanoseconds() -| start);
+        if (negotiated == null or negotiated.?.sample_rate_hz != resampler.input_rate) {
+            client.publishFormat(resampler.input_rate) catch |err| {
+                capture_error = err;
+                break;
+            };
+            negotiated = .{ .sample_rate_hz = resampler.input_rate, .channels_count = @intCast(client.ports_count) };
+        }
     }
     if (capture_error) |err| {
         // Before the first retained callback, discovery/format errors remain
@@ -643,16 +660,18 @@ fn writeErrorDescription(client: *const native.Client, err: anyerror, writer: *s
     if (client.diagnostic.invalid_sample_index) |index| try writer.print("; invalid_sample_index={d}", .{index});
     if (err == error.SourceNotFound or err == error.SourceAmbiguous) {
         try writer.print("; available sources:", .{});
-        for (client.catalog) |entry| if (entry) |object| {
-            if (object.kind != .node or !object.is_source) continue;
-            var serial: []const u8 = "";
-            for (client.catalog) |candidate| if (candidate) |device| {
-                if (device.kind == .device and device.id == object.parent) {
-                    serial = device.device_serial.get();
+        for (client.catalog) |entry| if (entry) |stored| {
+            if (stored.data != .node or !stored.data.node.is_source) continue;
+            const object = stored.expand(&client.text);
+            var serial: native.Text = .{};
+            for (client.catalog) |candidate| if (candidate) |stored_device| {
+                if (stored_device.data == .device and stored_device.id == object.parent) {
+                    // Own the expanded text until the diagnostic is formatted.
+                    serial = stored_device.expand(&client.text).device_serial;
                     break;
                 }
             };
-            try writer.print(" [name=\"{f}\", description=\"{f}\", serial=\"{f}\"]", .{ std.zig.fmtString(object.name.get()), std.zig.fmtString(object.description.get()), std.zig.fmtString(serial) });
+            try writer.print(" [name=\"{f}\", description=\"{f}\", serial=\"{f}\"]", .{ std.zig.fmtString(object.name.get()), std.zig.fmtString(object.description.get()), std.zig.fmtString(serial.get()) });
         };
     }
 }
@@ -712,28 +731,6 @@ const TerminalOutcome = enum(u8) {
     buffer_return_error,
 };
 
-const ValidatedAudioBlock = union(enum) {
-    empty,
-    silence: struct {
-        samples_count: u32,
-        header_marked_gap: bool,
-    },
-    samples: struct {
-        first_bytes: []const u8,
-        second_bytes: []const u8,
-    },
-
-    fn samplesCount(block: ValidatedAudioBlock) u32 {
-        return switch (block) {
-            .empty => 0,
-            .silence => |silence| silence.samples_count,
-            .samples => |samples| @intCast(
-                (samples.first_bytes.len + samples.second_bytes.len) / @sizeOf(f32),
-            ),
-        };
-    }
-};
-
 const RealtimeCapture = struct {
     exchange: *AudioExchange,
     publication_event_fd: linux.fd_t,
@@ -750,10 +747,9 @@ const RealtimeCapture = struct {
 };
 fn publishCompleteBlock(
     realtime: *RealtimeCapture,
-    block: ValidatedAudioBlock,
+    destination_samples: []f32,
 ) TerminalOutcome {
-    const block_samples_count = block.samplesCount();
-    assert(block != .empty);
+    const block_samples_count: u32 = @intCast(destination_samples.len);
     assert(block_samples_count > 0);
     assert(block_samples_count <= audio_exchange.callback_samples_count_max);
     assert(block_samples_count <= realtime.slot_samples_boundary);
@@ -763,69 +759,21 @@ fn publishCompleteBlock(
     assert(realtime.samples_count <
         realtime.recording_samples_target + audio_exchange.callback_samples_count_max);
 
-    // Slots contain complete callback blocks only. If this block does not fit,
-    // publish the preceding prefix and claim any slot already released by the
-    // consumer. Failing that claim is real pipeline pressure: overwriting a
-    // published slot would race the model process and corrupt retained audio.
-    const active_samples_count = realtime.active_slot.?.samples_count;
-    if (block_samples_count >
-        realtime.slot_samples_boundary - active_samples_count)
-    {
-        publishActiveSlotIfNonEmpty(realtime);
-        if (!beginNextAvailableSlot(realtime)) {
-            return .pipeline_full;
+    const active_slot = &realtime.active_slot.?;
+    // Conversion wrote only into this unpublished suffix. Normalize in place;
+    // a rejected suffix never advances the publication count.
+    var clipped: u32 = 0;
+    for (destination_samples) |*sample| {
+        if (!std.math.isFinite(sample.*)) return .invalid_buffer;
+        if (sample.* > 1) {
+            sample.* = 1;
+            clipped += 1;
+        } else if (sample.* < -1) {
+            sample.* = -1;
+            clipped += 1;
         }
     }
-
-    const active_slot = &realtime.active_slot.?;
-    const destination_samples = active_slot.writer.slot.samples[active_slot.samples_count..][0..block_samples_count];
-
-    switch (block) {
-        .empty => unreachable,
-        .silence => @memset(destination_samples, 0),
-        .samples => |samples| {
-            // Retain normalized Float32 samples in the private shared slot.
-            // Clamp overdrive and count it before release-publication; the
-            // activity detector consumes exactly the retained samples.
-            var destination_index: usize = 0;
-            var block_clipped_samples_count: u32 = 0;
-            for ([_][]const u8{ samples.first_bytes, samples.second_bytes }) |source_bytes| {
-                assert(source_bytes.len % @sizeOf(f32) == 0);
-                var source_offset: usize = 0;
-                while (source_offset < source_bytes.len) : (source_offset += @sizeOf(f32)) {
-                    var sample = std.mem.bytesToValue(
-                        f32,
-                        source_bytes[source_offset..][0..@sizeOf(f32)],
-                    );
-                    if (!std.math.isFinite(sample)) {
-                        return .invalid_buffer;
-                    }
-                    if (sample > 1.0) {
-                        sample = 1.0;
-                        block_clipped_samples_count += 1;
-                    } else if (sample < -1.0) {
-                        sample = -1.0;
-                        block_clipped_samples_count += 1;
-                    }
-
-                    destination_samples[destination_index] = sample;
-                    destination_index += 1;
-                }
-            }
-            assert(destination_index == destination_samples.len);
-            realtime.callback_state.observed.clipped_samples_count +=
-                block_clipped_samples_count;
-        },
-    }
-
-    // Count a Header gap only after its zero block has entered an owned slot.
-    // Validation alone is insufficient: pipeline pressure can reject a valid
-    // borrowed block before publication, and diagnostics must describe retained
-    // audio rather than samples that were returned to PipeWire untouched.
-    if (block == .silence and block.silence.header_marked_gap) {
-        realtime.callback_state.observed.header_gap_buffers_count += 1;
-        realtime.callback_state.observed.header_gap_samples_count += block_samples_count;
-    }
+    realtime.callback_state.observed.clipped_samples_count += clipped;
 
     const activity = realtime.activity_detector.observe(destination_samples);
 

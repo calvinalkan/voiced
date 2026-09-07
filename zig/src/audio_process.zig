@@ -135,11 +135,11 @@ pub fn sendControl(socket: std.posix.fd_t, command: ControlCommand) !void {
 }
 
 /// `PipeWireWorker` is the real audio role used by the one-binary supervisor.
-/// The supervisor sends bounded capture settings and transfers the audio memfd
-/// plus publication eventfd in one launch message. The worker returns the same
-/// logical final report used by service recordings.
+/// The supervisor transfers the audio memfd and publication eventfd once, then
+/// sends bounded capture settings per recording. Each final report acknowledges
+/// that the stream is closed and shared slots can be reused.
 pub const PipeWireWorker = struct {
-    pub const protocol_version: u16 = 6;
+    pub const protocol_version: u16 = 7;
 
     pub const LaunchOptions = struct {
         session_id: u64,
@@ -148,36 +148,27 @@ pub const PipeWireWorker = struct {
         automatic_stop: AutomaticStop,
     };
 
-    /// `sendLaunch` keeps descriptor transfer and fixed-record construction on
-    /// one side of the process API. The sender retains both descriptors; the
-    /// worker receives close-on-exec duplicates referring to the same objects.
-    pub fn sendLaunch(
-        control_socket: std.posix.fd_t,
-        audio_exchange_fd: std.posix.fd_t,
-        publication_event_fd: std.posix.fd_t,
-        options: LaunchOptions,
-    ) !void {
-        assert(control_socket >= 0);
-        assert(audio_exchange_fd >= 0);
-        assert(publication_event_fd >= 0);
-        assert(options.session_id > 0);
-        assert(options.recording_samples_target > 0);
-        assert(options.recording_samples_target <=
-            std.math.maxInt(u32) - audio_exchange.callback_samples_count_max);
-        switch (options.source) {
-            .default => {},
-            .node_name, .device_serial => |source| {
-                assert(source.len > 0);
-                assert(source.len < target_name_capacity);
-            },
-        }
+    // Shared descriptors are installed once per worker lifetime. Subsequent
+    // recordings carry only a value packet; the same mapped slots are reused.
+    pub fn initialize(socket: std.posix.fd_t, exchange: std.posix.fd_t, publication: std.posix.fd_t) !void {
+        const version: u32 = protocol_version;
+        try descriptor_handoff.send(socket, &version, &.{ exchange, publication });
+    }
 
-        const launch_packet = buildLaunchPacket(options);
-        const descriptors = [_]std.posix.fd_t{
-            audio_exchange_fd,
-            publication_event_fd,
-        };
-        try descriptor_handoff.send(control_socket, &launch_packet, &descriptors);
+    pub fn receiveReady(socket: std.posix.fd_t) !bool {
+        var version: u32 = undefined;
+        const result = std.os.linux.recvfrom(socket, std.mem.asBytes(&version).ptr, @sizeOf(u32), std.os.linux.MSG.DONTWAIT | std.os.linux.MSG.TRUNC, null, null);
+        switch (std.os.linux.errno(result)) {
+            .AGAIN, .INTR => return false,
+            .SUCCESS => if (result != @sizeOf(u32) or version != protocol_version) return error.InvalidAudioReady,
+            else => return error.AudioReadyReadFailed,
+        }
+        return true;
+    }
+
+    pub fn sendLaunch(socket: std.posix.fd_t, options: LaunchOptions) !void {
+        const packet = buildLaunchPacket(options);
+        try sendPacket(socket, std.mem.asBytes(&packet));
     }
 
     /// `decodeReport` checks wire enums before any `@enumFromInt`. Field
@@ -374,7 +365,7 @@ pub const PipeWireWorker = struct {
         }
     }
 
-    /// `run` enters one real PipeWire capture after exec. It binds its lifetime
+    /// `run` reuses one capture worker across recordings. It binds its lifetime
     /// to the expected supervisor before receiving shared resources, then owns
     /// and closes every descriptor installed by `SCM_RIGHTS`.
     pub fn run(
@@ -389,23 +380,33 @@ pub const PipeWireWorker = struct {
         unblockServiceSignals();
         defer closeFileDescriptor(control_socket);
 
-        var launch_packet: WireLaunch = undefined;
-        var shared_descriptors = try descriptor_handoff.receive(
-            control_socket,
-            &launch_packet,
-        );
+        var version: u32 = undefined;
+        var shared_descriptors = try descriptor_handoff.receive(control_socket, &version);
         defer shared_descriptors.deinit();
+        if (version != protocol_version) return error.InvalidAudioVersion;
+        const mapped_exchange = try mapAudioExchange(shared_descriptors.values[0]);
+        defer mapped_exchange.unmap();
+        try sendPacket(control_socket, std.mem.asBytes(&version));
 
-        assert(shared_descriptors.values[0] != control_socket);
-        assert(shared_descriptors.values[1] != control_socket);
-        assert(shared_descriptors.values[0] != shared_descriptors.values[1]);
-        try runAudioWorkerSession(
-            control_socket,
-            shared_descriptors.values[0],
-            shared_descriptors.values[1],
-            launch_packet,
-            environment,
-        );
+        while (true) {
+            var launch_packet: WireLaunch = undefined;
+            const received = std.os.linux.recvfrom(control_socket, std.mem.asBytes(&launch_packet).ptr, @sizeOf(WireLaunch), std.os.linux.MSG.TRUNC, null, null);
+            switch (std.os.linux.errno(received)) {
+                .INTR => continue,
+                .SUCCESS => {},
+                else => return error.AudioCommandReadFailed,
+            }
+            if (received == 0) return;
+            // Stop/cancel can race an automatic completion. They belong to the
+            // completed session, never to the next start packet on this socket.
+            if (received == @sizeOf(pipewire.ControlPacket)) {
+                const command = std.mem.bytesToValue(pipewire.ControlPacket, std.mem.asBytes(&launch_packet)[0..@sizeOf(pipewire.ControlPacket)]);
+                if (command.reserved != 0 or command.command > @intFromEnum(pipewire.ControlCommand.cancel)) return error.InvalidAudioCommand;
+                continue;
+            }
+            if (received != @sizeOf(WireLaunch)) return error.InvalidAudioCommand;
+            try runAudioWorkerSession(control_socket, mapped_exchange.exchange, shared_descriptors.values[1], launch_packet, environment);
+        }
     }
 
     const WireLaunch = extern struct {
@@ -767,36 +768,30 @@ fn validateReportPacket(
 
 fn runAudioWorkerSession(
     supervisor_socket: std.posix.fd_t,
-    exchange_fd: std.posix.fd_t,
+    exchange: *AudioExchange,
     publication_event_fd: std.posix.fd_t,
     launch_packet: PipeWireWorker.WireLaunch,
     environment: pipewire.Environment,
 ) !void {
     assert(supervisor_socket >= 0);
-    assert(exchange_fd >= 0);
     assert(publication_event_fd >= 0);
-    assert(supervisor_socket != exchange_fd);
     assert(supervisor_socket != publication_event_fd);
-    assert(exchange_fd != publication_event_fd);
 
     // Decode the fixed transport record once. Ordinary worker setup below uses
     // the logical source union, so a default source cannot carry stale text and
     // named source variants cannot exist without their required name.
     const launch = PipeWireWorker.decodeTrustedLaunch(&launch_packet);
 
-    const mapped_exchange = try mapAudioExchange(exchange_fd);
-    defer mapped_exchange.unmap();
-
     // The supervisor asserts the same postconditions immediately after it
     // initializes this trusted memfd. Repeat them here so the worker's launch
     // assumptions are visible without following an assertion helper.
-    assert(mapped_exchange.exchange.version == audio_exchange.format_version);
-    assert(mapped_exchange.exchange.timeline_validation_atomic == 0);
-    assert(mapped_exchange.exchange.session_id == launch.session_id);
-    assert(mapped_exchange.exchange.audio_callbacks_count_atomic == 0);
-    assert(mapped_exchange.exchange.audio_samples_count_atomic == 0);
-    assert(mapped_exchange.exchange.reserved_2 == 0);
-    for (&mapped_exchange.exchange.slots) |*slot| {
+    assert(exchange.version == audio_exchange.format_version);
+    assert(exchange.timeline_validation_atomic == 0);
+    assert(exchange.session_id == launch.session_id);
+    assert(exchange.audio_callbacks_count_atomic == 0);
+    assert(exchange.audio_samples_count_atomic == 0);
+    assert(exchange.reserved_2 == 0);
+    for (&exchange.slots) |*slot| {
         assert(@atomicLoad(
             u32,
             &slot.published_samples_count_atomic,
@@ -806,7 +801,7 @@ fn runAudioWorkerSession(
     }
 
     const worker_result = pipewire.run(.{
-        .exchange = mapped_exchange.exchange,
+        .exchange = exchange,
         .publication_event_fd = publication_event_fd,
         .control_socket = supervisor_socket,
         .source = launch.source,
@@ -974,7 +969,7 @@ fn runAudioWorkerSession(
         &report_packet,
         launch.recording_samples_target,
         launch.automatic_stop,
-        mapped_exchange.exchange,
+        exchange,
     );
     try sendPacket(supervisor_socket, std.mem.asBytes(&report_packet));
 }

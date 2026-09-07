@@ -9,9 +9,12 @@ and offline reference comparisons.
 
 - `zig/src/supervisor.zig` owns lifecycle transitions, public commands, worker
   deadlines, and desktop delivery through one event loop.
-- The isolated audio worker owns its PipeWire stream. Capture callbacks perform
-  bounded validation/copying into shared Float32 slots, with no allocation,
-  blocking I/O, model work, or logging.
+- The persistent isolated audio worker owns its PipeWire connection per capture.
+  It validates borrowed graph buffers and resamples directly into unpublished
+  shared Float32 slots, with no allocation, blocking I/O, model work, or logging
+  in the capture callback.
+- The supervisor owns the native Wayland clipboard client. Published text stays
+  immutable until ownership and all outstanding transfers release its buffer.
 - The isolated model worker borrows sealed audio and publishes bounded results.
   Reuse shared storage only after the previous owners have finished or exited.
 - The runtime and its arena remain at stable addresses until workers are joined.
@@ -34,8 +37,6 @@ VOICED_INSTANCE=test agent-run './test.sh --zig-replay'
 
 The replay test uses the optional reference environment documented in the native
 README. Runtime corpus commands are documented in `zig/audio-fixtures/README.md`.
-The old `test.sh --zig` branch targets removed experimental commands; it is not
-part of the current checks.
 
 ## Test isolation
 

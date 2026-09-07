@@ -1,6 +1,6 @@
 # Voiced Zig daemon
 
-The native executable contains the production daemon, its CLI client, and three
+The native executable contains the production daemon, its CLI client, and two
 private worker roles. There are no experimental commands, synthetic workers,
 WAV-output modes, or test-configuration flags.
 
@@ -14,7 +14,7 @@ main.zig
 │            ├── transcription_process.zig resident Whisper worker and mailbox
 │            │   ├── model_cache.zig
 │            │   └── ../runtime/root.zig
-│            ├── clipboard_process.zig     guardian and wl-copy ownership
+│            ├── clipboard_wayland.zig     native Wayland clipboard and transfers
 │            └── paste_keyboard.zig        persistent native uinput keyboard
 └── listen / record / stop / cancel / status / kill → control socket
 ```
@@ -23,8 +23,9 @@ main.zig
 command. The audio and model processes need separate lifetimes so the daemon
 can terminate blocked capture or inference without surrendering session state.
 The supervisor transfers their shared descriptors through `SCM_RIGHTS`. The
-clipboard guardian instead inherits a transcript pipe and contains wl-copy's
-background owner and transfer children in a separate session.
+capture process stays alive and maps its shared exchange once, opening and
+closing the microphone for each recording. Native clipboard I/O runs in the
+supervisor's existing epoll loop.
 
 ## Build and install models
 
@@ -38,7 +39,7 @@ no external inference engine or C++ bridge. The checkpoint importer reads the
 published CTranslate2 serialization format, not CTranslate2 code or libraries.
 
 ```bash
-sudo apt install pipewire wl-clipboard
+sudo apt install pipewire
 cd zig
 zig build setup-models
 zig build
@@ -376,11 +377,11 @@ there is no dummy inference. Cancellation discards the session and releases its
 model process. Normal shutdown stops and reaps workers before removing the
 control socket.
 
-Accepted nonempty text is streamed through a nonblocking pipe to stock
-`wl-copy --type text/plain;charset=utf-8 --`. The two-second acquisition limit
-includes that transfer. A guardian preserves wl-copy's default launcher-exit
-signal and requires a surviving adopted instance of the same binary before
-reporting acquisition. A zero exit without an owner is a failure.
+Accepted nonempty text is borrowed directly by the native Wayland client.
+Selection publication has a two-second deadline. Data-control protocols are
+preferred; the core data-device fallback temporarily maps a transparent surface
+and waits for its destruction to reach the compositor before reporting
+acquisition. The connection and its transparent pixel buffer are reused.
 
 After acquisition, the supervisor waits `paste_settle_ms` (default 10 ms) and
 sends the configured chord through native Linux input events, with
@@ -398,28 +399,29 @@ event loop keeps serving commands. Completion
 means the kernel accepted the key releases, not proof that an application pasted.
 An uncertain paste is never retried. A paste error preserves the clipboard.
 
-The clipboard owner survives later recordings and model expiry. At most two
-guardians coexist during replacement; a failed candidate leaves the prior owner
-running where selection has not already changed. Normal selection loss retires
-ownership without copying again. Guardians reap transfer children; the supervisor
-is also a subreaper and contains their session if a guardian crashes. Cancellation
-during delivery stops further output but cannot undo a copy or paste already sent.
+The clipboard owner survives later recordings and model expiry. Two transcript
+buffers are reserved at startup. A buffer remains immutable while offered or
+borrowed by a paste transfer; availability is derived from those references.
+Eight transfers may coexist, each with a two-second deadline. When both buffers
+are borrowed, the next recording waits for one to become reusable. Selection
+loss retires ownership without copying again. Cancellation during delivery stops
+further output but cannot undo a copy or paste already sent.
 
 `--transcript-output stdout` retains the synchronous diagnostic sink: final text followed
 by a newline. Operational messages go to the journal. Discarded sessions and empty
 no-speech results emit no transcription. A capture failure can still deliver a
 successfully transcribed valid prefix while reporting the capture error.
 
-Output adds no C bindings, input helper daemon, or service thread. The external
-clipboard dependency is wl-clipboard. PipeWire capture, desktop notifications
-and native journal logging are implemented directly in Zig. Repository-level systemd installation
-remains separate work.
+Output adds no C bindings, clipboard helper process, input helper daemon, or
+service thread. Wayland clipboard, PipeWire capture, desktop notifications and
+journal logging are implemented directly in Zig. Desktop services and permission
+to use uinput are still required. Repository-level systemd installation remains
+separate work.
 
-## Native clipboard spike
+## Native clipboard verification
 
-The optional `clipboard-check` target exercises a native Wayland replacement
-before integration into `serve`. The service still uses its existing wl-copy
-guardian until desktop verification is complete.
+The optional `clipboard-check` target exercises the same native Wayland client
+used by `serve`. The service does not invoke wl-copy.
 
 ```bash
 cd zig
@@ -443,6 +445,9 @@ with an xdg-shell surface and GNOME's GTK surface extension when available. It
 uses no C bindings, dynamic libraries, worker processes or extra threads.
 Text remains borrowed while offered or being transferred. Two generations and
 eight transfers bound retention; each stalled transfer expires after two seconds.
+The connection reserves 64 KiB for incoming frames and 4 KiB for outgoing
+requests. Phase-specific deadlines, pending publications and fallback surfaces
+live in a tagged union; completed phases retain none of their temporary state.
 Acquisition waits for the fallback surface's destruction to reach the compositor,
 but cannot guarantee the eventual focus target of a globally injected shortcut.
 
@@ -513,7 +518,7 @@ Every service event is a single native journal datagram with real `PRIORITY`,
 `SYSLOG_IDENTIFIER=voiced`, and `VOICED_COMPONENT`. Where supplied by the caller,
 `VOICED_RECORDING_ORDINAL` provides the same recording identity in supervisor
 and transcription-worker events, without logger-owned recording state. Model
-cache and clipboard-worker events can instead be correlated by their journal PID. Newlines in error details stay inside one binary-encoded
+cache events can instead be correlated by their journal PID. Newlines in error details stay inside one binary-encoded
 `MESSAGE`; they cannot create extra journal fields. Human-readable messages
 use snake_case, concept-first field names. Numeric values carry no unit suffix;
 time fields name their unit, and `size` always means bytes. Free-text strings
@@ -558,10 +563,9 @@ full diagnostics before retaining only the notification category and delivery
 outcome. Mic ambiguity logs include the match count and candidate sources; use
 `microphone_node` **instead of** `microphone_serial` to select one input.
 
-`wl-copy` diagnostics retain 2 KiB of stderr plus an omitted-byte count, the
-original error/native errno, and the raw child wait status. Its guardian drains
-stderr even when retention is full and journals primary and cleanup errors
-separately. Capture's bounded source-list presentation can omit entries; the
+Clipboard diagnostics retain typed transport and protocol errors, native errno,
+and the compositor's error object, code and message. Capture's bounded
+source-list presentation can omit entries; the
 worker journals the complete observed candidate catalog on selection errors.
 For the full cause and affected recording, run:
 
@@ -677,14 +681,19 @@ selects one source, averages its channels, and resamples to mono 16 kHz with a
 fixed-memory low-pass filter. Supported graph rates are 8–192 kHz, with at most
 eight channels and 100 ms of audio per graph cycle. Complete blocks are
 validated, non-finite samples rejected, and finite overdrive clamped before
-publication into three shared slots. Audio processing performs no allocation,
+publication into three shared slots. Mixing reads borrowed planar graph buffers,
+including wrapped spans, and the resampler writes directly into an unpublished
+slot suffix. A failed conversion leaves the committed prefix unchanged. Audio
+processing performs no allocation,
 logging, model work, or blocking I/O. Inference borrows each sealed slot without
 quantization or a second waveform allocation. The fixed PCM exchange occupies
 about 5.49 MiB.
 
 `pipewire_protocol.zig` owns framing, SPA PODs and descriptor transfer;
 `pipewire_native.zig` owns discovery, source identity, graph mappings and DSP
-cycles. `pipewire.zig` owns recording policy and shared-slot publication through
+cycles. The 128-entry catalog stores kind-specific fields and string references;
+a reusable 64 KiB string pool covers every entry at its maximum string lengths.
+Protocol queues reserve 64 KiB input and 32 KiB output. `pipewire.zig` owns recording policy and shared-slot publication through
 one worker poll loop. `audio_resampler.zig` retains the conversion phase and
 filter history. `realtime.zig` requests realtime scheduling directly, falling
 back to RTKit over native D-Bus with a 500 ms deadline. Scheduling and memory
@@ -712,14 +721,15 @@ the private quiet confirmation tail instead of creating another silence chunk.
 Outside capacity-stop cases, activity and model confidence suppress normal
 no-speech results; disagreement is an explicit failure.
 
-The session transcript is allocated once at 64 UTF-8 bytes per configured
-recording second plus one full 4 KiB mailbox result. The one-hour default uses
-about 229 KiB. Reaching this bound, the 4 KiB chunk-text bound, or the decoder's
+Each transcript buffer is sized once at 64 UTF-8 bytes per configured recording
+second plus one full 4 KiB mailbox result. The one-hour default reserves about
+229 KiB per buffer: one for stdout, two (about 458 KiB) for clipboard/desktop.
+Unused payload pages are not eagerly initialized. Reaching this bound, the 4 KiB chunk-text bound, or the decoder's
 446-token bound stops further recording/transcription and delivers the available
 text. The final prefix ends at a complete UTF-8 character; words or sentences may
 be incomplete. Desktop mode copies, sends the paste shortcut, then saves;
-clipboard mode copies and saves. No buffer grows and no second transcript is
-allocated.
+clipboard mode copies and saves. Publication, transfers and saving borrow the
+same completed buffer; no buffer grows or is allocated per recording.
 
 A notification distinguishes recording size, chunk size, and decoder token
 limits. Decoder-limit text is retained even when confidence is low: it may repeat
@@ -764,10 +774,11 @@ buffer. The supervisor trims only the assembled final transcript.
 [The runtime guide](runtime/README.md) explains the native Whisper implementation.
 
 With `VOICED_INSTANCE=test`, run `./test.sh --zig-control` from the repository
-root for wire-layout, malformed packet/reply, deadline, acknowledgement, and
-old-listener exclusion checks. Run `./test.sh --zig-output` for
-guardian/process and CLI checks. `VOICED_ZIG_MODEL_TESTS=1 ./test.sh --zig-output`
-also exercises real inference, repeated delivery, replacement failures, guardian
-crashes, deadlines, and cancellation on a private PipeWire graph. These use a
-compiled clipboard fixture and never access the live desktop or uinput. Existing
-`--zig` checks that invoke removed experimental paths need a separate follow-up.
+root for control checks, and `./test.sh --zig-logging` for the journal transport.
+Run `./test.sh --zig-output` for notifications, keyboard error handling,
+configuration, and private Wayland clipboard replacement/transfer checks. Set
+`VOICED_ZIG_MODEL_TESTS=1` to also exercise fixture audio through a private
+PipeWire graph, transcription, clipboard delivery, saved output, capture-worker
+reuse/recovery, and cancellation. These checks do not access your desktop or
+microphone. The desktop verifier above checks the native client against your
+compositor without restarting the installed service.

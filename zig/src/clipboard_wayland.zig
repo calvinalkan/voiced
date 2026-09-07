@@ -27,7 +27,30 @@ pub const Environment = struct { runtime_directory: ?[]const u8, display: ?[]con
 const Kind = enum { display, registry, discovery, binding, selection, restoring, compositor, shm, seat, keyboard, manager, device, source, surface, pool, buffer, shell, xdg_surface, toplevel, gtk_shell, gtk_surface };
 const Object = struct { kind: Kind, destroyed: bool = false };
 const Global = struct { name: u32 = 0, version: u32 = 0, object: u32 = 0 };
-const Source = struct { object: u32 = 0, text: []const u8 = "", id: u64 = 0, retired: bool = false };
+const Text = struct { bytes: []const u8, id: u64 };
+const Source = union(enum) {
+    empty,
+    offered: struct { object: u32, text: Text },
+    retired: Text,
+
+    fn text(self: Source) ?Text {
+        return switch (self) {
+            .empty => null,
+            .offered => |value| value.text,
+            .retired => |value| value,
+        };
+    }
+};
+const Pending = struct { slot: u1, deadline: u64 };
+const Popup = struct { surface: u32, xdg: u32, toplevel: u32, gtk: u32, attached: bool = false };
+const Operation = union(Phase) {
+    discovering: u64,
+    binding: u64,
+    ready,
+    focus: struct { pending: Pending, popup: Popup },
+    selection: struct { pending: Pending, popup: ?Popup },
+    restoring: Pending,
+};
 const Transfer = struct { fd: i32, source: u1, offset: usize = 0, expires_ns: u64 };
 
 pub const Client = struct {
@@ -45,15 +68,13 @@ pub const Client = struct {
     gtk: Global = .{},
     mode: Mode = .core,
     fallback_only: bool = false,
-    phase: Phase = .discovering,
-    expires_ns: u64 = 0,
+    phase: Operation = .{ .discovering = 0 },
     keyboard_capable: bool = false,
     keyboard: u32 = 0,
     device: u32 = 0,
-    sources: [2]Source = @splat(.{}),
+    pixel: u32 = 0,
+    sources: [2]Source = @splat(.empty),
     transfers: [8]?Transfer = @splat(null),
-    pending: ?u1 = null,
-    popup: ?struct { surface: u32, xdg: u32, toplevel: u32, gtk: u32, buffer: u32, attached: bool = false } = null,
     problem: ?Error = null,
     last_object: u32 = 0,
     last_opcode: u16 = 0,
@@ -65,7 +86,7 @@ pub const Client = struct {
         self.epoll_fd = epoll_fd;
         self.tag = tag;
         self.fallback_only = fallback_only;
-        self.expires_ns = now_ns + timeout_ns;
+        self.phase = .{ .discovering = now_ns + timeout_ns };
         self.start(environment) catch |err| return .{ .err = self.failure(err) };
         return .{ .ok = {} };
     }
@@ -73,7 +94,7 @@ pub const Client = struct {
         for (0..self.transfers.len) |index| self.closeTransfer(index);
         if (self.connection.fd >= 0) _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, self.connection.fd, null);
         self.connection.deinit();
-        self.sources = @splat(.{});
+        self.sources = @splat(.empty);
     }
     /// Busy and invalid_text leave the current clipboard untouched. Other errors
     /// terminate the connection: the caller must deinit before reconnecting.
@@ -81,7 +102,7 @@ pub const Client = struct {
         if (self.phase != .ready or self.isBorrowed(id)) return .{ .err = .busy };
         if (text.len == 0 or !std.unicode.utf8ValidateSlice(text)) return .{ .err = .invalid_text };
         const slot: u1 = for (self.sources, 0..) |source, index| {
-            if (source.text.len == 0) break @intCast(index);
+            if (source == .empty) break @intCast(index);
         } else return .{ .err = .busy };
         self.publishInternal(slot, id, text, now_ns) catch |err| return .{ .err = self.failure(err) };
         return .{ .ok = {} };
@@ -91,15 +112,15 @@ pub const Client = struct {
         return .{ .ok = event };
     }
     pub fn isBorrowed(self: *const Client, id: u64) bool {
-        for (self.sources) |source| if (source.text.len != 0 and source.id == id) return true;
+        for (self.sources) |source| if (source.text()) |text| if (text.id == id) return true;
         return false;
     }
     pub fn owns(self: *const Client, id: u64) bool {
-        for (self.sources) |source| if (source.text.len != 0 and source.id == id and !source.retired) return true;
+        for (self.sources) |source| if (source == .offered and source.offered.text.id == id) return true;
         return false;
     }
     pub fn deadline(self: *const Client) u64 {
-        var next = if (self.phase == .ready) std.math.maxInt(u64) else self.expires_ns;
+        var next = self.operationDeadline();
         for (self.transfers) |transfer| if (transfer) |t| {
             next = @min(next, t.expires_ns);
         };
@@ -123,9 +144,8 @@ pub const Client = struct {
     }
     fn publishInternal(self: *Client, slot: u1, id: u64, text: []const u8, now_ns: u64) !void {
         const object = try self.allocate(.source);
-        self.sources[slot] = .{ .object = object, .text = text, .id = id };
-        self.pending = slot;
-        self.expires_ns = now_ns + timeout_ns;
+        self.sources[slot] = .{ .offered = .{ .object = object, .text = .{ .bytes = text, .id = id } } };
+        const pending: Pending = .{ .slot = slot, .deadline = now_ns + timeout_ns };
         try self.words(self.manager().object, 0, &.{object});
         for (mime_types) |mime| {
             var w: wire.Writer = .{};
@@ -133,15 +153,17 @@ pub const Client = struct {
             try self.connection.send(object, 0, w.data(), null);
         }
         if (self.mode == .core) {
-            self.phase = .focus;
-            try self.createPopup();
-        } else try self.setSelection(0);
+            self.phase = .{ .focus = .{ .pending = pending, .popup = try self.createPopup() } };
+        } else {
+            self.phase = .{ .selection = .{ .pending = pending, .popup = null } };
+            try self.setSelection(0);
+        }
         try self.watch(self.connection.fd, linux.EPOLL.CTL_MOD, linux.EPOLL.IN | linux.EPOLL.OUT);
     }
     fn advanceInternal(self: *Client, now_ns: u64) !Event {
         if (self.problem != null) return error.Failed;
-        if (self.phase != .ready and now_ns >= self.expires_ns) {
-            self.problem = .{ .timed_out = self.phase };
+        if (self.phase != .ready and now_ns >= self.operationDeadline()) {
+            self.problem = .{ .timed_out = std.meta.activeTag(self.phase) };
             return error.TimedOut;
         }
         var event: Event = .none;
@@ -167,7 +189,7 @@ pub const Client = struct {
                 self.closeTransfer(index);
                 continue;
             }
-            const bytes = self.sources[transfer.source].text[transfer.offset..];
+            const bytes = self.sources[transfer.source].text().?.bytes[transfer.offset..];
             const written = linux.write(transfer.fd, bytes.ptr, @min(bytes.len, 64 * 1024));
             switch (linux.errno(written)) {
                 .AGAIN, .INTR => continue,
@@ -177,7 +199,7 @@ pub const Client = struct {
                         continue;
                     }
                     transfer.offset += written;
-                    if (transfer.offset == self.sources[transfer.source].text.len) {
+                    if (transfer.offset == self.sources[transfer.source].text().?.bytes.len) {
                         self.transfers_completed += 1;
                         self.closeTransfer(index);
                     }
@@ -186,11 +208,11 @@ pub const Client = struct {
             }
         }
         for (&self.sources, 0..) |*source, index| {
-            if (!source.retired) continue;
+            if (source.* != .retired) continue;
             const borrowed = for (self.transfers) |entry| {
                 if (entry != null and entry.?.source == index) break true;
             } else false;
-            if (!borrowed) source.* = .{};
+            if (!borrowed) source.* = .empty;
         }
         try self.connection.flush();
         try self.watch(self.connection.fd, linux.EPOLL.CTL_MOD, linux.EPOLL.IN | (if (self.connection.output_size > 0) @as(u32, linux.EPOLL.OUT) else 0));
@@ -261,9 +283,11 @@ pub const Client = struct {
                         event.* = .ready;
                     },
                     .selection => {
-                        if (self.popup != null) {
-                            try self.destroyPopup();
-                            self.phase = .restoring;
+                        if (self.phase != .selection) return error.InvalidMessage;
+                        if (self.phase.selection.popup) |popup| {
+                            try self.destroyPopup(popup);
+                            const pending = self.phase.selection.pending;
+                            self.phase = .{ .restoring = pending };
                             try self.sync(.restoring);
                         } else try self.acquired(event);
                     },
@@ -290,7 +314,7 @@ pub const Client = struct {
                     const serial = try r.word();
                     const surface = try r.word();
                     _ = try r.array();
-                    if (self.phase == .focus and self.popup != null and surface == self.popup.?.surface) try self.setSelection(serial);
+                    if (self.phase == .focus and surface == self.phase.focus.popup.surface) try self.setSelection(serial);
                 },
                 2 => {
                     _ = try r.word();
@@ -347,7 +371,7 @@ pub const Client = struct {
                         if (std.mem.eql(u8, mime, known)) break true;
                     } else false;
                     const source: ?u1 = for (self.sources, 0..) |s, index| {
-                        if (s.object == object and !s.retired) break @intCast(index);
+                        if (s == .offered and s.offered.object == object) break @intCast(index);
                     } else null;
                     if (!supported or source == null or entry.destroyed) return;
                     const slot = for (&self.transfers) |*t| {
@@ -361,13 +385,16 @@ pub const Client = struct {
                     slot.* = .{ .fd = fd, .source = source.?, .expires_ns = now_ns + timeout_ns };
                     retained = true;
                 } else if (opcode == cancel_opcode) {
-                    for (&self.sources, 0..) |*s, index| if (s.object == object) {
-                        if (!s.retired) try self.destroy(object, 1);
-                        s.retired = true;
-                        if (self.pending != null and self.pending.? == index) {
+                    for (&self.sources, 0..) |*s, index| if (s.* == .offered and s.offered.object == object) {
+                        try self.destroy(object, 1);
+                        // Copy before changing the union tag: Zig may write the
+                        // destination tag before evaluating an aggregate field.
+                        const text = s.offered.text;
+                        s.* = .{ .retired = text };
+                        if (self.pendingCopy()) |pending| if (pending.slot == index) {
                             self.problem = .selection_lost;
                             return error.SelectionLost;
-                        }
+                        };
                     };
                 } else if (self.mode == .core and opcode == 0) {
                     _ = try r.string();
@@ -384,8 +411,8 @@ pub const Client = struct {
                 const serial = try r.word();
                 if (!entry.destroyed) {
                     try self.words(object, 4, &.{serial});
-                    if (self.popup) |*popup| if (popup.xdg == object and !popup.attached) {
-                        try self.words(popup.surface, 1, &.{ popup.buffer, 0, 0 });
+                    if (self.popupView()) |popup| if (popup.xdg == object and !popup.attached) {
+                        try self.words(popup.surface, 1, &.{ self.pixel, 0, 0 });
                         try self.words(popup.surface, 2, &.{ 0, 0, 1, 1 });
                         if (popup.gtk != 0) try self.words(popup.gtk, 3, &.{0});
                         try self.words(popup.surface, 6, &.{});
@@ -453,18 +480,17 @@ pub const Client = struct {
             // gtk_surface.release arrived in v4. Binding only when available
             // prevents leaking a GTK extension object on every publication.
             if (self.gtk.version >= 4) try self.bind(&self.gtk, "gtk_shell1", 4, .gtk_shell);
+            self.pixel = try self.createPixel();
         }
-        self.phase = .binding;
+        const deadline_ns = self.operationDeadline();
+        self.phase = .{ .binding = deadline_ns };
         try self.sync(.binding);
     }
-    fn createPopup(self: *Client) !void {
+    fn createPopup(self: *Client) !Popup {
         const surface = try self.allocate(.surface);
         const xdg = try self.allocate(.xdg_surface);
         const toplevel = try self.allocate(.toplevel);
         const gtk = if (self.gtk.object != 0) try self.allocate(.gtk_surface) else 0;
-        const pool = try self.allocate(.pool);
-        const buffer = try self.allocate(.buffer);
-        self.popup = .{ .surface = surface, .xdg = xdg, .toplevel = toplevel, .gtk = gtk, .buffer = buffer };
         try self.words(self.compositor.object, 0, &.{surface});
         try self.words(self.shell.object, 2, &.{ xdg, surface });
         try self.words(xdg, 1, &.{toplevel});
@@ -475,13 +501,21 @@ pub const Client = struct {
         w.size = 0;
         try w.string("voiced");
         try self.connection.send(toplevel, 3, w.data(), null);
+        try self.words(surface, 6, &.{}); // Configure before attaching a buffer.
+        return .{ .surface = surface, .xdg = xdg, .toplevel = toplevel, .gtk = gtk };
+    }
+    // One immutable transparent pixel serves every temporary surface. The
+    // compositor may retain old attachments; no code ever writes this storage.
+    fn createPixel(self: *Client) !u32 {
+        const pool = try self.allocate(.pool);
+        const buffer = try self.allocate(.buffer);
         const fd: i32 = @intCast(try self.connection.check(linux.memfd_create("voiced-clipboard-surface", linux.MFD.CLOEXEC)));
         var owned = true;
         defer if (owned) {
             _ = linux.close(fd);
         };
         _ = try self.connection.check(linux.ftruncate(fd, 4));
-        w.size = 0;
+        var w: wire.Writer = .{};
         try w.word(pool);
         try w.word(4);
         try self.connection.send(self.shm.object, 0, w.data(), fd);
@@ -490,32 +524,54 @@ pub const Client = struct {
         // immediately: the wl_buffer retains the compositor's backing storage.
         try self.words(pool, 0, &.{ buffer, 0, 1, 1, 4, 0 });
         try self.destroy(pool, 1);
-        try self.words(surface, 6, &.{}); // Configure before attaching a buffer.
+        return buffer;
     }
-    fn destroyPopup(self: *Client) !void {
-        const popup = self.popup orelse return;
+    fn destroyPopup(self: *Client, popup: Popup) !void {
         if (popup.gtk != 0) try self.destroy(popup.gtk, 5);
         try self.destroy(popup.toplevel, 0);
         try self.destroy(popup.xdg, 0);
         try self.destroy(popup.surface, 0);
-        try self.destroy(popup.buffer, 0);
-        self.popup = null;
     }
     fn setSelection(self: *Client, serial: u32) !void {
-        const source = self.sources[self.pending.?].object;
+        const pending = self.pendingCopy() orelse return error.InvalidMessage;
+        const source = self.sources[pending.slot].offered.object;
         if (self.mode == .core) try self.words(self.device, 1, &.{ source, serial }) else try self.words(self.device, 0, &.{source});
-        self.phase = .selection;
+        const popup = if (self.phase == .focus) self.phase.focus.popup else null;
+        self.phase = .{ .selection = .{ .pending = pending, .popup = popup } };
         try self.sync(.selection);
     }
     fn acquired(self: *Client, event: *Event) !void {
-        const slot = self.pending orelse return error.InvalidMessage;
-        if (self.sources[slot].retired) {
+        const slot = (self.pendingCopy() orelse return error.InvalidMessage).slot;
+        if (self.sources[slot] != .offered) {
             self.problem = .selection_lost;
             return error.SelectionLost;
         }
-        self.pending = null;
         self.phase = .ready;
-        event.* = .{ .acquired = self.sources[slot].id };
+        event.* = .{ .acquired = self.sources[slot].offered.text.id };
+    }
+    fn operationDeadline(self: *const Client) u64 {
+        return switch (self.phase) {
+            .ready => std.math.maxInt(u64),
+            .discovering, .binding => |deadline_ns| deadline_ns,
+            .focus => |focus| focus.pending.deadline,
+            .selection => |selection| selection.pending.deadline,
+            .restoring => |pending| pending.deadline,
+        };
+    }
+    fn pendingCopy(self: *const Client) ?Pending {
+        return switch (self.phase) {
+            .focus => |focus| focus.pending,
+            .selection => |selection| selection.pending,
+            .restoring => |value| value,
+            else => null,
+        };
+    }
+    fn popupView(self: *Client) ?*Popup {
+        return switch (self.phase) {
+            .focus => |*focus| &focus.popup,
+            .selection => |*selection| if (selection.popup) |*value| value else null,
+            else => null,
+        };
     }
     fn bind(self: *Client, global: *Global, name: []const u8, version: u32, kind: Kind) !void {
         if (global.version == 0) return error.InvalidMessage;

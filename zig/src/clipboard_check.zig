@@ -1,4 +1,4 @@
-//! Standalone native clipboard spike. Preloads two UTF-8 files; stdin commands:
+//! Standalone native clipboard verifier. Preloads two UTF-8 files; stdin commands:
 //! a/b publish, s reports ownership/transfer state, p sends one optional paste,
 //! q exits. The caller drives this over pipes; stdout is a JSON event stream.
 const std = @import("std");

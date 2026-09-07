@@ -3,7 +3,6 @@ const logging = @import("logging.zig");
 const log = logging.scoped(.service);
 const audio_process = @import("audio_process.zig");
 const control_socket = @import("control_socket.zig");
-const clipboard_process = @import("clipboard_process.zig");
 const service_config = @import("service_config.zig");
 const supervisor = @import("supervisor.zig");
 const transcription_process = @import("transcription_process.zig");
@@ -184,7 +183,6 @@ pub fn main(init: std.process.Init) u8 {
     // Worker invocations are private re-executions of this binary. Their argv
     // carries the role, control FD, parent PID, and logging level. Shared
     // descriptors and model/capture settings arrive in the first seqpacket.
-    // The clipboard role instead inherits stdin and waits for a start packet.
     if (invocation == .serve or invocation == .worker) {
         const configured_level = if (invocation == .serve) invocation.serve.log_level else invocation.worker.log_level;
         const errno = logging.init(configured_level);
@@ -200,7 +198,6 @@ pub fn main(init: std.process.Init) u8 {
         .worker => |worker| switch (worker.role) {
             .@"audio-pipewire" => "voiced-capture",
             .@"transcription-model" => "voiced-asr",
-            .clipboard => "voiced-clip",
         },
         else => null,
     };
@@ -223,7 +220,6 @@ pub fn main(init: std.process.Init) u8 {
                 .system_bus_address = init.environ_map.get("DBUS_SYSTEM_BUS_ADDRESS") orelse "unix:path=/run/dbus/system_bus_socket",
             }),
             .@"transcription-model" => transcription_process.runModelWorker(init, worker.socket, worker.supervisor_pid),
-            .clipboard => clipboard_process.runWorker(init, worker.socket, worker.supervisor_pid),
         },
         .usage, .help => unreachable,
     };
@@ -266,7 +262,7 @@ const Invocation = union(enum) {
     serve: supervisor.ServiceOptions,
     client: control_socket.Request,
     worker: struct {
-        role: enum { @"audio-pipewire", @"transcription-model", clipboard },
+        role: enum { @"audio-pipewire", @"transcription-model" },
         socket: std.posix.fd_t,
         supervisor_pid: std.os.linux.pid_t,
         log_level: logging.Level,
@@ -443,7 +439,7 @@ const general_help =
     \\
     \\Run 'voiced help serve' or 'voiced <command> --help' for details.
     \\Only status prints to stdout; successful actions are silent. Errors go to stderr.
-    \\The daemon copies final text with wl-copy and sends a paste shortcut.
+    \\The daemon copies final text through Wayland and sends a paste shortcut.
     \\Use 'voiced serve --transcript-output stdout' for diagnostic transcript output.
     \\
     \\Environment:
@@ -497,7 +493,7 @@ const serve_help =
     \\are accepted. Idle retention accepts 0 through 4294967295 seconds.
     \\
     \\The service opens no microphone or model until a recording is requested.
-    \\Desktop output requires wl-copy and access to /dev/uinput. If the keyboard
+    \\Desktop output requires Wayland and access to /dev/uinput. If the keyboard
     \\is unavailable, copying still works. Clipboard mode sends no shortcut;
     \\stdout mode writes final text without contacting the desktop.
     \\Run 'voiced record -t' in another terminal to start recording.

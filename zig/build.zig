@@ -110,7 +110,7 @@ fn add_default_build_command(b: *std.Build, pie: bool) void {
     });
     clipboard_check.pie = pie;
     const install_clipboard_check = b.addInstallArtifact(clipboard_check, .{});
-    b.step("clipboard-check", "Build the isolated native Wayland clipboard spike").dependOn(&install_clipboard_check.step);
+    b.step("clipboard-check", "Build the native Wayland clipboard verifier").dependOn(&install_clipboard_check.step);
 
     const replay = b.addExecutable(.{
         .name = "voiced-replay",
