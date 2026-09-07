@@ -99,6 +99,19 @@ fn add_default_build_command(b: *std.Build, pie: bool) void {
     const install_notification_check = b.addInstallArtifact(notification_check, .{});
     b.step("notification-check", "Build the isolated notification verification driver").dependOn(&install_notification_check.step);
 
+    const clipboard_check = b.addExecutable(.{
+        .name = "voiced-clipboard-check",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/clipboard_check.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    clipboard_check.pie = pie;
+    const install_clipboard_check = b.addInstallArtifact(clipboard_check, .{});
+    b.step("clipboard-check", "Build the isolated native Wayland clipboard spike").dependOn(&install_clipboard_check.step);
+
     const replay = b.addExecutable(.{
         .name = "voiced-replay",
         .linkage = .static,

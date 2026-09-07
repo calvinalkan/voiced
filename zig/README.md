@@ -415,6 +415,37 @@ clipboard dependency is wl-clipboard. PipeWire capture, desktop notifications
 and native journal logging are implemented directly in Zig. Repository-level systemd installation
 remains separate work.
 
+## Native clipboard spike
+
+The optional `clipboard-check` target exercises a native Wayland replacement
+before integration into `serve`. The service still uses its existing wl-copy
+guardian until desktop verification is complete.
+
+```bash
+cd zig
+zig build clipboard-check
+./scripts/verify-clipboard.py
+```
+
+The verifier opens a dedicated GTK text window and checks three copies/pastes,
+focus restoration, and restoration of the previous plain-text clipboard. It
+writes `native.log` and `report.json` under a private `/tmp/voiced-native-clipboard-*`
+directory. Keep the window focused and release modifier keys. A clipboard with
+non-text formats is left unchanged; copy plain text before testing. The verifier
+uses Python/GTK and stock wl-clipboard for backup/restoration only. Use
+`--clipboard-only` to exercise GTK paste without opening uinput, and `--fallback`
+to force the temporary-surface path on a compositor with data-control support.
+
+`src/clipboard_wayland.zig` owns discovery, text generations and transfers;
+`src/wayland_wire.zig` handles the native socket and descriptor transport. The
+client prefers ext-data-control, then wlr-data-control, then core data-device
+with an xdg-shell surface and GNOME's GTK surface extension when available. It
+uses no C bindings, dynamic libraries, worker processes or extra threads.
+Text remains borrowed while offered or being transferred. Two generations and
+eight transfers bound retention; each stalled transfer expires after two seconds.
+Acquisition waits for the fallback surface's destruction to reach the compositor,
+but cannot guarantee the eventual focus target of a globally injected shortcut.
+
 ## Desktop notifications
 
 `src/notifications.zig` owns error presentation, replacement, dismissal, and
