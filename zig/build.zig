@@ -22,10 +22,13 @@ pub fn build(b: *std.Build) void {
     // Declaring setup does not run it or download data in the ordinary build.
     setup_tool.use_llvm = true;
     setup_tool.pie = pie;
+
     const run_setup = b.addRunArtifact(setup_tool);
     run_setup.setCwd(b.path(""));
+
     const setup_models = b.step("setup-models", "Download and verify the named Whisper checkpoints");
     setup_models.dependOn(&run_setup.step);
+
     b.step("setup", "Download and verify the named Whisper checkpoints").dependOn(setup_models);
 }
 
@@ -39,15 +42,26 @@ fn add_default_build_command(b: *std.Build, pie: bool) void {
         .fast => .ReleaseFast,
         .small => .ReleaseSmall,
     };
+
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "crash_diagnostics", b.option(
+        bool,
+        "crash-diagnostics",
+        "Keep in-process panic/fault stack traces in voiced (default: true)",
+    ) orelse true);
+
     // Keep the inference kernels speed-optimized in the compact application
     // build. Debug and ReleaseSafe still apply to every module.
     const inference_optimize = if (optimize == .ReleaseSmall) .ReleaseFast else optimize;
+
     const models_module = b.createModule(.{ .root_source_file = b.path("src/models.zig") });
+
     const inference = b.createModule(.{
         .root_source_file = b.path("runtime/root.zig"),
         .target = b.graph.host,
         .optimize = inference_optimize,
     });
+
     const voiced = b.addExecutable(.{
         .name = "voiced",
         // Static PIE retains address randomization without an ELF interpreter
@@ -62,10 +76,12 @@ fn add_default_build_command(b: *std.Build, pie: bool) void {
             .strip = false,
         }),
     });
+
     // LLVM optimizes the host's AVX-VNNI inference kernels. This executable is
     // host-targeted, not a portable CPU-dispatched baseline.
     voiced.use_llvm = true;
     voiced.pie = pie;
+    voiced.root_module.addOptions("build_options", build_options);
     voiced.root_module.addImport("models", models_module);
     voiced.root_module.addImport("inference", inference);
     b.installArtifact(voiced);
@@ -79,6 +95,7 @@ fn add_default_build_command(b: *std.Build, pie: bool) void {
             .optimize = optimize,
         }),
     });
+
     const install_notification_check = b.addInstallArtifact(notification_check, .{});
     b.step("notification-check", "Build the isolated notification verification driver").dependOn(&install_notification_check.step);
 

@@ -65,10 +65,36 @@ zig build -Doptimize=ReleaseSmall
 strip --strip-all -o zig-out/bin/voiced-stripped zig-out/bin/voiced
 ```
 
-The build retains debug data, and the daemon explicitly enables stack tracing.
-Keep the unstripped binary for offline symbolization; the separate stripped copy
-retains stack-trace machinery, not the removed debug data. The daemon disables
-unused `std.Io` networking in every build mode. Raw Unix sockets and PipeWire remain available, and the separate model-setup tool keeps networking.
+The build retains debug data, and `-Dcrash-diagnostics=true` (the default) keeps
+in-process panic stack tracing and Zig's mode-dependent fault handler. Keep the
+unstripped binary for offline symbolization; the separate stripped copy retains
+stack-trace machinery, not the removed debug data.
+
+To remove in-process symbolization without disabling ReleaseSafe checks:
+
+```bash
+zig build -Doptimize=ReleaseSafe -Dcrash-diagnostics=false
+strip --strip-all -o zig-out/bin/voiced-stripped zig-out/bin/voiced
+```
+
+This daemon-only option is independent of stripping and optimization mode. Normal
+CLI output and operational logs remain unchanged. Panics print a best-effort
+message to stderr and abort with SIGABRT; memory faults use the OS signal handling
+instead of Zig's rich fault handler. Neither path prints an in-process stack
+trace. Unwind information and the unstripped debug executable remain available
+for external debugging.
+
+Before deploying this mode, verify core collection for the actual service; an
+abort does not guarantee a saved core. Ubuntu may use Apport rather than
+systemd-coredump. Retain the exact matching unstripped executable and libraries
+for `gdb /path/to/voiced-debug /path/to/core`. Cores can contain audio, transcripts,
+and other process memory: restrict access and retention. The build does not
+change the host's collector configuration.
+
+The `Binary Size Optimizations` section in `src/main.zig` owns the daemon's Zig
+root configuration. Unused `std.Io` networking is disabled in every build mode.
+Raw Unix sockets and PipeWire remain available, and the separate model-setup tool
+keeps networking.
 
 ## Run
 

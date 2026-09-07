@@ -9,13 +9,69 @@ const supervisor = @import("supervisor.zig");
 const transcription_process = @import("transcription_process.zig");
 const stderr = std.debug.print;
 
+// ─── Binary Size Optimizations ────────────────────────────────────────────────
+
+// ── Crash Diagnostics ──
+//
+// -Dcrash-diagnostics=false opts out of in-process crash reporting (default: true).
+// Runtime safety checks and normal logs remain; panics print a short message and
+// abort. Keeping both panic and fault paths out of stack symbolization discards
+// ELF/DWARF parsing, symbol lookup/sorting, and their diagnostic dependencies.
+// Configure external core collection separately and retain the matching
+// unstripped executable so GDB can resolve the core's addresses to source lines.
+// Stripping removes debug data, not the executable code that prints stack traces;
+// this build option removes that code by eliminating its compile-time references.
+//
+// Measured on this workstation: Intel Core i7-13700HX (x86-64), Ubuntu 24.04.3 LTS,
+// Zig 0.16.0/LLVM, native PipeWire, ReleaseSafe + PIE. GNU-stripped size fell from
+// 1,565,784 to 1,314,072 bytes (-251,712, or 16.1%).
+const crash_diagnostics = @import("build_options").crash_diagnostics;
+
 pub const std_options: std.Options = .{
-    // Keep panic stack tracing even when building a compact executable.
-    .allow_stack_tracing = true,
+    .allow_stack_tracing = crash_diagnostics,
+    .enable_segfault_handler = crash_diagnostics and std.debug.default_enable_segfault_handler,
     // IPC and D-Bus use raw Unix sockets; PipeWire uses its own API.
     // The separate model-setup executable retains std.Io networking.
     .networking = false,
 };
+
+pub const panic = std.debug.FullPanic(if (crash_diagnostics) std.debug.defaultPanic else panicWithoutTrace);
+
+fn panicWithoutTrace(message: []const u8, first_trace_addr: ?usize) noreturn {
+    @branchHint(.cold);
+    _ = first_trace_addr;
+    const linux = std.os.linux;
+
+    // A closed stderr pipe must not terminate us with SIGPIPE before abort can
+    // request a core. No restoration is needed: this thread never resumes.
+    var blocked = linux.sigemptyset();
+    linux.sigaddset(&blocked, .PIPE);
+    _ = linux.sigprocmask(linux.SIG.BLOCK, &blocked, null);
+
+    // Best-effort raw writes avoid allocation, logging locks, and recursive
+    // formatting during a panic. A failed write must not prevent termination.
+    print: {
+        for ([_][]const u8{ "voiced: panic: ", message, "\n" }) |part| {
+            var remaining = part;
+            while (remaining.len != 0) {
+                const result = linux.write(2, remaining.ptr, remaining.len);
+                switch (linux.errno(result)) {
+                    .SUCCESS => {
+                        if (result == 0) break :print;
+                        remaining = remaining[result..];
+                    },
+                    .INTR => continue,
+                    else => break :print,
+                }
+            }
+        }
+    }
+    // Normal exit cannot produce a core; the host's collector and policy decide
+    // whether this SIGABRT actually saves one. Keep the matching debug binary.
+    std.process.abort();
+}
+
+// ─── Command Dispatch ─────────────────────────────────────────────────────────
 
 pub fn main(init: std.process.Init) u8 {
     // ── Parse Before Acting ──
