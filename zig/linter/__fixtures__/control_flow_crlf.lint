@@ -1,0 +1,31 @@
+error[visible_control_flow]: `if` body requires braces
+ --> control_flow_crlf.input.zig:2:12
+  |
+2 |     if (flag) work();
+  |               ^^^^
+  |
+  = help: wrap the body in `{ ... }`
+
+error[visible_control_flow]: `try` is hidden inside another same-line expression
+ --> control_flow_crlf.input.zig:6:10
+  |
+6 |     consume(try load());
+  |             ^^^
+  |
+  = help: start `try` on a new line or assign its result before the outer expression
+
+error[visible_control_flow]: `return` must start on its own line
+  --> control_flow_crlf.input.zig:11:17
+   |
+11 | fn load() !u8 { return 1; }
+   |                 ^^^^^^
+   |
+   = help: move `return` to a new line or brace its containing control-flow body
+
+error[visible_control_flow]: `return` must start on its own line
+  --> control_flow_crlf.input.zig:12:17
+   |
+12 | fn eof() void { return; }
+   |                 ^^^^^^
+   |
+   = help: move `return` to a new line or brace its containing control-flow body

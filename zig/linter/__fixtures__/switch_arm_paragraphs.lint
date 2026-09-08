@@ -1,0 +1,87 @@
+error[visible_statement_paragraphs]: adjacent braced switch arms must be separated by a blank line
+  --> switch_arm_paragraphs.input.zig:36:9
+   |
+36 |         else => {
+   |         ^^^^
+   |
+   = help: insert a blank line before this switch arm
+
+error[visible_statement_paragraphs]: adjacent braced switch arms must be separated by a blank line
+  --> switch_arm_paragraphs.input.zig:78:9
+   |
+78 |         else => {
+   |         ^^^^
+   |
+   = help: insert a blank line before this switch arm
+
+error[visible_statement_paragraphs]: adjacent braced switch arms must be separated by a blank line
+   --> switch_arm_paragraphs.input.zig:111:9
+    |
+111 |         1 => {
+    |         ^
+    |
+    = help: insert a blank line before this switch arm
+
+error[visible_statement_paragraphs]: adjacent braced switch arms must be separated by a blank line
+   --> switch_arm_paragraphs.input.zig:123:9
+    |
+123 |         1 => {
+    |         ^
+    |
+    = help: insert a blank line before this switch arm
+
+error[visible_statement_paragraphs]: adjacent braced switch arms must be separated by a blank line
+   --> switch_arm_paragraphs.input.zig:126:9
+    |
+126 |         else => {
+    |         ^^^^
+    |
+    = help: insert a blank line before this switch arm
+
+error[visible_statement_paragraphs]: adjacent braced switch arms must be separated by a blank line
+   --> switch_arm_paragraphs.input.zig:169:9
+    |
+169 |         else => {
+    |         ^^^^
+    |
+    = help: insert a blank line before this switch arm
+
+error[visible_statement_paragraphs]: adjacent braced switch arms must be separated by a blank line
+   --> switch_arm_paragraphs.input.zig:196:9
+    |
+196 |         else => {},
+    |         ^^^^
+    |
+    = help: insert a blank line before this switch arm
+
+error[visible_statement_paragraphs]: adjacent braced switch arms must be separated by a blank line
+   --> switch_arm_paragraphs.input.zig:203:9
+    |
+203 |         else => {
+    |         ^^^^
+    |
+    = help: insert a blank line before this switch arm
+
+error[visible_statement_paragraphs]: adjacent braced switch arms must be separated by a blank line
+   --> switch_arm_paragraphs.input.zig:212:9
+    |
+212 |         else => {},
+    |         ^^^^
+    |
+    = help: insert a blank line before this switch arm
+
+error[visible_statement_paragraphs]: adjacent braced switch arms must be separated by a blank line
+   --> switch_arm_paragraphs.input.zig:229:9
+    |
+229 |         else => fallback: {
+    |         ^^^^
+    |
+    = help: insert a blank line before this switch arm
+
+error[visible_statement_paragraphs]: adjacent braced switch arms must be separated by a blank line
+   --> switch_arm_paragraphs.input.zig:240:9
+    |
+240 |         inline else => {
+    |         ^^^^^^
+    |
+    = help: insert a blank line before this switch arm

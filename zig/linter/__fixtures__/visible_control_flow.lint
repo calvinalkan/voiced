@@ -1,0 +1,348 @@
+error[visible_control_flow]: `if` body requires braces
+ --> visible_control_flow.input.zig:7:20
+  |
+7 |     if (condition) return;
+  |                    ^^^^^^
+  |
+  = help: wrap the body in `{ ... }`
+
+error[visible_control_flow]: `if` body requires braces
+  --> visible_control_flow.input.zig:11:20
+   |
+11 |     if (condition) return error.NotReady;
+   |                    ^^^^^^
+   |
+   = help: wrap the body in `{ ... }`
+
+error[visible_control_flow]: `if` body requires braces
+  --> visible_control_flow.input.zig:16:24
+   |
+16 |         if (condition) break;
+   |                        ^^^^^
+   |
+   = help: wrap the body in `{ ... }`
+
+error[visible_control_flow]: `if` body requires braces
+  --> visible_control_flow.input.zig:22:24
+   |
+22 |         if (condition) continue;
+   |                        ^^^^^^^^
+   |
+   = help: wrap the body in `{ ... }`
+
+error[visible_control_flow]: `if` body requires braces
+  --> visible_control_flow.input.zig:27:27
+   |
+27 |     if (optional) |value| return value;
+   |                           ^^^^^^
+   |
+   = help: wrap the body in `{ ... }`
+
+error[visible_control_flow]: `if` branch exits without braces
+  --> visible_control_flow.input.zig:33:41
+   |
+33 |     const value = if (condition) 1 else return error.NotReady;
+   |                                         ^^^^^^
+   |
+   = help: wrap the branch in `{ ... }`
+
+error[visible_control_flow]: `if` branch exits without braces
+  --> visible_control_flow.input.zig:39:34
+   |
+39 |     const value = if (condition) return 1 else 0;
+   |                                  ^^^^^^
+   |
+   = help: wrap the branch in `{ ... }`
+
+error[visible_control_flow]: `if` branch exits without braces
+  --> visible_control_flow.input.zig:46:10
+   |
+46 |         (return 1)
+   |          ^^^^^^
+   |
+   = help: wrap the branch in `{ ... }`
+
+error[visible_control_flow]: `orelse` fallback requires braces for exits or statement work
+  --> visible_control_flow.input.zig:52:35
+   |
+52 |     const value = optional orelse return 0;
+   |                                   ^^^^^^
+   |
+   = help: wrap the fallback in `{ ... }`
+
+error[visible_control_flow]: `catch` fallback requires braces for exits or statement work
+  --> visible_control_flow.input.zig:58:23
+   |
+58 |     operation() catch return;
+   |                       ^^^^^^
+   |
+   = help: wrap the fallback in `{ ... }`
+
+error[visible_control_flow]: `catch` fallback requires braces for exits or statement work
+  --> visible_control_flow.input.zig:62:29
+   |
+62 |     operation() catch |err| return err;
+   |                             ^^^^^^
+   |
+   = help: wrap the fallback in `{ ... }`
+
+error[visible_control_flow]: `while` body requires braces
+  --> visible_control_flow.input.zig:66:18
+   |
+66 |     while (true) break;
+   |                  ^^^^^
+   |
+   = help: wrap the body in `{ ... }`
+
+error[visible_control_flow]: `for` body requires braces
+  --> visible_control_flow.input.zig:70:21
+   |
+70 |     for (items) |_| continue;
+   |                     ^^^^^^^^
+   |
+   = help: wrap the body in `{ ... }`
+   = note: `inline for` follows the same rule
+
+error[visible_control_flow]: `if` body requires braces
+  --> visible_control_flow.input.zig:76:33
+   |
+76 |             0 => if (item == 0) continue,
+   |                                 ^^^^^^^^
+   |
+   = help: wrap the body in `{ ... }`
+
+error[visible_control_flow]: `if` body requires braces
+  --> visible_control_flow.input.zig:86:20
+   |
+86 |     if (condition) startWorker();
+   |                    ^^^^^^^^^^^
+   |
+   = help: wrap the body in `{ ... }`
+
+error[visible_control_flow]: `if` body requires braces
+  --> visible_control_flow.input.zig:91:9
+   |
+91 |         startWorker();
+   |         ^^^^^^^^^^^
+   |
+   = help: wrap the body in `{ ... }`
+
+error[visible_control_flow]: `if` body requires braces
+   --> visible_control_flow.input.zig:103:12
+    |
+103 |     } else queueWorker();
+    |            ^^^^^^^^^^^
+    |
+    = help: wrap the body in `{ ... }`
+
+error[visible_control_flow]: `if` body requires braces
+   --> visible_control_flow.input.zig:126:9
+    |
+126 |         return;
+    |         ^^^^^^
+    |
+    = help: wrap the body in `{ ... }`
+
+error[visible_control_flow]: `while` body requires braces
+   --> visible_control_flow.input.zig:137:9
+    |
+137 |         process(item);
+    |         ^^^^^^^
+    |
+    = help: wrap the body in `{ ... }`
+
+error[visible_control_flow]: `for` body requires braces
+   --> visible_control_flow.input.zig:148:9
+    |
+148 |         worker.stop();
+    |         ^^^^^^
+    |
+    = help: wrap the body in `{ ... }`
+    = note: `inline for` follows the same rule
+
+error[visible_control_flow]: `for` body requires braces
+   --> visible_control_flow.input.zig:158:33
+    |
+158 |     inline for (fields) |field| registerField(field);
+    |                                 ^^^^^^^^^^^^^
+    |
+    = help: wrap the body in `{ ... }`
+    = note: `inline for` follows the same rule
+
+error[visible_control_flow]: `if` body requires braces
+   --> visible_control_flow.input.zig:169:9
+    |
+169 |         startWorker();
+    |         ^^^^^^^^^^^
+    |
+    = help: wrap the body in `{ ... }`
+
+error[visible_control_flow]: `if` body requires braces
+   --> visible_control_flow.input.zig:179:23
+    |
+179 |     defer if (opened) closeWorker();
+    |                       ^^^^^^^^^^^
+    |
+    = help: wrap the body in `{ ... }`
+
+error[visible_control_flow]: complex `if` branches must start on separate lines
+   --> visible_control_flow.input.zig:210:24
+    |
+210 |     return if (cached) getCachedWorker() else createWorker();
+    |                        ^^^^^^^^^^^^^^^
+    |
+    = help: move each branch expression to the line after `if` or `else`
+    = note: simple leaf values may remain inline
+
+error[visible_control_flow]: complex `if` branches must start on separate lines
+   --> visible_control_flow.input.zig:221:25
+    |
+221 |     return if (limited) @min(requested, maximum) else requested;
+    |                         ^^^^
+    |
+    = help: move each branch expression to the line after `if` or `else`
+    = note: simple leaf values may remain inline
+
+error[visible_control_flow]: complex `if` branches must start on separate lines
+   --> visible_control_flow.input.zig:232:25
+    |
+232 |     return if (forward) base + distance else base - distance;
+    |                         ^^^^
+    |
+    = help: move each branch expression to the line after `if` or `else`
+    = note: simple leaf values may remain inline
+
+error[visible_control_flow]: complex `if` branches must start on separate lines
+   --> visible_control_flow.input.zig:243:34
+    |
+243 |     return if (optional) |value| value else fallback;
+    |                                  ^^^^^
+    |
+    = help: move each branch expression to the line after `if` or `else`
+    = note: simple leaf values may remain inline
+
+error[visible_control_flow]: complex `if` branches must start on separate lines
+   --> visible_control_flow.input.zig:254:24
+    |
+254 |     return if (failed) .failed else if (ready) .active else .idle;
+    |                        ^
+    |
+    = help: move each branch expression to the line after `if` or `else`
+    = note: simple leaf values may remain inline
+
+error[visible_control_flow]: complex `orelse` fallback must start on a new line
+   --> visible_control_flow.input.zig:278:28
+    |
+278 |     return optional orelse createWorker();
+    |                            ^^^^^^^^^^^^
+    |
+    = help: move the fallback after `orelse` or wrap it in `{ ... }`
+    = note: simple leaf values may remain inline
+
+error[visible_control_flow]: complex `orelse` fallback must start on a new line
+   --> visible_control_flow.input.zig:287:28
+    |
+287 |     return optional orelse createValue() + offset;
+    |                            ^^^^^^^^^^^
+    |
+    = help: move the fallback after `orelse` or wrap it in `{ ... }`
+    = note: simple leaf values may remain inline
+
+error[visible_control_flow]: `orelse` fallback requires braces for exits or statement work
+   --> visible_control_flow.input.zig:297:9
+    |
+297 |         return error.MissingWorker;
+    |         ^^^^^^
+    |
+    = help: wrap the fallback in `{ ... }`
+
+error[visible_control_flow]: `orelse` fallback requires braces for exits or statement work
+   --> visible_control_flow.input.zig:304:10
+    |
+304 |         (return error.MissingWorker);
+    |          ^^^^^^
+    |
+    = help: wrap the fallback in `{ ... }`
+
+error[visible_control_flow]: `orelse` fallback requires braces for exits or statement work
+   --> visible_control_flow.input.zig:319:9
+    |
+319 |         unreachable;
+    |         ^^^^^^^^^^^
+    |
+    = help: wrap the fallback in `{ ... }`
+
+error[visible_control_flow]: `orelse` fallback requires braces for exits or statement work
+   --> visible_control_flow.input.zig:330:9
+    |
+330 |         reportUnavailable();
+    |         ^^^^^^^^^^^^^^^^^
+    |
+    = help: wrap the fallback in `{ ... }`
+
+error[visible_control_flow]: complex `catch` fallback must start on a new line
+   --> visible_control_flow.input.zig:349:31
+    |
+349 |     return loadWorker() catch recoverWorker();
+    |                               ^^^^^^^^^^^^^
+    |
+    = help: move the fallback after `catch` or wrap it in `{ ... }`
+    = note: simple leaf values may remain inline
+
+error[visible_control_flow]: complex `catch` fallback must start on a new line
+   --> visible_control_flow.input.zig:358:37
+    |
+358 |     return loadWorker() catch |err| recoverWorkerFrom(err);
+    |                                     ^^^^^^^^^^^^^^^^^
+    |
+    = help: move the fallback after `catch` or wrap it in `{ ... }`
+    = note: simple leaf values may remain inline
+
+error[visible_control_flow]: `catch` fallback requires braces for exits or statement work
+   --> visible_control_flow.input.zig:368:9
+    |
+368 |         return err;
+    |         ^^^^^^
+    |
+    = help: wrap the fallback in `{ ... }`
+
+error[visible_control_flow]: `catch` fallback requires braces for exits or statement work
+   --> visible_control_flow.input.zig:383:9
+    |
+383 |         unreachable;
+    |         ^^^^^^^^^^^
+    |
+    = help: wrap the fallback in `{ ... }`
+
+error[visible_control_flow]: `catch` fallback requires braces for exits or statement work
+   --> visible_control_flow.input.zig:394:9
+    |
+394 |         logFailure(err);
+    |         ^^^^^^^^^^
+    |
+    = help: wrap the fallback in `{ ... }`
+
+error[visible_control_flow]: `try` is hidden inside another same-line expression
+   --> visible_control_flow.input.zig:406:15
+    |
+406 |     configure(try loadConfig());
+    |               ^^^
+    |
+    = help: start `try` on a new line or assign its result before the outer expression
+
+error[visible_control_flow]: `try` is hidden inside another same-line expression
+   --> visible_control_flow.input.zig:430:27
+    |
+430 |     configure(.{ .value = try loadValue() });
+    |                           ^^^
+    |
+    = help: start `try` on a new line or assign its result before the outer expression
+
+error[visible_control_flow]: captured `errdefer` handler requires braces
+   --> visible_control_flow.input.zig:462:20
+    |
+462 |     errdefer |err| logFailure(err);
+    |                    ^^^^^^^^^^
+    |
+    = help: wrap the handler in `{ ... }`
+    = note: plain `errdefer cleanup();` may remain unbraced

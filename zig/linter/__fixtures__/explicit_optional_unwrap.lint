@@ -1,0 +1,35 @@
+error[explicit_optional_unwrap]: `.?` unwraps an optional without handling `null`
+ --> explicit_optional_unwrap.input.zig:2:16
+  |
+2 |     return opt.?;
+  |                ^
+  |
+  = help: use a capture or `orelse`
+  = note: use `orelse { unreachable; }` only when `null` is impossible
+
+error[explicit_optional_unwrap]: `.?` unwraps an optional without handling `null`
+ --> explicit_optional_unwrap.input.zig:7:20
+  |
+7 |         return opt.?;
+  |                    ^
+  |
+  = help: use a capture or `orelse`
+  = note: use `orelse { unreachable; }` only when `null` is impossible
+
+error[explicit_optional_unwrap]: `.?` unwraps an optional without handling `null`
+  --> explicit_optional_unwrap.input.zig:14:16
+   |
+14 |     return opt.?.?;
+   |                ^
+   |
+   = help: use a capture or `orelse`
+   = note: use `orelse { unreachable; }` only when `null` is impossible
+
+error[explicit_optional_unwrap]: `.?` unwraps an optional without handling `null`
+  --> explicit_optional_unwrap.input.zig:14:18
+   |
+14 |     return opt.?.?;
+   |                  ^
+   |
+   = help: use a capture or `orelse`
+   = note: use `orelse { unreachable; }` only when `null` is impossible
