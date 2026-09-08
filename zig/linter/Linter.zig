@@ -1,132 +1,649 @@
-const Linter = @This();
-
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
-
 const Allocator = std.mem.Allocator;
-const Blake3 = std.crypto.hash.Blake3;
+const Ast = std.zig.Ast;
 
-const Diagnostics = @import("Diagnostics.zig");
-const FileContext = @import("FileContext.zig");
+const AstTokenCache = @import("AstTokenCache.zig");
+const BuiltinRules = @import("BuiltinRules.zig");
+const Fixes = @import("Fixes.zig");
+const Gitignore = @import("Gitignore.zig");
+const LintCache = @import("LintCache.zig");
+const LintContext = @import("LintContext.zig");
+const Plugin = @import("Plugin.zig");
+const Report = @import("LintReport.zig");
 
-pub const File = struct {
+/// `Allocators` separates temporary linting memory from returned report memory.
+///
+/// The linter releases every reference to `scratch` before returning and never
+/// resets or deinitializes either caller-owned allocator. Every slice in the
+/// returned report uses `report` and remains valid until the caller deinitializes
+/// the report or releases that allocator. Report construction uses coarse table
+/// and text allocations rather than allocating each diagnostic string separately.
+pub const Allocators = struct {
+    scratch: Allocator,
+    report: Allocator,
+
+    /// `same` gives scratch data and the returned report the same allocation
+    /// lifetime. Resetting an arena passed here invalidates the report.
+    pub fn same(allocator: Allocator) Allocators {
+        return .{ .scratch = allocator, .report = allocator };
+    }
+};
+
+/// `ReportPathFormat` selects the coordinate system for diagnostic and fixed-file
+/// paths without changing traversal, ignore matching, or cache identity.
+pub const ReportPathFormat = enum {
+    /// Paths are relative to the process working directory when `lint` begins.
+    cwd_relative,
+
+    /// Paths are relative to the nearest enclosing `.git` directory or file.
+    /// When no Git root exists, paths are relative to the process working
+    /// directory.
+    git_root_relative,
+
+    /// Paths are canonical absolute filesystem paths.
+    absolute,
+};
+
+const file_size_max_default = 1 * 1024 * 1024; // 1 MiB
+const gitignore_file_size_max = 120 * 1024; // 120 KiB
+
+/// `LintOptions` controls one file or directory lint operation.
+pub const LintOptions = struct {
+    /// Exact directory basenames excluded by a default directory scan. Callers
+    /// may concatenate this array with their own names before invoking `lint`.
+    pub const excluded_dir_names_default = [_][]const u8{
+        ".git",
+        ".hg",
+        ".svn",
+        ".jj",
+        ".zig-cache",
+        "zig-cache",
+        "zig-out",
+        "zig-pkg",
+        ".cache",
+        "node_modules",
+        ".venv",
+        "__fixtures__",
+    };
+
+    /// `file_size_max` is an inclusive source-byte limit. An oversized explicit
+    /// file fails with `error.FileTooLarge`; an oversized file found beneath a
+    /// directory produces a diagnostic and does not stop the scan.
+    file_size_max: u32 = file_size_max_default,
+
+    /// The Zig release whose language and standard-library contracts rules
+    /// should target. Built-in and plugin rules receive this exact value. It
+    /// does not select the linter's parser or formatter, both of which remain
+    /// those of the toolchain that built the linter.
+    ///
+    /// The default targets the toolchain that built the linter. Prerelease and
+    /// build metadata are preserved and participate in lint-cache identity;
+    /// their backing slices must remain valid until `lint` returns.
+    target_zig_version: std.SemanticVersion = builtin.zig_version,
+
+    /// When true, the report contains canonical text for every file changed by
+    /// compatible rule edits or Zig formatting. The linter never writes source
+    /// files, and diagnostics continue to describe the input text.
+    apply_fixes: bool = false,
+
+    /// `report_path_format` applies uniformly to diagnostics and fixed files.
+    report_path_format: ReportPathFormat = .cwd_relative,
+
+    /// Exact directory basenames excluded at every descendant depth. Supplying
+    /// this field replaces the defaults rather than extending them; pass an
+    /// empty slice to disable directory-name exclusions. These exclusions are
+    /// independent of `.gitignore` and cannot be overridden by its negations.
+    excluded_dir_names: []const []const u8 = &excluded_dir_names_default,
+
+    /// When true, directory scans inside a Git repository apply regular,
+    /// non-symlinked `.gitignore` files from the nearest `.git` boundary through
+    /// the scan root and included descendants. An ignored scan root produces an
+    /// empty report. Without a Git boundary, the scan root starts ignore lookup.
+    respect_gitignore: bool = true,
+
+    /// Registered native plugins selected explicitly for this operation. An
+    /// empty slice runs no plugins. The registry serializes plugin callbacks,
+    /// prevents unload while they run, and rejects absent or duplicate handles.
+    plugins: []const Plugin.Handle = &.{},
+
+    /// Null disables persistent caching. Explicit file inputs never consult or
+    /// update persistent cache state.
+    cache: ?Cache = null,
+
+    /// `Cache` configures persistent storage used to accelerate linting.
+    pub const Cache = struct {
+        /// `base_dir` names a trusted writable directory dedicated to private
+        /// linter cache state. The linter manages everything beneath it and may
+        /// create multiple files or subdirectories, replace formats, or discard
+        /// entries without notice. Callers must treat its contents as private
+        /// and unstable and must not depend on their names or representation.
+        ///
+        /// Cache state is scoped to this directory; the linter never consults a
+        /// different base directory. Selecting a fresh base directory therefore
+        /// guarantees a full cache miss. The linter does not consult `HOME` or
+        /// XDG directories to choose one implicitly.
+        base_dir: []const u8,
+    };
+};
+
+/// `lint` checks one filesystem path and returns caller-owned immutable output.
+///
+/// A regular file is always checked regardless of its extension or cache state;
+/// directory-name exclusions and `.gitignore` files do not apply to it. A
+/// directory is traversed recursively and checks regular `.zig` files. By
+/// default it applies regular, non-symlinked `.gitignore` files of at
+/// most 120 KiB from the nearest Git boundary through the scan root and included
+/// descendants. Without a Git boundary, ignore lookup begins at the scan root.
+/// It also prunes the exact basenames in
+/// `LintOptions.excluded_dir_names_default`. Directory-name exclusions
+/// are applied independently before `.gitignore` rules. Ignore matching does not
+/// inspect Git's index, so a tracked path that matches a pattern is excluded
+/// from a directory scan. During a directory walk, a symlink is linted only
+/// when its target is a regular `.zig` file.
+///
+/// Traversal and source-read failures fail the operation. Cache corruption and
+/// cache-specific I/O failures become misses; a failed scan does not publish
+/// partial cache state.
+pub fn lint(
+    allocators: Allocators,
+    io: std.Io,
     path: []const u8,
-    text: [:0]const u8,
-};
+    options: LintOptions,
+) !Report.LintReport {
+    var builder: Report.Builder = .{};
+    defer builder.deinit(allocators.scratch);
 
-const LintRule = *const fn (
-    Allocator,
-    Allocator,
-    []const u8,
-    *const FileContext,
-    *Diagnostics,
-) Allocator.Error!void;
+    const stat = try std.Io.Dir.cwd().statFile(io, path, .{});
+    if (stat.kind != .file and stat.kind != .directory) {
+        return error.UnsupportedFileType;
+    }
 
-const lint_rules: []const LintRule = &.{
-    @import("rules/hidden_control_flow.zig").lint,
-    @import("rules/explicit_optional_unwrap.zig").lint,
-    @import("rules/blank_line_before_control_flow_exit.zig").lint,
-    @import("rules/visible_resource_lifetime.zig").lint,
-};
-
-pub const empty: Linter = .{};
-
-diagnostics: Diagnostics = .empty,
-
-/// Return `error.FileTooLarge` before parsing if `file.text` exceeds
-/// `file_size_max` bytes. Files exactly at the limit are accepted.
-/// Syntax errors and lint violations are appended to `diagnostics`.
-pub fn lint_file(
-    linter: *Linter,
-    file_allocator: Allocator,
-    diagnostic_allocator: Allocator,
-    file: File,
-    file_size_max: u32,
-) (Allocator.Error || error{FileTooLarge})!void {
-    if (file.text.len > file_size_max) {
+    if (stat.kind == .file and stat.size > options.file_size_max) {
         return error.FileTooLarge;
     }
 
-    var ast = try std.zig.Ast.parse(file_allocator, file.text, .zig);
-    defer ast.deinit(file_allocator);
+    const absolute_input_path = try std.Io.Dir.cwd().realPathFileAlloc(
+        io,
+        path,
+        allocators.scratch,
+    );
+    defer allocators.scratch.free(absolute_input_path);
 
-    const context = try FileContext.init(file_allocator, ast, file_size_max);
-    defer file_allocator.free(context.line_starts);
+    const git_root_is_needed = options.report_path_format == .git_root_relative or
+        (stat.kind == .directory and options.respect_gitignore);
 
-    if (ast.errors.len != 0) {
-        try linter.diagnostics.add_at_token(
-            diagnostic_allocator,
-            file.path,
-            &context,
-            ast.errors[0].token,
-            "parse",
-            "this file does not parse; fix the syntax error before linting",
-        );
+    const git_root = if (git_root_is_needed)
+        try findGitRoot(io, absolute_input_path, stat.kind)
+    else
+        null;
 
-        return;
+    var report_paths = try ReportPaths.init(
+        allocators.scratch,
+        io,
+        absolute_input_path,
+        options.report_path_format,
+        git_root,
+    );
+    defer report_paths.deinit(allocators.scratch);
+
+    switch (stat.kind) {
+        .file => try lintFilePath(
+            allocators.scratch,
+            io,
+            absolute_input_path,
+            report_paths.input_path,
+            options,
+            &builder,
+        ),
+        .directory => try lintDir(
+            allocators.scratch,
+            io,
+            absolute_input_path,
+            if (options.respect_gitignore) git_root else null,
+            options,
+            &report_paths,
+            &builder,
+        ),
+        else => unreachable,
     }
 
-    for (lint_rules) |run_rule| {
-        try run_rule(file_allocator, diagnostic_allocator, file.path, &context, &linter.diagnostics);
+    return builder.finish(allocators.scratch, allocators.report);
+}
+
+const ReportPaths = struct {
+    input_path: []u8,
+    entry_path_buffer: std.ArrayList(u8) = .empty,
+
+    fn init(
+        allocator: Allocator,
+        io: std.Io,
+        absolute_input_path: []const u8,
+        format: ReportPathFormat,
+        git_root: ?[]const u8,
+    ) !ReportPaths {
+        switch (format) {
+            .absolute => return .{
+                .input_path = try allocator.dupe(u8, absolute_input_path),
+            },
+            .git_root_relative => if (git_root) |root| {
+                return .{
+                    .input_path = try allocator.dupe(
+                        u8,
+                        relativePathFromAncestor(absolute_input_path, root),
+                    ),
+                };
+            },
+            .cwd_relative => {},
+        }
+
+        const cwd_path = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(cwd_path);
+
+        const input_path = try std.fs.path.relative(
+            allocator,
+            cwd_path,
+            null,
+            cwd_path,
+            absolute_input_path,
+        );
+
+        return .{ .input_path = input_path };
+    }
+
+    fn deinit(paths: *ReportPaths, allocator: Allocator) void {
+        paths.entry_path_buffer.deinit(allocator);
+        allocator.free(paths.input_path);
+
+        paths.* = undefined;
+    }
+
+    fn entryPath(
+        paths: *ReportPaths,
+        allocator: Allocator,
+        scan_relative_path: []const u8,
+    ) Allocator.Error![]const u8 {
+        const input_path = paths.input_path;
+        if (input_path.len == 0) {
+            return scan_relative_path;
+        }
+
+        paths.entry_path_buffer.clearRetainingCapacity();
+
+        const separator_is_needed = !std.fs.path.isSep(input_path[input_path.len - 1]);
+
+        try paths.entry_path_buffer.ensureTotalCapacity(
+            allocator,
+            input_path.len +
+                @intFromBool(separator_is_needed) +
+                scan_relative_path.len,
+        );
+
+        paths.entry_path_buffer.appendSliceAssumeCapacity(input_path);
+
+        if (separator_is_needed) {
+            paths.entry_path_buffer.appendAssumeCapacity(std.fs.path.sep);
+        }
+
+        paths.entry_path_buffer.appendSliceAssumeCapacity(scan_relative_path);
+
+        return paths.entry_path_buffer.items;
+    }
+};
+
+fn findGitRoot(
+    io: std.Io,
+    absolute_input_path: []const u8,
+    input_kind: std.Io.File.Kind,
+) !?[]const u8 {
+    var ancestor = if (input_kind == .directory)
+        absolute_input_path
+    else
+        std.fs.path.dirname(absolute_input_path) orelse {
+            return null;
+        };
+
+    var marker_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    while (true) {
+        const marker_path = if (std.mem.eql(u8, ancestor, std.fs.path.sep_str))
+            try std.fmt.bufPrint(&marker_path_buffer, "{s}.git", .{ancestor})
+        else
+            try std.fmt.bufPrint(&marker_path_buffer, "{s}" ++ std.fs.path.sep_str ++ ".git", .{ancestor});
+
+        const marker_stat = std.Io.Dir.cwd().statFile(
+            io,
+            marker_path,
+            .{ .follow_symlinks = false },
+        ) catch |err|
+            switch (err) {
+                error.FileNotFound => null,
+                else => return err,
+            };
+
+        if (marker_stat) |stat| {
+            if (stat.kind == .directory or stat.kind == .file) {
+                // A primary worktree normally has a `.git` directory. Linked
+                // worktrees and modern submodules use a `.git` file that points
+                // to their Git directory instead.
+                return ancestor;
+            }
+        }
+
+        const parent = std.fs.path.dirname(ancestor) orelse {
+            return null;
+        };
+
+        if (parent.len == ancestor.len) {
+            return null;
+        }
+
+        ancestor = parent;
     }
 }
 
-const file_size_max_default = 1 * 1024 * 1024; // 1 MiB
+fn relativePathFromAncestor(path: []const u8, ancestor: []const u8) []const u8 {
+    assert(ancestor.len != 0);
+    assert(std.mem.startsWith(u8, path, ancestor));
 
-pub const LintDirectoryOptions = struct {
-    /// Null disables caching. The caller supplies a trusted, writable cache
-    /// directory; the library does not consult XDG or HOME.
-    cache: ?struct {
-        /// The caller owns invalidation when the linter implementation, Zig
-        /// version, or effective rules change. Use a versioned base directory
-        /// (for example `/tmp/lint-cache/v2`), clear the cache, or disable it.
-        /// The library adds no implementation-version directory automatically.
-        /// A commit ID alone does not cover dirty builds.
-        base_dir: []const u8,
-    } = null,
-    /// Inclusive source-byte limit; zero permits only empty files. Cache entries
-    /// exceeding this limit are discarded individually, without invalidating
-    /// other entries or requiring a different cache directory.
-    file_size_max: u32 = file_size_max_default,
+    if (path.len == ancestor.len) {
+        return "";
+    }
+
+    if (std.fs.path.isSep(ancestor[ancestor.len - 1])) {
+        return path[ancestor.len..];
+    }
+
+    assert(std.fs.path.isSep(path[ancestor.len]));
+
+    return path[ancestor.len + 1 ..];
+}
+
+// ─── File Linting ────────────────────────────────────────────────────────────
+
+const FileResult = struct {
+    lint_clean: bool,
+    zig_fmt_clean: bool,
 };
 
-/// Recursively lint `.zig` files beneath `dir_path`, appending diagnostics.
-///
-/// Skips descendant directories named `.git`, `.zig-cache`, `.cache`,
-/// `zig-cache`, `zig-out`, `zig-pkg`, or `__fixtures__` at any depth.
-///
-/// Files in `__fixtures__` can still be checked explicitly with `lint_file`.
-///
-/// Files larger than `options.file_size_max` produce a file-level diagnostic without
-/// being parsed; scanning continues with the remaining files.
-///
-/// Optional clean-file caching uses relative path, inode, size, and nanosecond
-/// mtime, not content hashes. Changes preserving that metadata can be missed;
-/// pass `.{}` for an unconditional scan. Cache files live directly beneath
-/// the supplied base: `<root-hash>.bin`. Cache failures
-/// do not fail linting. Only a completed scan publishes updated cache records.
-pub fn lintDirectory(
-    linter: *Linter,
+fn lintFilePath(
     scratch_allocator: Allocator,
-    diagnostic_allocator: Allocator,
     io: std.Io,
-    dir_path: []const u8,
-    options: LintDirectoryOptions,
+    path: []const u8,
+    report_path: []const u8,
+    options: LintOptions,
+    builder: *Report.Builder,
+) !void {
+    const opened = try openRegularFile(io, std.Io.Dir.cwd(), path, .{}) orelse {
+        return error.UnsupportedFileType;
+    };
+
+    var source_file = opened.file;
+    defer source_file.close(io);
+
+    if (opened.stat.size > options.file_size_max) {
+        return error.FileTooLarge;
+    }
+
+    var file_arena = std.heap.ArenaAllocator.init(scratch_allocator);
+    defer file_arena.deinit();
+
+    const file_allocator = file_arena.allocator();
+    const buffer_size = @as(usize, options.file_size_max) + 1;
+    const buffer = try file_allocator.alloc(u8, buffer_size);
+
+    var reader = source_file.reader(io, &.{});
+
+    const read_size = reader.interface.readSliceShort(buffer) catch |err|
+        switch (err) {
+            error.ReadFailed => return reader.err orelse {
+                unreachable;
+            },
+        };
+
+    if (read_size == buffer.len) {
+        return error.FileTooLarge;
+    }
+
+    buffer[read_size] = 0;
+
+    const source = buffer[0..read_size :0];
+
+    var ast = try Ast.parse(file_allocator, source, .zig);
+    defer ast.deinit(file_allocator);
+
+    _ = try lintAst(
+        file_allocator,
+        scratch_allocator,
+        io,
+        builder,
+        report_path,
+        ast,
+        options,
+        .{},
+    );
+}
+
+fn lintAst(
+    file_allocator: Allocator,
+    builder_allocator: Allocator,
+    io: std.Io,
+    builder: *Report.Builder,
+    path: []const u8,
+    ast: Ast,
+    options: LintOptions,
+    previously_verified: LintCache.Verified,
+) !FileResult {
+    if (ast.errors.len != 0) {
+        if (!previously_verified.lint_clean) {
+            const parse_error = ast.errors[0];
+            const token = parse_error.token + @intFromBool(parse_error.token_is_prev);
+            const location = ast.tokenLocation(0, token);
+            const start_offset = ast.tokenStart(token);
+
+            var parse_message: std.Io.Writer.Allocating = .init(file_allocator);
+            defer parse_message.deinit();
+
+            ast.renderError(parse_error, &parse_message.writer) catch {
+                return error.OutOfMemory;
+            };
+
+            const message = try parse_message.toOwnedSlice();
+            defer file_allocator.free(message);
+
+            try builder.addDiagnostic(builder_allocator, .{
+                .path = path,
+                .rule_name = "parse",
+                .message = message,
+                .help = "fix this syntax error before running the linter",
+                .location = .{
+                    .line = location.line + 1,
+                    .column = location.column + 1,
+                    .range = .{
+                        .start_offset = start_offset,
+                        .end_offset = @intCast(start_offset + ast.tokenSlice(token).len),
+                    },
+                },
+                .source_line = ast.source[location.line_start..location.line_end],
+            });
+        }
+
+        return .{
+            .lint_clean = previously_verified.lint_clean,
+            .zig_fmt_clean = previously_verified.zig_fmt_clean,
+        };
+    }
+
+    var fixes = Fixes.init(file_allocator);
+    defer fixes.deinit();
+
+    fixes.reset(ast.source);
+
+    const diagnostics_before = builder.diagnosticCount();
+
+    if (!previously_verified.lint_clean) {
+        var context = try LintContext.init(
+            file_allocator,
+            builder_allocator,
+            path,
+            ast,
+            options.target_zig_version,
+            builder,
+            if (options.apply_fixes)
+                &fixes
+            else
+                null,
+        );
+        defer context.deinit();
+
+        for (BuiltinRules.all) |definition| {
+            try context.runRule(definition);
+        }
+
+        try Plugin.runConfigured(io, options.plugins, &context);
+    }
+
+    const lint_clean = previously_verified.lint_clean or
+        builder.diagnosticCount() == diagnostics_before;
+
+    var zig_fmt_clean = previously_verified.zig_fmt_clean;
+
+    if (options.apply_fixes and !zig_fmt_clean) {
+        const applied = try fixes.applyAndFormat(ast, options.file_size_max);
+        defer if (applied.updated_source) |updated_source| {
+            file_allocator.free(updated_source);
+        };
+
+        if (applied.updated_source) |updated_source| {
+            try builder.addFixedFile(
+                builder_allocator,
+                path,
+                updated_source,
+                applied.applied_fix_count,
+                applied.skipped_fix_count,
+            );
+        } else {
+            builder.addFixCounts(applied.applied_fix_count, applied.skipped_fix_count);
+
+            zig_fmt_clean = true;
+        }
+    }
+
+    return .{
+        .lint_clean = lint_clean,
+        .zig_fmt_clean = zig_fmt_clean,
+    };
+}
+
+// ─── Directory Linting ───────────────────────────────────────────────────────
+
+fn lintDir(
+    scratch_allocator: Allocator,
+    io: std.Io,
+    absolute_scan_path: []const u8,
+    git_root: ?[]const u8,
+    options: LintOptions,
+    report_paths: *ReportPaths,
+    builder: *Report.Builder,
 ) !void {
     // ── Prepare Scan ──
 
-    var dir_handle = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
+    var dir_handle = try std.Io.Dir.cwd().openDir(io, absolute_scan_path, .{ .iterate = true });
     defer dir_handle.close(io);
 
-    var cache: ?CleanFilesCache = CleanFilesCache.init(scratch_allocator, io, dir_handle, options) catch null;
-    defer if (cache) |*clean_cache| {
-        clean_cache.deinit(scratch_allocator);
+    var lint_cache: ?LintCache = if (options.cache) |configuration|
+        LintCache.init(
+            scratch_allocator,
+            io,
+            dir_handle,
+            configuration.base_dir,
+            options.target_zig_version,
+        ) catch null
+    else
+        null;
+    defer if (lint_cache) |*cache| {
+        cache.deinit(scratch_allocator);
     };
 
-    var walker = try dir_handle.walk(scratch_allocator);
+    // Open the syntax cache before traversal so every selected path can mark its
+    // entry seen, including files skipped by lint-clean facts. A completed scan
+    // can then prune deleted, renamed, and excluded entries. This deliberately
+    // loads the syntax pack on a fully lint-cached scan; mixed scans need it
+    // anyway, and avoiding persistent stale entries keeps the cache bounded.
+    var syntax_cache: ?AstTokenCache = if (options.cache) |configuration|
+        AstTokenCache.init(
+            scratch_allocator,
+            io,
+            dir_handle,
+            configuration.base_dir,
+        ) catch null
+    else
+        null;
+    defer if (syntax_cache) |*cache| {
+        cache.deinit(scratch_allocator);
+    };
+
+    // Plugin artifacts are not part of lint-cache identity. A plugin scan still
+    // opens and commits the index so a successful complete scan discards old
+    // unkeyed facts, but those facts never suppress or describe plugin work.
+    const lint_cache_facts_are_usable = options.plugins.len == 0;
+
+    // ── Resolve Inherited Exclusions ──
+
+    var gitignore: Gitignore = .{};
+    defer gitignore.deinit(scratch_allocator);
+
+    const gitignore_scan_dir_path = if (git_root) |root|
+        relativePathFromAncestor(absolute_scan_path, root)
+    else
+        "";
+
+    if (git_root) |root| {
+        if (gitignore_scan_dir_path.len != 0) {
+            const scan_root_is_ignored = try loadAncestorGitignores(
+                scratch_allocator,
+                io,
+                root,
+                gitignore_scan_dir_path,
+                &gitignore,
+            );
+
+            if (scan_root_is_ignored) {
+                // The complete selected set is empty. Commit it so files from
+                // an earlier included scan cannot survive this generation.
+                commitDirectoryCaches(
+                    scratch_allocator,
+                    io,
+                    &lint_cache,
+                    &syntax_cache,
+                );
+
+                return;
+            }
+        }
+    }
+
+    const root_has_gitignore = options.respect_gitignore and try loadGitignoreFile(
+        scratch_allocator,
+        io,
+        &gitignore,
+        dir_handle,
+        ".gitignore",
+        gitignore_scan_dir_path,
+    );
+
+    var dirs_have_gitignore: std.ArrayList(bool) = .empty;
+    defer dirs_have_gitignore.deinit(scratch_allocator);
+
+    try dirs_have_gitignore.append(scratch_allocator, root_has_gitignore);
+
+    var gitignore_entry_path_buffer: std.ArrayList(u8) = .empty;
+    defer gitignore_entry_path_buffer.deinit(scratch_allocator);
+
+    var walker = try dir_handle.walkSelectively(scratch_allocator);
     defer walker.deinit();
 
-    // Allocate only on the first miss. An entirely cached scan needs neither
+    // Allocate only on the first miss. An entirely verified scan needs neither
     // this configurable read buffer nor its ReleaseSafe allocation/free poison fills.
     var file_buffer: ?[]u8 = null;
     defer if (file_buffer) |buffer| {
@@ -138,430 +655,426 @@ pub fn lintDirectory(
 
     // ── Check Files ──
 
-    while (true) {
-        const entry = try walker.next(io) orelse {
-            break;
-        };
+    while (try walker.next(io)) |entry| {
+        // ── Restore The Entry's Parent Scope ──
 
-        if (entry.kind == .directory) {
-            if (std.mem.eql(u8, entry.basename, ".git") or
-                std.mem.eql(u8, entry.basename, ".zig-cache") or
-                std.mem.eql(u8, entry.basename, ".cache") or
-                std.mem.eql(u8, entry.basename, "zig-cache") or
-                std.mem.eql(u8, entry.basename, "zig-out") or
-                std.mem.eql(u8, entry.basename, "zig-pkg") or
-                std.mem.eql(u8, entry.basename, "__fixtures__"))
-            {
-                walker.leave(io);
+        while (dirs_have_gitignore.items.len > entry.depth()) {
+            const dir_had_gitignore = dirs_have_gitignore.pop() orelse {
+                unreachable;
+            };
+
+            if (dir_had_gitignore) {
+                gitignore.pop();
             }
+        }
+
+        assert(dirs_have_gitignore.items.len == entry.depth());
+
+        // ── Resolve Unknown Filesystem Types ──
+
+        var entry_kind = entry.kind;
+
+        if (entry_kind == .unknown) {
+            entry_kind = (try entry.dir.statFile(
+                io,
+                entry.basename,
+                .{ .follow_symlinks = false },
+            )).kind;
+        }
+
+        // ── Apply Directory And Repository Exclusions Before I/O ──
+
+        if (entry_kind == .directory and dirNameIsExcluded(
+            options.excluded_dir_names,
+            entry.basename,
+        )) {
+            continue;
+        }
+
+        const gitignore_entry_path = if (options.respect_gitignore and gitignore_scan_dir_path.len != 0) path: {
+            gitignore_entry_path_buffer.clearRetainingCapacity();
+
+            try gitignore_entry_path_buffer.ensureTotalCapacity(
+                scratch_allocator,
+                gitignore_scan_dir_path.len + 1 + entry.path.len,
+            );
+
+            gitignore_entry_path_buffer.appendSliceAssumeCapacity(gitignore_scan_dir_path);
+            gitignore_entry_path_buffer.appendAssumeCapacity('/');
+            gitignore_entry_path_buffer.appendSliceAssumeCapacity(entry.path);
+
+            break :path gitignore_entry_path_buffer.items;
+        } else entry.path;
+
+        if (options.respect_gitignore and gitignore.pathIsIgnored(
+            gitignore_entry_path,
+            entry_kind == .directory,
+        )) {
+            continue;
+        }
+
+        // ── Enter Included Directory Scope ──
+
+        if (entry_kind == .directory) {
+            var gitignore_path_buffer: [std.Io.Dir.max_name_bytes + "/.gitignore".len]u8 = undefined;
+            const gitignore_path = try std.fmt.bufPrint(
+                &gitignore_path_buffer,
+                "{s}/.gitignore",
+                .{entry.basename},
+            );
+
+            try dirs_have_gitignore.ensureUnusedCapacity(scratch_allocator, 1);
+
+            const child_has_gitignore = options.respect_gitignore and try loadGitignoreFile(
+                scratch_allocator,
+                io,
+                &gitignore,
+                entry.dir,
+                gitignore_path,
+                gitignore_entry_path,
+            );
+
+            var dir_entry = entry;
+
+            dir_entry.kind = .directory;
+
+            walker.enter(io, dir_entry) catch |err| {
+                if (child_has_gitignore) {
+                    gitignore.pop();
+                }
+
+                return err;
+            };
+
+            dirs_have_gitignore.appendAssumeCapacity(child_has_gitignore);
 
             continue;
         }
+
+        // ── Select Eligible Zig Files ──
 
         if (!std.mem.endsWith(u8, entry.basename, ".zig")) {
             continue;
         }
 
-        if (cache) |*clean_files_cache| {
-            if (clean_files_cache.has(io, entry.dir, entry.basename, entry.path, options.file_size_max)) {
-                continue;
-            }
+        switch (entry_kind) {
+            .file, .sym_link => {},
+            else => continue,
         }
 
-        const buffer = file_buffer orelse buffer: {
-            // Read one byte beyond the accepted file limit. A full buffer means the
-            // file is either exactly this size or larger; both exceed `file_size_max`.
-            // A shorter read leaves that extra byte available for the zero sentinel
-            // required by `Ast.parse`'s `[:0]const u8` input.
-            const buffer_size = std.math.add(usize, options.file_size_max, 1) catch {
-                return error.OutOfMemory;
-            };
-
-            const allocated = try scratch_allocator.alloc(u8, buffer_size);
-            file_buffer = allocated;
-
-            break :buffer allocated;
+        const opened = try openRegularFile(io, entry.dir, entry.basename, .{}) orelse {
+            continue;
         };
 
-        var source_file = try entry.dir.openFile(io, entry.basename, .{});
+        var source_file = opened.file;
         defer source_file.close(io);
 
-        // Cache the pre-read metadata, even if the file changes during linting.
-        // A metadata change makes this entry miss on the next scan. Using newer
-        // metadata instead could associate a clean result with unread contents.
-        const stat_before = if (cache) |_|
-            source_file.stat(io) catch null
+        const cached_syntax: ?AstTokenCache.Entry = if (syntax_cache) |*cache|
+            cache.lookup(entry.path, opened.stat, options.file_size_max)
         else
             null;
 
-        var reader = source_file.reader(io, &.{});
+        const previously_verified = if (lint_cache_facts_are_usable)
+            if (lint_cache) |*cache|
+                cache.lookup(entry.path, opened.stat, options.file_size_max) orelse
+                    LintCache.Verified{}
+            else
+                LintCache.Verified{}
+        else
+            LintCache.Verified{};
 
-        const read_len = reader.interface.readSliceShort(buffer) catch |err|
-            switch (err) {
-                error.ReadFailed => return reader.err orelse {
-                    unreachable;
-                },
+        if (previously_verified.lint_clean and
+            (!options.apply_fixes or previously_verified.zig_fmt_clean))
+        {
+            continue;
+        }
+
+        const report_path = try report_paths.entryPath(scratch_allocator, entry.path);
+
+        var linted_source_size: usize = undefined;
+        var result: FileResult = undefined;
+        if (cached_syntax) |token_entry| {
+            _ = file_arena.reset(.retain_capacity);
+
+            const file_allocator = file_arena.allocator();
+
+            var ast = try token_entry.parse(file_allocator);
+            defer ast.deinit(file_allocator);
+
+            result = try lintAst(
+                file_allocator,
+                scratch_allocator,
+                io,
+                builder,
+                report_path,
+                ast,
+                options,
+                previously_verified,
+            );
+            linted_source_size = token_entry.source.len;
+        } else {
+            const buffer = file_buffer orelse buffer: {
+                const buffer_size = @as(usize, options.file_size_max) + 1;
+                const allocated = try scratch_allocator.alloc(u8, buffer_size);
+
+                file_buffer = allocated;
+
+                break :buffer allocated;
             };
 
-        if (read_len == buffer.len) {
-            // Messages are borrowed by Diagnostics, so this formatted limit
-            // must live with the diagnostic rather than the reusable file arena.
-            const message = try std.fmt.allocPrint(diagnostic_allocator, "file is larger than {d} bytes; split it.", .{options.file_size_max});
-            errdefer diagnostic_allocator.free(message);
+            var reader = source_file.reader(io, &.{});
 
-            try linter.diagnostics.add(diagnostic_allocator, .{
-                .path = entry.path,
-                .line = 1,
-                .column = 1,
-                .rule_name = "parse",
-                .message = message,
-            });
+            const read_size = reader.interface.readSliceShort(buffer) catch |err|
+                switch (err) {
+                    error.ReadFailed => return reader.err orelse {
+                        unreachable;
+                    },
+                };
 
-            continue;
+            if (read_size == buffer.len) {
+                const message = try std.fmt.allocPrint(
+                    scratch_allocator,
+                    "file exceeds the {d}-byte size limit",
+                    .{options.file_size_max},
+                );
+                defer scratch_allocator.free(message);
+
+                try builder.addDiagnostic(scratch_allocator, .{
+                    .path = report_path,
+                    .rule_name = "file_size",
+                    .message = message,
+                    .help = "split the file or increase `file_size_max`",
+                    .location = .{
+                        .line = 1,
+                        .column = 1,
+                        .range = .{ .start_offset = 0, .end_offset = 0 },
+                    },
+                });
+
+                continue;
+            }
+
+            buffer[read_size] = 0;
+
+            const source = buffer[0..read_size :0];
+
+            _ = file_arena.reset(.retain_capacity);
+
+            const file_allocator = file_arena.allocator();
+
+            var ast = try Ast.parse(file_allocator, source, .zig);
+            defer ast.deinit(file_allocator);
+
+            if (syntax_cache) |*cache| {
+                if (opened.stat.size == read_size) {
+                    cache.put(
+                        scratch_allocator,
+                        entry.path,
+                        opened.stat,
+                        source,
+                        ast.tokens,
+                    ) catch {};
+                }
+            }
+
+            result = try lintAst(
+                file_allocator,
+                scratch_allocator,
+                io,
+                builder,
+                report_path,
+                ast,
+                options,
+                previously_verified,
+            );
+            linted_source_size = read_size;
         }
 
-        // Terminate the populated prefix using the extra byte reserved above.
-        // The sentinel is available at `text[text.len]` but is not part of `text`.
-        buffer[read_len] = 0;
+        if (lint_cache_facts_are_usable) {
+            if (lint_cache) |*cache| {
+                if (!result.lint_clean or opened.stat.size != linted_source_size) {
+                    continue;
+                }
 
-        _ = file_arena.reset(.retain_capacity);
-
-        const diagnostics_before = linter.diagnostics.count();
-
-        try linter.lint_file(
-            file_arena.allocator(),
-            diagnostic_allocator,
-            .{ .path = entry.path, .text = buffer[0..read_len :0] },
-            options.file_size_max,
-        );
-
-        const clean_cache = if (cache) |*value|
-            value
-        else {
-            continue;
-        };
-
-        const metadata = stat_before orelse {
-            continue;
-        };
-
-        if (linter.diagnostics.count() != diagnostics_before or metadata.size != read_len) {
-            continue;
+                cache.put(scratch_allocator, entry.path, opened.stat, .{
+                    .lint_clean = true,
+                    .zig_fmt_clean = result.zig_fmt_clean,
+                }) catch {};
+            }
         }
-
-        const record: CleanFilesCache.Record = .{
-            .inode = metadata.inode,
-            .size = @intCast(metadata.size),
-            .mtime_ns = metadata.mtime.nanoseconds,
-            .seen = true,
-        };
-
-        clean_cache.put(scratch_allocator, entry.path, record) catch {
-            // Ignore errors if cache is full; the cache is best effort and not critical for linting.
-        };
     }
 
-    // Reaching here means the walk completed. Failed scans leave the previous
-    // disk index intact; its metadata is still checked on the next invocation.
-    if (cache) |*clean_cache| {
-        clean_cache.save(scratch_allocator, io) catch {};
+    // Reaching here means the complete walk succeeded. Failed scans leave the
+    // previous disk files intact, and each record is revalidated on the next run.
+    commitDirectoryCaches(
+        scratch_allocator,
+        io,
+        &lint_cache,
+        &syntax_cache,
+    );
+}
+
+fn commitDirectoryCaches(
+    allocator: Allocator,
+    io: std.Io,
+    lint_cache: *?LintCache,
+    syntax_cache: *?AstTokenCache,
+) void {
+    if (lint_cache.*) |*cache| {
+        cache.save(allocator, io) catch {};
+    }
+
+    if (syntax_cache.*) |*cache| {
+        cache.save(allocator, io) catch {};
     }
 }
 
-const CleanFilesCache = struct {
-    records: std.StringHashMapUnmanaged(Record) = .empty,
-    storage: std.heap.ArenaAllocator,
-    abs_path: []const u8,
-    dirty: bool = false,
+// `std.Io.Dir.openFile` performs a blocking read-only open. A FIFO named with a
+// `.zig` suffix would wait for a writer before the linter could inspect its
+// type. `O_NONBLOCK` makes opening every candidate safe; after `fstat` confirms
+// a regular file, the flag does not change regular-file reads.
+fn openRegularFile(
+    io: std.Io,
+    dir: std.Io.Dir,
+    sub_path: []const u8,
+    options: struct { follow_symlinks: bool = true },
+) !?struct { file: std.Io.File, stat: std.Io.File.Stat } {
+    const handle = try std.posix.openat(dir.handle, sub_path, .{
+        .ACCMODE = .RDONLY,
+        .NONBLOCK = true,
+        .NOCTTY = true,
+        .NOFOLLOW = !options.follow_symlinks,
+        .CLOEXEC = true,
+    }, 0);
 
-    // The scan limit is u32, so every admitted file size fits without loss.
-    // Keeping size at that width leaves room for seen within a 32-byte record,
-    // rather than padding a u64-sized record to 48 bytes around the i128 mtime.
-    const Record = struct {
-        inode: u64,
-        size: u32,
-        mtime_ns: i128,
-        seen: bool = false,
+    var file: std.Io.File = .{
+        .handle = handle,
+        .flags = .{ .nonblocking = true },
+    };
+    errdefer file.close(io);
 
-        fn matches(record: Record, stat: std.Io.File.Stat) bool {
-            return record.inode == stat.inode and record.size == stat.size and
-                record.mtime_ns == stat.mtime.nanoseconds;
+    const stat = try file.stat(io);
+    if (stat.kind != .file) {
+        file.close(io);
+
+        return null;
+    }
+
+    return .{ .file = file, .stat = stat };
+}
+
+// The scan walker starts at the requested root and cannot discover `.gitignore`
+// files above it. Descend only that root's ancestor chain, evaluating each
+// directory before loading its own file because an ignored directory is a prune
+// boundary that descendant rules cannot reverse. Returns whether one of those
+// rules excludes the requested scan root.
+fn loadAncestorGitignores(
+    allocator: Allocator,
+    io: std.Io,
+    git_root: []const u8,
+    git_root_relative_scan_path: []const u8,
+    gitignore: *Gitignore,
+) !bool {
+    assert(git_root_relative_scan_path.len != 0);
+
+    var ancestor_dir = try std.Io.Dir.cwd().openDir(io, git_root, .{});
+    defer ancestor_dir.close(io);
+
+    _ = try loadGitignoreFile(
+        allocator,
+        io,
+        gitignore,
+        ancestor_dir,
+        ".gitignore",
+        "",
+    );
+
+    var components = std.mem.splitScalar(u8, git_root_relative_scan_path, '/');
+    var ancestor_path_size: usize = 0;
+
+    while (components.next()) |component| {
+        ancestor_path_size += @intFromBool(ancestor_path_size != 0) + component.len;
+
+        const ancestor_path = git_root_relative_scan_path[0..ancestor_path_size];
+        if (gitignore.pathIsIgnored(ancestor_path, true)) {
+            return true;
         }
+
+        if (ancestor_path_size == git_root_relative_scan_path.len) {
+            return false;
+        }
+
+        const child_dir = try ancestor_dir.openDir(io, component, .{});
+
+        ancestor_dir.close(io);
+
+        ancestor_dir = child_dir;
+
+        _ = try loadGitignoreFile(
+            allocator,
+            io,
+            gitignore,
+            ancestor_dir,
+            ".gitignore",
+            ancestor_path,
+        );
+    }
+
+    return false;
+}
+
+fn dirNameIsExcluded(excluded_names: []const []const u8, name: []const u8) bool {
+    for (excluded_names) |excluded_name| {
+        if (std.mem.eql(u8, name, excluded_name)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// `loadGitignoreFile` reads one regular, non-symlink file through `allocator`
+// and compiles it into `gitignore`. It returns false when the path is absent or
+// not an eligible file; the `Gitignore` copy outlives the temporary read buffer.
+fn loadGitignoreFile(
+    allocator: Allocator,
+    io: std.Io,
+    gitignore: *Gitignore,
+    dir: std.Io.Dir,
+    sub_path: []const u8,
+    matching_dir_path: []const u8,
+) !bool {
+    const opened = openRegularFile(
+        io,
+        dir,
+        sub_path,
+        .{ .follow_symlinks = false },
+    ) catch |err|
+        switch (err) {
+            error.FileNotFound, error.IsDir, error.SymLinkLoop => return false,
+            else => return err,
+        } orelse {
+        return false;
     };
 
-    comptime {
-        assert(@sizeOf(Record) == 32);
-    }
+    var file = opened.file;
+    defer file.close(io);
 
-    // Explicit little-endian fields, never a dump of Zig struct padding:
-    //
-    //   header:  magic[8] | version:u32 | record_count:u32
-    //   record:  path_len:u32 | inode:u64 | size:u32 | mtime_ns:i128 | path bytes
-    //
-    // Keys borrow slices of the loaded buffer. The map is freed before the
-    // storage arena that owns that buffer and newly discovered paths.
-    const magic = "ZLCLNIDX";
+    var reader = file.reader(io, &.{});
 
-    // Version 2 narrows the encoded size too. Version 1 indexes rebuild once;
-    // within this format, a lower scan limit still drops only oversized entries.
-    const version = 2;
-    const header_size_expected = 16;
-    const record_size_expected = 32;
-    const cache_size_max = 100 * 1024 * 1024; // 100 MB
-
-    fn init(
-        allocator: Allocator,
-        io: std.Io,
-        base_dir_handle: std.Io.Dir,
-        options: LintDirectoryOptions,
-    ) !?CleanFilesCache {
-        const configuration = options.cache orelse {
-            return null;
+    const contents = reader.interface.allocRemaining(
+        allocator,
+        .limited(gitignore_file_size_max),
+    ) catch |err|
+        switch (err) {
+            error.ReadFailed => return reader.err orelse {
+                unreachable;
+            },
+            error.OutOfMemory, error.StreamTooLong => |failure| return failure,
         };
+    defer allocator.free(contents);
 
-        if (configuration.base_dir.len == 0) {
-            return error.InvalidCacheDirectory;
-        }
+    try gitignore.push(allocator, matching_dir_path, contents);
 
-        // ── Locate Index ──
-        //
-        // Separate scanned roots beneath the caller's base directory. The
-        // caller may include an implementation version in that base path.
-        // This hash identifies the scanned root; file contents are not hashed.
-
-        var storage_arena = std.heap.ArenaAllocator.init(allocator);
-        errdefer storage_arena.deinit();
-
-        const storage = storage_arena.allocator();
-        const base_dir_path = try base_dir_handle.realPathFileAlloc(io, ".", storage);
-
-        var base_dir_digest: [Blake3.digest_length]u8 = undefined;
-        Blake3.hash(base_dir_path, &base_dir_digest, .{});
-
-        const cache_path = try std.fmt.allocPrint(storage, "{s}/{s}.bin", .{
-            configuration.base_dir,
-            std.fmt.bytesToHex(base_dir_digest, .lower),
-        });
-
-        // ── Load Records ──
-
-        var cache: CleanFilesCache = .{ .storage = storage_arena, .abs_path = cache_path };
-
-        cache.init_load_records(allocator, io) catch {
-            // Loading may stop after inserting some records. No partial index is
-            // trusted: one malformed record makes every file a cache miss.
-            cache.records.clearRetainingCapacity();
-            cache.dirty = true;
-        };
-
-        return cache;
-    }
-
-    fn deinit(cache: *CleanFilesCache, allocator: Allocator) void {
-        cache.records.deinit(allocator);
-        cache.storage.deinit();
-    }
-
-    fn init_load_records(cache: *CleanFilesCache, allocator: Allocator, io: std.Io) !void {
-        const cache_bin = try std.Io.Dir.cwd().readFileAlloc(
-            io,
-            cache.abs_path,
-            cache.storage.allocator(),
-            .limited(cache_size_max),
-        );
-        const cache_size = cache_bin.len;
-
-        if (cache_size < header_size_expected or !std.mem.eql(u8, cache_bin[0..8], magic) or
-            std.mem.readInt(u32, cache_bin[8..12], .little) != version)
-        {
-            return error.InvalidCache;
-        }
-
-        const count = std.mem.readInt(u32, cache_bin[12..16], .little);
-
-        if (count > (cache_size - header_size_expected) / record_size_expected) {
-            // Bound capacity before trusting a disk-provided count. A tiny
-            // corrupt file must not trigger a huge hashmap reservation.
-            return error.InvalidCache;
-        }
-
-        try cache.records.ensureTotalCapacity(allocator, count);
-
-        var scan_offset: usize = header_size_expected;
-
-        for (0..count) |_| {
-            if (cache_size - scan_offset < record_size_expected) {
-                return error.InvalidCache;
-            }
-
-            const fields = cache_bin[scan_offset..][0..record_size_expected];
-            const path_size = std.mem.readInt(u32, fields[0..4], .little);
-
-            const record: Record = .{
-                .inode = std.mem.readInt(u64, fields[4..12], .little),
-                .size = std.mem.readInt(u32, fields[12..16], .little),
-                .mtime_ns = std.mem.readInt(i128, fields[16..32], .little),
-            };
-
-            scan_offset += record_size_expected;
-
-            if (path_size == 0 or path_size > cache_size - scan_offset) {
-                return error.InvalidCache;
-            }
-
-            const path = cache_bin[scan_offset..][0..path_size];
-
-            scan_offset += path_size;
-
-            const entry = cache.records.getOrPutAssumeCapacity(path);
-            if (entry.found_existing) {
-                return error.InvalidCache;
-            }
-
-            entry.value_ptr.* = record;
-        }
-
-        if (scan_offset != cache_size) {
-            return error.InvalidCache;
-        }
-    }
-
-    fn has(
-        cache: *CleanFilesCache,
-        io: std.Io,
-        dir_handle: std.Io.Dir,
-        name: []const u8,
-        path: []const u8,
-        file_size_max: u32,
-    ) bool {
-        const record = cache.records.getPtr(path) orelse {
-            return false;
-        };
-
-        // The size limit belongs to this scan, not the binary format. Lowering
-        // it invalidates only this entry; the other clean records remain useful.
-        const stat = if (record.size <= file_size_max)
-            dir_handle.statFile(io, name, .{}) catch null
-        else
-            null;
-
-        if (stat) |metadata| {
-            if (record.matches(metadata)) {
-                record.seen = true;
-
-                return true;
-            }
-        }
-
-        // A failed metadata read or a changed file must never leave the old
-        // clean result reusable.
-        // The same applies when the recorded size exceeds this scan's limit.
-        _ = cache.records.remove(path);
-        cache.dirty = true;
-
-        return false;
-    }
-
-    fn put(
-        cache: *CleanFilesCache,
-        allocator: Allocator,
-        path: []const u8,
-        record: Record,
-    ) !void {
-        // Walker paths are temporary. Unlike loaded keys, new keys need one
-        // copy before advancing the directory walker.
-        const owned_path = try cache.storage.allocator().dupe(u8, path);
-
-        try cache.records.put(allocator, owned_path, record);
-
-        cache.dirty = true;
-    }
-
-    fn save(cache: *CleanFilesCache, allocator: Allocator, io: std.Io) !void {
-        // ── Measure Retained Records ──
-        //
-        // Only seen records survive. Deleted files disappear, and a warm scan
-        // with exactly the same records avoids a cache write altogether.
-
-        var record_count: u32 = 0;
-        var cache_size: usize = header_size_expected;
-        var iterator = cache.records.iterator();
-
-        while (iterator.next()) |entry| {
-            if (!entry.value_ptr.seen) {
-                continue;
-            }
-
-            const remaining_space = cache_size_max - cache_size;
-
-            const path_size = entry.key_ptr.len;
-            if (remaining_space < record_size_expected or
-                path_size > remaining_space - record_size_expected)
-            {
-                // Omit this record rather than abandon the whole index. Keep
-                // looking: a later, shorter path may still fit in the budget.
-                continue;
-            }
-
-            cache_size += record_size_expected + path_size;
-            record_count += 1;
-        }
-
-        if (!cache.dirty and record_count == cache.records.count()) {
-            return;
-        }
-
-        // ── Encode And Publish ──
-
-        const bytes = try allocator.alloc(u8, cache_size);
-        defer allocator.free(bytes);
-
-        @memcpy(bytes[0..8], magic);
-        std.mem.writeInt(u32, bytes[8..12], version, .little);
-        std.mem.writeInt(u32, bytes[12..16], record_count, .little);
-
-        var scan_offset: usize = header_size_expected;
-        iterator = cache.records.iterator();
-
-        // Replay the measurement pass's size check in the same map order.
-        // Do not mutate the map between passes: both must select exactly the
-        // same records so the header count and allocated byte size stay valid.
-        while (iterator.next()) |entry| {
-            if (!entry.value_ptr.seen) {
-                continue;
-            }
-
-            const remaining_space = cache_size_max - scan_offset;
-
-            const record = entry.value_ptr;
-            const key = entry.key_ptr.*;
-            const key_size = key.len;
-
-            if (remaining_space < record_size_expected or
-                key_size > remaining_space - record_size_expected)
-            {
-                continue;
-            }
-
-            const fields = bytes[scan_offset..][0..record_size_expected];
-
-            std.mem.writeInt(u32, fields[0..4], @intCast(key_size), .little);
-            std.mem.writeInt(u64, fields[4..12], record.inode, .little);
-            std.mem.writeInt(u32, fields[12..16], record.size, .little);
-            std.mem.writeInt(i128, fields[16..32], record.mtime_ns, .little);
-
-            scan_offset += record_size_expected;
-            @memcpy(bytes[scan_offset..][0..key_size], key);
-            scan_offset += key_size;
-        }
-
-        // A concurrent reader sees the previous complete index or this one,
-        // never a truncated overwrite. Concurrent writers may lose cache hits,
-        // but every retained record must still pass the metadata check.
-        var output = try std.Io.Dir.cwd().createFileAtomic(io, cache.abs_path, .{ .make_path = true, .replace = true });
-        defer output.deinit(io);
-
-        try output.file.writeStreamingAll(io, bytes);
-        try output.replace(io);
-    }
-};
+    return true;
+}

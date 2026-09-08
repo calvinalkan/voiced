@@ -1,14 +1,14 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
-const Diagnostics = @import("../Diagnostics.zig");
+const Rule = @import("../Rule.zig");
+const LintContext = Rule.Context;
+const identifierText = LintContext.identifierText;
 
 /// Snapshot `std.debug.assert` in the file header as `const assert = std.debug.assert;`
 /// and call `assert`. Qualified spellings and file-root aliases of that function are hits.
-pub fn lint(
-    file_allocator: std.mem.Allocator,
-    report: *Diagnostics.Report,
-) std.mem.Allocator.Error!void {
-    const ast = report.file.ast;
+pub fn lint(context: *LintContext) Rule.Error!void {
+    const file_allocator = context.scratch_allocator;
+    const ast = context.ast;
 
     // ── Header Snapshot ──
     //
@@ -40,33 +40,13 @@ pub fn lint(
             break;
         };
 
-        switch (ast.nodeTag(init)) {
-            .container_decl,
-            .container_decl_trailing,
-            .container_decl_two,
-            .container_decl_two_trailing,
-            .container_decl_arg,
-            .container_decl_arg_trailing,
-            .tagged_union,
-            .tagged_union_trailing,
-            .tagged_union_two,
-            .tagged_union_two_trailing,
-            .tagged_union_enum_tag,
-            .tagged_union_enum_tag_trailing,
-            .error_set_decl,
-            .fn_proto,
-            .fn_proto_one,
-            .fn_proto_simple,
-            .fn_proto_multi,
-            .fn_decl,
-            => break,
-
-            else => {},
+        if (LintContext.nodeIsDirectType(ast, init) or ast.nodeTag(init) == .fn_decl) {
+            break;
         }
 
         if (variable.ast.type_node != .none or
             ast.tokenTag(variable.ast.mut_token + 1) != .identifier or
-            !std.mem.eql(u8, ast.tokenSlice(variable.ast.mut_token + 1), "assert") or
+            !std.mem.eql(u8, identifierText(ast, variable.ast.mut_token + 1), "assert") or
             ast.nodeTag(init) != .field_access)
         {
             continue;
@@ -74,7 +54,7 @@ pub fn lint(
 
         const debug_access, const assert_token = ast.nodeData(init).node_and_token;
 
-        if (!std.mem.eql(u8, ast.tokenSlice(assert_token), "assert") or
+        if (!std.mem.eql(u8, identifierText(ast, assert_token), "assert") or
             ast.nodeTag(debug_access) != .field_access)
         {
             continue;
@@ -82,9 +62,9 @@ pub fn lint(
 
         const std_ident, const debug_token = ast.nodeData(debug_access).node_and_token;
 
-        if (!std.mem.eql(u8, ast.tokenSlice(debug_token), "debug") or
+        if (!std.mem.eql(u8, identifierText(ast, debug_token), "debug") or
             ast.nodeTag(std_ident) != .identifier or
-            !std.mem.eql(u8, ast.tokenSlice(ast.nodeMainToken(std_ident)), "std"))
+            !std.mem.eql(u8, identifierText(ast, ast.nodeMainToken(std_ident)), "std"))
         {
             continue;
         }
@@ -121,7 +101,7 @@ pub fn lint(
         };
 
         try aliases.append(file_allocator, .{
-            .name = ast.tokenSlice(variable.ast.mut_token + 1),
+            .name = identifierText(ast, variable.ast.mut_token + 1),
             .init = init,
         });
     }
@@ -136,7 +116,7 @@ pub fn lint(
         const node: Ast.Node.Index = @enumFromInt(index_usize);
         const assert_token = ast.nodeData(node).node_and_token[1];
 
-        if (!std.mem.eql(u8, ast.tokenSlice(assert_token), "assert")) {
+        if (!std.mem.eql(u8, identifierText(ast, assert_token), "assert")) {
             continue;
         }
 
@@ -148,9 +128,8 @@ pub fn lint(
             continue;
         }
 
-        try report.add(.{
+        try context.report(.{
             .token = assert_token,
-            .rule_name = "assert_header_snapshot",
             .message = "assertions must use the file-header `assert` snapshot",
             .help = "define `const assert = std.debug.assert;` in the file header and call `assert`",
         });
@@ -176,7 +155,7 @@ fn pathOf(ast: Ast, node: Ast.Node.Index, aliases: []Alias) Path {
         .grouped_expression => return pathOf(ast, ast.nodeData(node).node_and_token[0], aliases),
 
         .identifier => {
-            const name = ast.tokenSlice(ast.nodeMainToken(node));
+            const name = identifierText(ast, ast.nodeMainToken(node));
             if (std.mem.eql(u8, name, "std")) {
                 return .std;
             }
@@ -205,7 +184,7 @@ fn pathOf(ast: Ast, node: Ast.Node.Index, aliases: []Alias) Path {
 
         .field_access => {
             const lhs, const field_token = ast.nodeData(node).node_and_token;
-            const field = ast.tokenSlice(field_token);
+            const field = identifierText(ast, field_token);
 
             return switch (pathOf(ast, lhs, aliases)) {
                 .std => if (std.mem.eql(u8, field, "debug")) .std_debug else .none,

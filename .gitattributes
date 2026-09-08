@@ -1,0 +1,2 @@
+# CRLF linter inputs preserve source bytes; formatted fix snapshots use LF.
+zig/linter/__fixtures__/*/*_crlf.input.zig -text whitespace=cr-at-eol

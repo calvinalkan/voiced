@@ -1,0 +1,111 @@
+{
+  "description": "Real-model UTF-8 token-limit reproducer. The synthetic speech is mis-transcribed; the observed output tests byte boundaries, not transcription accuracy.",
+  "wav_sha256": "0d3f0e19f578f648920596e932a2330d4092a5d7dcf5deaf39ac14cc3b5d6fd9",
+  "audio": {
+    "sample_rate_hz": 16000,
+    "channels_count": 1,
+    "sample_bits": 16,
+    "samples_count": 54080
+  },
+  "generator": {
+    "program": "ffmpeg",
+    "filter": "flite",
+    "voice": "awb",
+    "text": "The Czech composer Leo Janacek wrote the opera Jenufa."
+  },
+  "model": {
+    "kind": "whisper.small.en",
+    "packed_file_sha256": "6b5a21c9f57aef7be42dfadd0820790d2690f3e209546f989523caaa031499a2"
+  },
+  "runtime": {
+    "audio_samples_count_max": 480000,
+    "encoder_padding_max": "seconds_30",
+    "workers_count": 4
+  },
+  "transcription": {
+    "encoder_padding": "seconds_5",
+    "encoder_workers_count_max": 4,
+    "decoder_workers_count_max": 4
+  },
+  "reference": {
+    "transcript_tokens_count_max": 446,
+    "text": " The Czech composer Leo Jana Czech Rotiopra Janańa",
+    "tokens": [
+      383,
+      16639,
+      26777,
+      19632,
+      449,
+      2271,
+      16639,
+      371,
+      5092,
+      404,
+      430,
+      449,
+      2271,
+      129,
+      226,
+      64
+    ]
+  },
+  "cases": [
+    {
+      "transcript_tokens_count_max": 14,
+      "tokens": [
+        383,
+        16639,
+        26777,
+        19632,
+        449,
+        2271,
+        16639,
+        371,
+        5092,
+        404,
+        430,
+        449,
+        2271,
+        129
+      ],
+      "raw_text_hex": "2054686520437a65636820636f6d706f736572204c656f204a616e6120437a65636820526f74696f707261204a616e61c5",
+      "expected_result": "token_limit",
+      "expected_text": " The Czech composer Leo Jana Czech Rotiopra Jana",
+      "before_fix_result": "InvalidTranscriptEncoding"
+    },
+    {
+      "transcript_tokens_count_max": 15,
+      "tokens": [
+        383,
+        16639,
+        26777,
+        19632,
+        449,
+        2271,
+        16639,
+        371,
+        5092,
+        404,
+        430,
+        449,
+        2271,
+        129,
+        226
+      ],
+      "raw_text_hex": "2054686520437a65636820636f6d706f736572204c656f204a616e6120437a65636820526f74696f707261204a616e61c584",
+      "expected_result": "token_limit",
+      "expected_text": " The Czech composer Leo Jana Czech Rotiopra Janań",
+      "before_fix_result": "ok, end=token_limit"
+    }
+  ],
+  "verification": {
+    "zig_version": "0.16.0",
+    "application_optimization": "ReleaseSafe",
+    "inference_optimization": "ReleaseSafe",
+    "stdlib_optimization": "ReleaseSmall",
+    "separate_inference_object": true,
+    "repetitions_per_case": 3,
+    "weights_and_vocabulary_unmodified": true,
+    "regression_test": "src/inference/root_test.zig: token limits preserve complete UTF-8 characters and all tokens"
+  }
+}

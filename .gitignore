@@ -3,3 +3,8 @@ __pycache__/
 *.py[cod]
 .venv/
 .ruff_cache/
+
+# Zig build outputs
+/.zig-cache/
+/zig-out/
+/zig-pkg/

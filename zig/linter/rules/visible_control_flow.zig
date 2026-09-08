@@ -1,17 +1,18 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Ast = std.zig.Ast;
-const Diagnostics = @import("../Diagnostics.zig");
-const FileContext = @import("../FileContext.zig");
-const Fixes = @import("../Fixes.zig");
+const Rule = @import("../Rule.zig");
+const LintContext = Rule.Context;
+const nodeIsBlock = LintContext.nodeIsBlock;
+const nodeTagIsAssignment = LintContext.nodeTagIsAssignment;
+const nodeTagIsCall = LintContext.nodeTagIsCall;
+const nodeTagIsExit = LintContext.nodeTagIsExit;
 
-/// Keep statement control flow braced, complex value selection multiline, and
-/// explicit or implicit exits visible. Direct switch arms remain compact.
-pub fn lint(
-    file_allocator: std.mem.Allocator,
-    report: *Diagnostics.Report,
-) std.mem.Allocator.Error!void {
-    const file = report.file;
+/// Keep statement control flow braced, non-block compound value selection
+/// multiline, and explicit exits visible. Direct switch arms remain compact.
+pub fn lint(context: *LintContext) Rule.Error!void {
+    const file_allocator = context.scratch_allocator;
+    const file = context;
     const ast = file.ast;
 
     const node_flags = try file_allocator.alloc(u8, ast.nodes.len);
@@ -22,11 +23,6 @@ pub fn lint(
     const pending_nodes = try file_allocator.alloc(Ast.Node.Index, ast.nodes.len);
     defer file_allocator.free(pending_nodes);
 
-    const visible_try_tokens = try file_allocator.alloc(bool, ast.tokens.len);
-    defer file_allocator.free(visible_try_tokens);
-
-    @memset(visible_try_tokens, false);
-
     const violation_kinds = try file_allocator.alloc(Violation, ast.tokens.len);
     defer file_allocator.free(violation_kinds);
 
@@ -34,7 +30,7 @@ pub fn lint(
 
     // Check-only scans retain the one-byte classification. Fix collection also
     // remembers the owning construct, avoiding a parent search per diagnostic.
-    const fix_nodes: []Ast.Node.Index = if (report.fixes != null)
+    const fix_nodes: []Ast.Node.Index = if (context.fixes_enabled)
         try file_allocator.alloc(Ast.Node.Index, ast.tokens.len)
     else
         &.{};
@@ -48,15 +44,15 @@ pub fn lint(
     // statement, then propagate statement position only through constructs
     // whose direct children execute as statements. The fixed worklist holds at
     // most one entry per node, avoiding a parent scan for every control node.
-    classifyNodeContext(ast, node_flags, pending_nodes, visible_try_tokens);
+    classifyNodeContext(ast, node_flags, pending_nodes);
 
     // ── Record Violations ──
     //
     // Structural checks run before token-level exit checks. A parent that
     // requires braces marks its direct body as covered, preventing a second
-    // diagnostic for the same hidden `return` or `try`.
+    // diagnostic for the same hidden exit.
     recordStructuralViolations(file, node_flags, violations);
-    recordHiddenFlowViolations(file, node_flags, visible_try_tokens, violations);
+    recordHiddenFlowViolations(file, node_flags, violations);
 
     // ── Emit In Source Order ──
     //
@@ -67,23 +63,20 @@ pub fn lint(
             continue;
         }
 
-        const description = descriptionFor(violation);
         const token: Ast.TokenIndex = @intCast(token_usize);
 
-        const fix = if (report.fixes != null)
+        const fix = if (context.fixes_enabled)
             try proposeFix(file_allocator, file, node_flags, violations.fix_nodes[token], token, violation)
         else
             null;
-        defer if (fix) |edit| {
-            file_allocator.free(edit.replacement);
-        };
 
-        try report.add(.{
+        const violation_index = @intFromEnum(violation);
+
+        try context.report(.{
             .token = token,
-            .rule_name = "visible_control_flow",
-            .message = description.message,
-            .help = description.help,
-            .note = description.note,
+            .message = violation_messages[violation_index],
+            .help = violation_help[violation_index] orelse "",
+            .note = violation_notes[violation_index] orelse "",
             .fix = fix,
         });
     }
@@ -105,7 +98,6 @@ const Violation = enum(u8) {
     unbraced_catch_fallback,
     inline_complex_orelse_value,
     inline_complex_catch_value,
-    inline_nested_try,
     unbraced_errdefer_capture,
     hidden_return,
     hidden_break,
@@ -123,69 +115,68 @@ fn classifyNodeContext(
     ast: Ast,
     node_flags: []u8,
     pending_nodes: []Ast.Node.Index,
-    visible_try_tokens: []bool,
 ) void {
     var pending_count: usize = 0;
 
     for (ast.nodes.items(.tag), 0..) |tag, node_usize| {
         const node: Ast.Node.Index = @enumFromInt(node_usize);
 
-        var block_buffer: [2]Ast.Node.Index = undefined;
-        if (ast.blockStatements(&block_buffer, node)) |statements| {
-            // Every direct block child is in statement position:
-            //
-            //   {
-            //       const value = compute();  <- statement
-            //       if (ready) { ... }         <- statement
-            //   }
-            for (statements) |statement| {
-                node_flags[@intFromEnum(statement)] |= node_flag_block_child;
+        switch (tag) {
+            .block_two, .block_two_semicolon, .block, .block_semicolon => {
+                var block_buffer: [2]Ast.Node.Index = undefined;
+                const statements = ast.blockStatements(&block_buffer, node) orelse {
+                    unreachable;
+                };
 
-                markStatementPosition(node_flags, pending_nodes, &pending_count, statement);
-            }
-        }
+                // Every direct block child is in statement position:
+                //
+                //   {
+                //       const value = compute();  <- statement
+                //       if (ready) { ... }         <- statement
+                //   }
+                for (statements) |statement| {
+                    node_flags[@intFromEnum(statement)] |= node_flag_block_child;
 
-        if (ast.fullIf(node)) |if_node| {
-            if (if_node.ast.else_expr.unwrap()) |else_body| {
-                if (ast.fullIf(else_body) != null) {
-                    // Record the syntactic `else if` relationship independently
-                    // of value/statement context. The chain root owns multiline
-                    // validation so one compact chain produces one diagnostic:
-                    //
-                    //   if (a) .one else if (b) .two else .three
-                    //                       ^^ `else_body`; marked
-                    node_flags[@intFromEnum(else_body)] |= node_flag_else_if;
+                    markStatementPosition(node_flags, pending_nodes, &pending_count, statement);
                 }
-            }
-        }
+            },
 
-        if (ast.fullSwitchCase(node)) |switch_case| {
-            // Mark only the direct target so token-level `try` and exit checks
-            // permit compact arms. Structural nodes still check their own
-            // children, which are not marked:
-            //
-            //   .start => return,                    <- target; exempt exit
-            //   .stop => if (ready) stopWorker(),    <- `if` target is visited
-            //                ^^^^^^^^^^^ body; not marked and still checked
-            const target = switch_case.ast.target_expr;
+            .if_simple, .@"if" => {
+                const if_node = ast.fullIf(node) orelse {
+                    unreachable;
+                };
 
-            node_flags[@intFromEnum(target)] |= node_flag_switch_arm;
+                if (if_node.ast.else_expr.unwrap()) |else_body| {
+                    if (ast.fullIf(else_body) != null) {
+                        // Record the syntactic `else if` relationship independently
+                        // of value/statement context. The chain root owns multiline
+                        // validation so one compact chain produces one diagnostic:
+                        //
+                        //   if (a) .one else if (b) .two else .three
+                        //                       ^^ `else_body`; marked
+                        node_flags[@intFromEnum(else_body)] |= node_flag_else_if;
+                    }
+                }
+            },
 
-            markLeadingTry(ast, visible_try_tokens, target);
-        }
+            .switch_case_one, .switch_case_inline_one, .switch_case, .switch_case_inline => {
+                const switch_case = ast.fullSwitchCase(node) orelse {
+                    unreachable;
+                };
 
-        if (directValue(ast, tag, node)) |value| {
-            // A leading `try` remains the principal operation when its direct
-            // value continues with `orelse` or another lower-precedence node:
-            //
-            //   const entry = try walker.next(io) orelse {
-            //                 ^^^ first token of the whole initializer; visible
-            //       break;
-            //   };
-            //
-            // In contrast, an aggregate field or call argument does not begin
-            // its containing value and remains subject to the nested-try rule.
-            markLeadingTry(ast, visible_try_tokens, value);
+                // Mark only the direct target so token-level exit checks permit
+                // compact arms. Structural nodes still check their own
+                // children, which are not marked:
+                //
+                //   .start => return,                    <- target; exempt exit
+                //   .stop => if (ready) stopWorker(),    <- `if` target is visited
+                //                ^^^^^^^^^^^ body; not marked and still checked
+                const target = switch_case.ast.target_expr;
+
+                node_flags[@intFromEnum(target)] |= node_flag_switch_arm;
+            },
+
+            else => {},
         }
     }
 
@@ -298,7 +289,7 @@ fn markStatementPosition(
 }
 
 fn recordStructuralViolations(
-    file: *const FileContext,
+    file: *const LintContext,
     node_flags: []u8,
     violations: Violations,
 ) void {
@@ -309,8 +300,31 @@ fn recordStructuralViolations(
 
         switch (tag) {
             .if_simple, .@"if" => recordIfViolations(file, node_flags, violations, node),
-            .while_simple, .while_cont, .@"while" => recordWhileViolations(ast, node_flags, violations, node),
-            .for_simple, .@"for" => recordForViolations(ast, node_flags, violations, node),
+
+            .while_simple, .while_cont, .@"while" => {
+                const while_node = ast.fullWhile(node) orelse {
+                    unreachable;
+                };
+
+                recordRequiredBlock(ast, node_flags, violations, while_node.ast.then_expr, node, .unbraced_while_body);
+
+                if (while_node.ast.else_expr.unwrap()) |else_body| {
+                    recordRequiredBlock(ast, node_flags, violations, else_body, node, .unbraced_while_body);
+                }
+            },
+
+            .for_simple, .@"for" => {
+                const for_node = ast.fullFor(node) orelse {
+                    unreachable;
+                };
+
+                recordRequiredBlock(ast, node_flags, violations, for_node.ast.then_expr, node, .unbraced_for_body);
+
+                if (for_node.ast.else_expr.unwrap()) |else_body| {
+                    recordRequiredBlock(ast, node_flags, violations, else_body, node, .unbraced_for_body);
+                }
+            },
+
             .@"catch", .@"orelse" => recordFallbackViolation(file, node_flags, violations, node),
             .@"errdefer" => recordErrdeferViolation(ast, node_flags, violations, node),
 
@@ -320,7 +334,7 @@ fn recordStructuralViolations(
 }
 
 fn recordIfViolations(
-    file: *const FileContext,
+    file: *const LintContext,
     node_flags: []u8,
     violations: Violations,
     node: Ast.Node.Index,
@@ -371,7 +385,7 @@ fn recordIfViolations(
     }
 
     if (node_flags[@intFromEnum(node)] & node_flag_else_if != 0 or
-        !valueIfRequiresMultiline(ast, if_node))
+        !valueIfRequiresMultiline(ast, node))
     {
         return;
     }
@@ -400,7 +414,7 @@ fn recordIfExitBranch(
     }
 
     const effective_body = unwrapGroupedExpression(ast, body);
-    if (!nodeIsExit(ast.nodeTag(effective_body))) {
+    if (!nodeTagIsExit(ast.nodeTag(effective_body))) {
         return false;
     }
 
@@ -412,40 +426,6 @@ fn recordIfExitBranch(
     recordViolationAtNode(ast, node_flags, violations, effective_body, owner, .unbraced_if_exit_branch);
 
     return true;
-}
-
-fn recordWhileViolations(
-    ast: Ast,
-    node_flags: []u8,
-    violations: Violations,
-    node: Ast.Node.Index,
-) void {
-    const while_node = ast.fullWhile(node) orelse {
-        unreachable;
-    };
-
-    recordRequiredBlock(ast, node_flags, violations, while_node.ast.then_expr, node, .unbraced_while_body);
-
-    if (while_node.ast.else_expr.unwrap()) |else_body| {
-        recordRequiredBlock(ast, node_flags, violations, else_body, node, .unbraced_while_body);
-    }
-}
-
-fn recordForViolations(
-    ast: Ast,
-    node_flags: []u8,
-    violations: Violations,
-    node: Ast.Node.Index,
-) void {
-    const for_node = ast.fullFor(node) orelse {
-        unreachable;
-    };
-
-    recordRequiredBlock(ast, node_flags, violations, for_node.ast.then_expr, node, .unbraced_for_body);
-
-    if (for_node.ast.else_expr.unwrap()) |else_body| {
-        recordRequiredBlock(ast, node_flags, violations, else_body, node, .unbraced_for_body);
-    }
 }
 
 fn recordRequiredBlock(
@@ -464,7 +444,7 @@ fn recordRequiredBlock(
 }
 
 fn recordFallbackViolation(
-    file: *const FileContext,
+    file: *const LintContext,
     node_flags: []u8,
     violations: Violations,
     node: Ast.Node.Index,
@@ -478,7 +458,7 @@ fn recordFallbackViolation(
     }
 
     const tag = ast.nodeTag(node);
-    const fallback_is_exit = nodeIsExit(ast.nodeTag(effective_fallback));
+    const fallback_is_exit = nodeTagIsExit(ast.nodeTag(effective_fallback));
     const is_statement = node_flags[@intFromEnum(node)] & node_flag_statement != 0;
 
     if (is_statement or fallback_is_exit) {
@@ -510,7 +490,7 @@ fn recordFallbackViolation(
     }
 
     if (!valueIsSimple(ast, fallback) and
-        file.tokensOnSameLine(ast.nodeMainToken(node), ast.firstToken(fallback)))
+        file.areTokensOnSameLine(ast.nodeMainToken(node), ast.firstToken(fallback)))
     {
         // A compound value may stay unbraced, but it starts below the fallback
         // operator. Classifying the root as simple or compound also prevents
@@ -548,20 +528,47 @@ fn recordErrdeferViolation(
     recordViolationAtNode(ast, node_flags, violations, deferred, node, .unbraced_errdefer_capture);
 }
 
-fn valueIfRequiresMultiline(ast: Ast, if_node: Ast.full.If) bool {
-    if (if_node.payload_token != null or if_node.error_token != null) {
-        return true;
+fn valueIfRequiresMultiline(ast: Ast, initial_if: Ast.Node.Index) bool {
+    var node = initial_if;
+    var requires_multiline = false;
+
+    while (true) {
+        const if_node = switch (ast.nodeTag(node)) {
+            .if_simple => ast.ifSimple(node),
+            .@"if" => ast.ifFull(node),
+            else => unreachable,
+        };
+
+        // Zig fmt keeps `else` beside a closing brace. The block already exposes
+        // the branch boundary, so leave the entire chain formatter-controlled.
+        if (nodeIsBlock(ast, if_node.ast.then_expr)) {
+            return false;
+        }
+
+        if (if_node.payload_token != null or
+            if_node.error_token != null or
+            !valueIsSimple(ast, if_node.ast.then_expr))
+        {
+            requires_multiline = true;
+        }
+
+        const else_body = if_node.ast.else_expr.unwrap() orelse {
+            return false;
+        };
+
+        if (ast.fullIf(else_body) != null) {
+            requires_multiline = true;
+            node = else_body;
+
+            continue;
+        }
+
+        if (nodeIsBlock(ast, else_body)) {
+            return false;
+        }
+
+        return requires_multiline or !valueIsSimple(ast, else_body);
     }
-
-    const else_body = if_node.ast.else_expr.unwrap() orelse {
-        return false;
-    };
-
-    if (ast.fullIf(else_body) != null) {
-        return true;
-    }
-
-    return !valueIsSimple(ast, if_node.ast.then_expr) or !valueIsSimple(ast, else_body);
 }
 
 fn unwrapGroupedExpression(ast: Ast, initial_node: Ast.Node.Index) Ast.Node.Index {
@@ -609,7 +616,7 @@ fn valueIsSimple(ast: Ast, initial_node: Ast.Node.Index) bool {
     }
 }
 
-fn valueIfMultilineViolation(file: *const FileContext, initial_if: Ast.Node.Index) ?Ast.Node.Index {
+fn valueIfMultilineViolation(file: *const LintContext, initial_if: Ast.Node.Index) ?Ast.Node.Index {
     const ast = file.ast;
     var node = initial_if;
 
@@ -620,13 +627,18 @@ fn valueIfMultilineViolation(file: *const FileContext, initial_if: Ast.Node.Inde
 
         const then_body = if_node.ast.then_expr;
 
-        if (!nodeIsBlock(ast, then_body) and bodySharesPrecedingTokenLine(file, then_body)) {
-            // The token immediately before a then-body is the closing header
-            // token, including a closing capture pipe:
-            //
-            //   if (optional) |value| value else fallback
-            //                         ^^^^^ `then_body`; same line, rejected
-            return then_body;
+        if (!nodeIsBlock(ast, then_body)) {
+            const first_token = ast.firstToken(then_body);
+            assert(first_token > 0);
+
+            if (file.areTokensOnSameLine(first_token - 1, first_token)) {
+                // The token immediately before a then-body is the closing header
+                // token, including a closing capture pipe:
+                //
+                //   if (optional) |value| value else fallback
+                //                         ^^^^^ `then_body`; same line, rejected
+                return then_body;
+            }
         }
 
         const else_body = if_node.ast.else_expr.unwrap() orelse {
@@ -646,7 +658,7 @@ fn valueIfMultilineViolation(file: *const FileContext, initial_if: Ast.Node.Inde
         }
 
         if (!nodeIsBlock(ast, else_body) and
-            file.tokensOnSameLine(if_node.else_token, ast.firstToken(else_body)))
+            file.areTokensOnSameLine(if_node.else_token, ast.firstToken(else_body)))
         {
             // A leaf else-body starts below `else`:
             //
@@ -660,92 +672,36 @@ fn valueIfMultilineViolation(file: *const FileContext, initial_if: Ast.Node.Inde
     }
 }
 
-fn bodySharesPrecedingTokenLine(file: *const FileContext, body: Ast.Node.Index) bool {
-    const first_token = file.ast.firstToken(body);
-    assert(first_token > 0);
-
-    return file.tokensOnSameLine(first_token - 1, first_token);
-}
-
 fn recordHiddenFlowViolations(
-    file: *const FileContext,
-    node_flags: []u8,
-    visible_try_tokens: []const bool,
+    file: *const LintContext,
+    node_flags: []const u8,
     violations: Violations,
 ) void {
-    for (file.ast.nodes.items(.tag), 0..) |tag, node_usize| {
+    const ast = file.ast;
+
+    for (ast.nodes.items(.tag), 0..) |tag, node_usize| {
+        const violation: Violation = switch (tag) {
+            .@"return" => .hidden_return,
+            .@"break" => .hidden_break,
+            .@"continue" => .hidden_continue,
+            .unreachable_literal => .hidden_unreachable,
+            else => continue,
+        };
+
         const node: Ast.Node.Index = @enumFromInt(node_usize);
+        const flags = node_flags[node_usize];
 
-        switch (tag) {
-            .@"try" => recordHiddenTryViolation(file, node_flags, visible_try_tokens, violations, node),
-            .@"return", .@"break", .@"continue", .unreachable_literal => recordHiddenExitViolation(file, node_flags, violations, node),
-
-            else => {},
+        if (flags & (node_flag_covered | node_flag_switch_arm) != 0) {
+            continue;
         }
+
+        const token = ast.nodeMainToken(node);
+        if (token == 0 or !file.areTokensOnSameLine(token - 1, token)) {
+            continue;
+        }
+
+        recordViolation(violations, token, node, violation);
     }
-}
-
-fn recordHiddenTryViolation(
-    file: *const FileContext,
-    node_flags: []const u8,
-    visible_try_tokens: []const bool,
-    violations: Violations,
-    node: Ast.Node.Index,
-) void {
-    const ast = file.ast;
-    const flags = node_flags[@intFromEnum(node)];
-
-    if (flags & (node_flag_covered | node_flag_switch_arm) != 0) {
-        return;
-    }
-
-    const token = ast.nodeMainToken(node);
-    if (visible_try_tokens[token]) {
-        return;
-    }
-
-    if (token == 0 or !file.tokensOnSameLine(token - 1, token)) {
-        return;
-    }
-
-    // Nested `try` hides an implicit error return among another operation's
-    // arguments. Starting it on a physical line exposes that exit:
-    //
-    //   configure(try loadConfig());  <- rejected
-    //
-    //   configure(
-    //       try loadConfig(),         <- accepted
-    //   );
-    recordViolation(violations, token, node, .inline_nested_try);
-}
-
-fn recordHiddenExitViolation(
-    file: *const FileContext,
-    node_flags: []const u8,
-    violations: Violations,
-    node: Ast.Node.Index,
-) void {
-    const ast = file.ast;
-    const flags = node_flags[@intFromEnum(node)];
-
-    if (flags & (node_flag_covered | node_flag_switch_arm) != 0) {
-        return;
-    }
-
-    const token = ast.nodeMainToken(node);
-    if (token == 0 or !file.tokensOnSameLine(token - 1, token)) {
-        return;
-    }
-
-    const violation: Violation = switch (ast.nodeTag(node)) {
-        .@"return" => .hidden_return,
-        .@"break" => .hidden_break,
-        .@"continue" => .hidden_continue,
-        .unreachable_literal => .hidden_unreachable,
-        else => unreachable,
-    };
-
-    recordViolation(violations, token, node, violation);
 }
 
 fn recordViolationAtNode(
@@ -780,26 +736,30 @@ fn recordViolation(
 
 fn proposeFix(
     allocator: std.mem.Allocator,
-    file: *const FileContext,
+    file: *const LintContext,
     node_flags: []const u8,
     owner: Ast.Node.Index,
     token: Ast.TokenIndex,
     violation: Violation,
-) std.mem.Allocator.Error!?Fixes.ProposedEdit {
+) std.mem.Allocator.Error!?Rule.Fix {
     switch (violation) {
         .none => return null,
+
+        // This requires semantic extraction; adding braces inside the value
+        // expression only exposes another violation after the first fix pass.
+        .unbraced_if_exit_branch => return null,
+
         .inline_complex_if_value => return try multilineIfFix(allocator, file, owner),
 
         .inline_complex_orelse_value,
         .inline_complex_catch_value,
-        .inline_nested_try,
         .hidden_return,
         .hidden_break,
         .hidden_continue,
         .hidden_unreachable,
         => {
             const ast = file.ast;
-            const layout = lineLayout(file, token);
+            const layout = file.lineLayout(token);
             const token_offset = ast.tokenStart(token);
             var source_start_offset = token_offset;
 
@@ -812,6 +772,7 @@ fn proposeFix(
             }
 
             const after_statement = token > 0 and ast.tokenTag(token - 1) == .semicolon;
+
             const replacement = try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{
                 layout.newline,
                 layout.indent,
@@ -819,8 +780,10 @@ fn proposeFix(
             });
 
             return .{
-                .source_start_offset = source_start_offset,
-                .removal_size = token_offset - source_start_offset,
+                .range = .{
+                    .start_offset = source_start_offset,
+                    .end_offset = token_offset,
+                },
                 .replacement = replacement,
             };
         },
@@ -828,7 +791,6 @@ fn proposeFix(
         .unbraced_if_body,
         .unbraced_while_body,
         .unbraced_for_body,
-        .unbraced_if_exit_branch,
         .unbraced_orelse_fallback,
         .unbraced_catch_fallback,
         .unbraced_errdefer_capture,
@@ -838,11 +800,11 @@ fn proposeFix(
 
 fn multilineIfFix(
     allocator: std.mem.Allocator,
-    file: *const FileContext,
+    file: *const LintContext,
     owner: Ast.Node.Index,
-) std.mem.Allocator.Error!Fixes.ProposedEdit {
+) std.mem.Allocator.Error!?Rule.Fix {
     const ast = file.ast;
-    const layout = lineLayout(file, ast.firstToken(owner));
+    const layout = file.lineLayout(ast.firstToken(owner));
     const source_start_offset = ast.tokenStart(ast.firstToken(owner));
     const last_token = ast.lastToken(owner);
     const source_end_offset = ast.tokenStart(last_token) + ast.tokenSlice(last_token).len;
@@ -860,17 +822,21 @@ fn multilineIfFix(
             unreachable;
         };
 
-        if (!nodeIsBlock(ast, if_node.ast.then_expr)) {
-            try appendBranchBreak(
-                allocator,
-                file,
-                &replacement,
-                &source_offset,
-                ast.firstToken(if_node.ast.then_expr),
-                layout,
-                true,
-            );
+        // Zig fmt rejoins a block branch with `else`. Leave those conditionals
+        // for a semantic rewrite rather than proposing an unstable line-only fix.
+        if (nodeIsBlock(ast, if_node.ast.then_expr)) {
+            return null;
         }
+
+        try appendBranchBreak(
+            allocator,
+            file,
+            &replacement,
+            &source_offset,
+            ast.firstToken(if_node.ast.then_expr),
+            layout,
+            true,
+        );
 
         const else_body = if_node.ast.else_expr.unwrap() orelse {
             break;
@@ -892,46 +858,46 @@ fn multilineIfFix(
             continue;
         }
 
-        if (!nodeIsBlock(ast, else_body)) {
-            try appendBranchBreak(
-                allocator,
-                file,
-                &replacement,
-                &source_offset,
-                ast.firstToken(else_body),
-                layout,
-                true,
-            );
+        if (nodeIsBlock(ast, else_body)) {
+            return null;
         }
+
+        try appendBranchBreak(
+            allocator,
+            file,
+            &replacement,
+            &source_offset,
+            ast.firstToken(else_body),
+            layout,
+            true,
+        );
 
         break;
     }
 
     try replacement.appendSlice(allocator, ast.source[source_offset..source_end_offset]);
 
+    const owned_replacement = try replacement.toOwnedSlice(allocator);
+
     return .{
-        .source_start_offset = source_start_offset,
-        .removal_size = @intCast(source_end_offset - source_start_offset),
-        .replacement = try replacement.toOwnedSlice(allocator),
+        .range = .{
+            .start_offset = source_start_offset,
+            .end_offset = @intCast(source_end_offset),
+        },
+        .replacement = owned_replacement,
     };
 }
 
-const LineLayout = struct {
-    newline: []const u8,
-    indent: []const u8,
-    indent_unit: []const u8,
-};
-
 fn appendBranchBreak(
     allocator: std.mem.Allocator,
-    file: *const FileContext,
+    file: *const LintContext,
     replacement: *std.ArrayList(u8),
     source_offset: *usize,
     token: Ast.TokenIndex,
-    layout: LineLayout,
+    layout: LintContext.LineLayout,
     continuation: bool,
 ) std.mem.Allocator.Error!void {
-    if (token == 0 or !file.tokensOnSameLine(token - 1, token)) {
+    if (token == 0 or !file.areTokensOnSameLine(token - 1, token)) {
         return;
     }
 
@@ -958,12 +924,12 @@ fn appendBranchBreak(
 
 fn bracedBodyFix(
     allocator: std.mem.Allocator,
-    file: *const FileContext,
+    file: *const LintContext,
     node_flags: []const u8,
     owner: Ast.Node.Index,
     token: Ast.TokenIndex,
     violation: Violation,
-) std.mem.Allocator.Error!?Fixes.ProposedEdit {
+) std.mem.Allocator.Error!?Rule.Fix {
     const ast = file.ast;
 
     const owns_semicolon = switch (violation) {
@@ -979,7 +945,7 @@ fn bracedBodyFix(
     }
 
     const body = switch (violation) {
-        .unbraced_if_body, .unbraced_if_exit_branch => body: {
+        .unbraced_if_body => body: {
             const if_node = ast.fullIf(owner) orelse {
                 unreachable;
             };
@@ -994,6 +960,7 @@ fn bracedBodyFix(
                 unreachable;
             };
         },
+
         .unbraced_while_body => body: {
             const while_node = ast.fullWhile(owner) orelse {
                 unreachable;
@@ -1007,6 +974,7 @@ fn bracedBodyFix(
                 unreachable;
             };
         },
+
         .unbraced_for_body => body: {
             const for_node = ast.fullFor(owner) orelse {
                 unreachable;
@@ -1035,7 +1003,7 @@ fn bracedBodyFix(
     const first_token = ast.firstToken(body);
     const last_token = ast.lastToken(body);
 
-    if (first_token == 0 or !file.tokensOnSameLine(first_token, last_token)) {
+    if (first_token == 0 or !file.areTokensOnSameLine(first_token, last_token)) {
         return null;
     }
 
@@ -1043,13 +1011,11 @@ fn bracedBodyFix(
     // not just as the body's root. A new block must not narrow their effect.
     for (first_token..last_token + 1) |index_usize| {
         const index: Ast.TokenIndex = @intCast(index_usize);
-
         if (ast.tokenTag(index) != .builtin) {
             continue;
         }
 
         const name = ast.tokenSlice(index);
-
         if (std.mem.startsWith(u8, name, "@set") or std.mem.eql(u8, name, "@branchHint")) {
             return null;
         }
@@ -1080,7 +1046,8 @@ fn bracedBodyFix(
         return null;
     }
 
-    const layout = lineLayout(file, ast.firstToken(owner));
+    const layout = file.lineLayout(ast.firstToken(owner));
+
     const replacement = try std.fmt.allocPrint(allocator, " {{{s}{s}{s}{s};{s}{s}}}", .{
         layout.newline,
         layout.indent,
@@ -1091,8 +1058,10 @@ fn bracedBodyFix(
     });
 
     return .{
-        .source_start_offset = @intCast(source_start_offset),
-        .removal_size = @intCast(source_end_offset - source_start_offset),
+        .range = .{
+            .start_offset = @intCast(source_start_offset),
+            .end_offset = @intCast(source_end_offset),
+        },
         .replacement = replacement,
     };
 }
@@ -1104,184 +1073,67 @@ fn bodyCanGainScope(ast: Ast, initial_node: Ast.Node.Index) bool {
         node = ast.nodeData(node).node;
     }
 
-    return switch (ast.nodeTag(node)) {
-        .call_one,
-        .call_one_comma,
-        .call,
-        .call_comma,
-        .builtin_call_two,
-        .builtin_call_two_comma,
-        .builtin_call,
-        .builtin_call_comma,
-        .assign,
-        .assign_mul,
-        .assign_div,
-        .assign_mod,
-        .assign_add,
-        .assign_sub,
-        .assign_shl,
-        .assign_shl_sat,
-        .assign_shr,
-        .assign_bit_and,
-        .assign_bit_xor,
-        .assign_bit_or,
-        .assign_mul_wrap,
-        .assign_add_wrap,
-        .assign_sub_wrap,
-        .assign_mul_sat,
-        .assign_add_sat,
-        .assign_sub_sat,
-        .@"return",
-        .@"break",
-        .@"continue",
-        .unreachable_literal,
-        => true,
+    const tag = ast.nodeTag(node);
 
-        else => false,
-    };
+    return nodeTagIsCall(tag) or nodeTagIsAssignment(tag) or nodeTagIsExit(tag);
 }
 
-fn lineLayout(file: *const FileContext, token: Ast.TokenIndex) LineLayout {
-    const location = file.tokenLocation(token);
-    const text = file.lineText(location.line);
-    const indent_size = text.len - std.mem.trimStart(u8, text, " \t").len;
-    const indent = text[0..indent_size];
+const violation_messages = [_][]const u8{
+    "",
+    "`if` body requires braces",
+    "`while` body requires braces",
+    "`for` body requires braces",
+    "`if` value branch hides an exit",
+    "complex `if` branches must start on separate lines",
+    "`orelse` fallback requires braces for exits or statement work",
+    "`catch` fallback requires braces for exits or statement work",
+    "complex `orelse` fallback must start on a new line",
+    "complex `catch` fallback must start on a new line",
+    "captured `errdefer` handler requires braces",
+    "`return` must start on its own line",
+    "`break` must start on its own line",
+    "`continue` must start on its own line",
+    "`unreachable` must start on its own line",
+};
 
-    // Prefer this line's terminator. At EOF, inherit the preceding one rather
-    // than introducing LF into a CRLF file with no final newline.
-    const newline_offset = if (location.line + 1 < file.line_starts.len)
-        file.line_starts[location.line + 1]
-    else
-        file.line_starts[location.line];
+const violation_help = [_]?[]const u8{
+    null,
+    "wrap the body in `{ ... }`",
+    "wrap the body in `{ ... }`",
+    "wrap the body in `{ ... }`",
+    "move the exit into a preceding braced statement",
+    "move each branch expression to the line after `if` or `else`",
+    "wrap the fallback in `{ ... }`",
+    "wrap the fallback in `{ ... }`",
+    "move the fallback after `orelse` or wrap it in `{ ... }`",
+    "move the fallback after `catch` or wrap it in `{ ... }`",
+    "wrap the handler in `{ ... }`",
+    "move `return` to a new line or brace its containing control-flow body",
+    "move `break` to a new line or brace its containing control-flow body",
+    "move `continue` to a new line or brace its containing control-flow body",
+    "move `unreachable` to a new line or brace its containing control-flow body",
+};
 
-    return .{
-        .newline = if (newline_offset >= 2 and file.ast.source[newline_offset - 2] == '\r') "\r\n" else "\n",
-        .indent = indent,
-        .indent_unit = if (std.mem.indexOfScalar(u8, indent, '\t') != null) "\t" else "    ",
-    };
-}
+const violation_notes = [_]?[]const u8{
+    null,
+    null,
+    null,
+    "`inline for` follows the same rule",
+    null,
+    "simple leaf values may remain inline",
+    null,
+    null,
+    "simple leaf values may remain inline",
+    "simple leaf values may remain inline",
+    "plain `errdefer cleanup();` may remain unbraced",
+    null,
+    null,
+    null,
+    null,
+};
 
-fn nodeIsBlock(ast: Ast, node: Ast.Node.Index) bool {
-    return switch (ast.nodeTag(node)) {
-        .block_two, .block_two_semicolon, .block, .block_semicolon => true,
-        else => false,
-    };
-}
-
-fn markLeadingTry(ast: Ast, visible_try_tokens: []bool, value: Ast.Node.Index) void {
-    const first_token = ast.firstToken(value);
-
-    if (ast.tokenTag(first_token) == .keyword_try) {
-        visible_try_tokens[first_token] = true;
-    }
-}
-
-fn directValue(ast: Ast, tag: Ast.Node.Tag, node: Ast.Node.Index) ?Ast.Node.Index {
-    if (ast.fullVarDecl(node)) |declaration| {
-        return declaration.ast.init_node.unwrap();
-    }
-
-    return switch (tag) {
-        .assign_mul,
-        .assign_div,
-        .assign_mod,
-        .assign_add,
-        .assign_sub,
-        .assign_shl,
-        .assign_shl_sat,
-        .assign_shr,
-        .assign_bit_and,
-        .assign_bit_xor,
-        .assign_bit_or,
-        .assign_mul_wrap,
-        .assign_add_wrap,
-        .assign_sub_wrap,
-        .assign_mul_sat,
-        .assign_add_sat,
-        .assign_sub_sat,
-        .assign,
-        => ast.nodeData(node).node_and_node[1],
-        .assign_destructure => ast.nodeData(node).extra_and_node[1],
-        .@"return" => ast.nodeData(node).opt_node.unwrap(),
-        .@"break", .@"continue" => ast.nodeData(node).opt_token_and_opt_node[1].unwrap(),
-        else => null,
-    };
-}
-
-fn nodeIsExit(tag: Ast.Node.Tag) bool {
-    return switch (tag) {
-        .@"return", .@"break", .@"continue", .unreachable_literal => true,
-        else => false,
-    };
-}
-
-fn descriptionFor(violation: Violation) Diagnostics.Description {
-    return switch (violation) {
-        .none => unreachable,
-        .unbraced_if_body => .{
-            .message = "`if` body requires braces",
-            .help = "wrap the body in `{ ... }`",
-        },
-        .unbraced_while_body => .{
-            .message = "`while` body requires braces",
-            .help = "wrap the body in `{ ... }`",
-        },
-        .unbraced_for_body => .{
-            .message = "`for` body requires braces",
-            .help = "wrap the body in `{ ... }`",
-            .note = "`inline for` follows the same rule",
-        },
-        .unbraced_if_exit_branch => .{
-            .message = "`if` branch exits without braces",
-            .help = "wrap the branch in `{ ... }`",
-        },
-        .inline_complex_if_value => .{
-            .message = "complex `if` branches must start on separate lines",
-            .help = "move each branch expression to the line after `if` or `else`",
-            .note = "simple leaf values may remain inline",
-        },
-        .unbraced_orelse_fallback => .{
-            .message = "`orelse` fallback requires braces for exits or statement work",
-            .help = "wrap the fallback in `{ ... }`",
-        },
-        .unbraced_catch_fallback => .{
-            .message = "`catch` fallback requires braces for exits or statement work",
-            .help = "wrap the fallback in `{ ... }`",
-        },
-        .inline_complex_orelse_value => .{
-            .message = "complex `orelse` fallback must start on a new line",
-            .help = "move the fallback after `orelse` or wrap it in `{ ... }`",
-            .note = "simple leaf values may remain inline",
-        },
-        .inline_complex_catch_value => .{
-            .message = "complex `catch` fallback must start on a new line",
-            .help = "move the fallback after `catch` or wrap it in `{ ... }`",
-            .note = "simple leaf values may remain inline",
-        },
-        .inline_nested_try => .{
-            .message = "`try` is hidden inside another same-line expression",
-            .help = "start `try` on a new line or assign its result before the outer expression",
-        },
-        .unbraced_errdefer_capture => .{
-            .message = "captured `errdefer` handler requires braces",
-            .help = "wrap the handler in `{ ... }`",
-            .note = "plain `errdefer cleanup();` may remain unbraced",
-        },
-        .hidden_return => .{
-            .message = "`return` must start on its own line",
-            .help = "move `return` to a new line or brace its containing control-flow body",
-        },
-        .hidden_break => .{
-            .message = "`break` must start on its own line",
-            .help = "move `break` to a new line or brace its containing control-flow body",
-        },
-        .hidden_continue => .{
-            .message = "`continue` must start on its own line",
-            .help = "move `continue` to a new line or brace its containing control-flow body",
-        },
-        .hidden_unreachable => .{
-            .message = "`unreachable` must start on its own line",
-            .help = "move `unreachable` to a new line or brace its containing control-flow body",
-        },
-    };
+comptime {
+    assert(violation_messages.len == @typeInfo(Violation).@"enum".fields.len);
+    assert(violation_help.len == violation_messages.len);
+    assert(violation_notes.len == violation_messages.len);
 }

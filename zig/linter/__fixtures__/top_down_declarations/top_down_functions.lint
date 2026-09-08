@@ -1,0 +1,71 @@
+error[top_down_declarations]: `@"quoted name"` appears before its only caller `entry`
+   --> zig/linter/__fixtures__/top_down_declarations/top_down_functions.input.zig:151:8
+    |
+151 |     fn @"quoted name"() void {}
+    |        ^^^^^^^^^^^^^^
+    |
+    = help: move `@"quoted name"` below `entry`, or inline it if it only implements this call-site phase
+    = note: keep a separate function when it owns an independent operation, invariant, failure policy, lifecycle, or substantial bounded phase
+
+error[top_down_declarations]: `deepPhase` appears before its only caller `deepRoot`
+  --> zig/linter/__fixtures__/top_down_declarations/top_down_functions.input.zig:95:4
+   |
+95 | fn deepPhase() void {
+   |    ^^^^^^^^^
+   |
+   = help: move `deepPhase` below `deepRoot`, or inline it if it only implements this call-site phase
+   = note: keep a separate function when it owns an independent operation, invariant, failure policy, lifecycle, or substantial bounded phase
+
+error[top_down_declarations]: `eMTarget` appears before its only caller `entry`
+   --> zig/linter/__fixtures__/top_down_declarations/top_down_functions.input.zig:142:8
+    |
+142 |     fn eMTarget() void {}
+    |        ^^^^^^^^
+    |
+    = help: move `eMTarget` below `entry`, or inline it if it only implements this call-site phase
+    = note: keep a separate function when it owns an independent operation, invariant, failure policy, lifecycle, or substantial bounded phase
+
+error[top_down_declarations]: `h` appears before its only caller `entry`
+   --> zig/linter/__fixtures__/top_down_declarations/top_down_functions.input.zig:118:8
+    |
+118 |     fn h() void {}
+    |        ^
+    |
+    = help: move `h` below `entry`, or inline it if it only implements this call-site phase
+    = note: keep a separate function when it owns an independent operation, invariant, failure policy, lifecycle, or substantial bounded phase
+
+error[top_down_declarations]: `helper` appears before its only caller `entry`
+   --> zig/linter/__fixtures__/top_down_declarations/top_down_functions.input.zig:104:8
+    |
+104 |     fn helper() void;
+    |        ^^^^^^
+    |
+    = help: move `helper` below `entry`, or inline it if it only implements this call-site phase
+    = note: keep a separate function when it owns an independent operation, invariant, failure policy, lifecycle, or substantial bounded phase
+
+error[top_down_declarations]: `loadImpl` appears before its only caller `load`
+ --> zig/linter/__fixtures__/top_down_declarations/top_down_functions.input.zig:1:4
+  |
+1 | fn loadImpl() void {}
+  |    ^^^^^^^^
+  |
+  = help: move `loadImpl` below `load`, or inline it if it only implements this call-site phase
+  = note: keep a separate function when it owns an independent operation, invariant, failure policy, lifecycle, or substantial bounded phase
+
+error[top_down_declarations]: `repeatImpl` appears before its only caller `repeat`
+ --> zig/linter/__fixtures__/top_down_declarations/top_down_functions.input.zig:7:4
+  |
+7 | fn repeatImpl() void {}
+  |    ^^^^^^^^^^
+  |
+  = help: move `repeatImpl` below `repeat`, or inline it if it only implements this call-site phase
+  = note: keep a separate function when it owns an independent operation, invariant, failure policy, lifecycle, or substantial bounded phase
+
+error[top_down_declarations]: `startImpl` appears before its only caller `start`
+  --> zig/linter/__fixtures__/top_down_declarations/top_down_functions.input.zig:43:8
+   |
+43 |     fn startImpl() void {}
+   |        ^^^^^^^^^
+   |
+   = help: move `startImpl` below `start`, or inline it if it only implements this call-site phase
+   = note: keep a separate function when it owns an independent operation, invariant, failure policy, lifecycle, or substantial bounded phase

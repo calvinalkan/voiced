@@ -1,25 +1,28 @@
 const std = @import("std");
 const Ast = std.zig.Ast;
-const Diagnostics = @import("../Diagnostics.zig");
-const FileContext = @import("../FileContext.zig");
-const Fixes = @import("../Fixes.zig");
+const Rule = @import("../Rule.zig");
+const LintContext = Rule.Context;
+const identifierText = LintContext.identifierText;
+const nodeIsBlock = LintContext.nodeIsBlock;
+const nodeTagIsAssignment = LintContext.nodeTagIsAssignment;
+const nodeTagIsCall = LintContext.nodeTagIsCall;
+const nodeTagIsExit = LintContext.nodeTagIsExit;
 
 /// Classify each gap between sibling statements once, then enforce the one
 /// strongest layout constraint assigned to it. Semantic setup groups override
 /// generic statement-category boundaries, so one gap cannot receive competing
 /// diagnostics from independent spacing rules.
-pub fn lint(
-    file_allocator: std.mem.Allocator,
-    report: *Diagnostics.Report,
-) std.mem.Allocator.Error!void {
-    const diagnostic_allocator = report.diagnostic_allocator;
-    const path = report.path;
-    const file = report.file;
-    const diagnostics = report.diagnostics;
-    const ast = file.ast;
+pub fn lint(context: *LintContext) Rule.Error!void {
+    const file_allocator = context.scratch_allocator;
+    const ast = context.ast;
 
     var block_buffer: [2]Ast.Node.Index = undefined;
-    for (ast.nodes.items(.tag), 0..) |_, index_usize| {
+    for (ast.nodes.items(.tag), 0..) |tag, index_usize| {
+        switch (tag) {
+            .block_two, .block_two_semicolon, .block, .block_semicolon => {},
+            else => continue,
+        }
+
         const block: Ast.Node.Index = @enumFromInt(index_usize);
 
         const statements = ast.blockStatements(&block_buffer, block) orelse {
@@ -35,74 +38,62 @@ pub fn lint(
 
         @memset(gaps, .{});
 
-        const grouped_cleanup = try file_allocator.alloc(bool, statements.len);
-        defer file_allocator.free(grouped_cleanup);
-
-        @memset(grouped_cleanup, false);
-
         try markUndefinedStorageGroups(
             file_allocator,
-            diagnostic_allocator,
-            path,
-            file,
-            diagnostics,
+            context,
             statements,
             gaps,
-            grouped_cleanup,
         );
 
         try markCleanupGroups(
             file_allocator,
-            report,
+            context,
             block,
             statements,
             gaps,
-            grouped_cleanup,
         );
 
-        markProducerGuardAndAssertGroups(file, statements, gaps);
-        markGenericParagraphs(file, statements, gaps);
+        markProducerGuardAndAssertGroups(context, statements, gaps);
+        markGenericParagraphs(context, statements, gaps);
 
         for (statements[1..], 1..) |statement, statement_index| {
             const gap = gaps[statement_index];
+            if (gap.constraint == .unconstrained) {
+                continue;
+            }
+
             const right_token = ast.firstToken(statement);
             const left_token = terminatedToken(ast, ast.lastToken(statements[statement_index - 1]), right_token);
 
             const violates = switch (gap.constraint) {
                 .unconstrained => false,
-                .required_blank => !hasParagraphBreak(file, left_token, right_token),
-                .forbidden_blank => file.hasEmptyLineBetween(left_token, right_token),
+                .required_blank => !hasParagraphBreak(context, left_token, right_token),
+                .forbidden_blank => context.hasEmptyLineBetween(left_token, right_token),
             };
 
             if (!violates) {
                 continue;
             }
 
-            const fix = if (report.fixes != null)
-                try paragraphGapFix(file_allocator, file, ast.firstToken(block), left_token, right_token, gap.constraint)
+            const fix = if (context.fixes_enabled)
+                try paragraphGapFix(file_allocator, context, ast.firstToken(block), left_token, right_token, gap.constraint)
             else
                 null;
-            defer if (fix) |edit| {
-                file_allocator.free(edit.replacement);
-            };
 
-            const description = descriptionFor(file, statements[statement_index - 1], statement, gap.reason);
+            const description = descriptionFor(context, statements[statement_index - 1], statement, gap.reason);
 
-            try report.add(.{
+            try context.report(.{
                 .token = right_token,
-                .rule_name = rule_name,
                 .message = description.message,
-                .help = description.help,
-                .note = description.note,
+                .help = description.help orelse "",
+                .note = description.note orelse "",
                 .fix = fix,
             });
         }
     }
 
-    try lintSwitchArmParagraphs(file_allocator, report);
+    try lintSwitchArmParagraphs(file_allocator, context);
 }
-
-const rule_name = "visible_statement_paragraphs";
 
 const Constraint = enum(u2) {
     unconstrained,
@@ -158,15 +149,11 @@ fn forbidBlank(gaps: []Gap, index: usize, reason: Reason) void {
 
 fn markUndefinedStorageGroups(
     file_allocator: std.mem.Allocator,
-    diagnostic_allocator: std.mem.Allocator,
-    path: []const u8,
-    file: *const FileContext,
-    diagnostics: *Diagnostics,
+    context: *LintContext,
     statements: []const Ast.Node.Index,
     gaps: []Gap,
-    grouped_cleanup: []bool,
-) std.mem.Allocator.Error!void {
-    const ast = file.ast;
+) Rule.Error!void {
+    const ast = context.ast;
 
     var undefined_names: std.StringHashMapUnmanaged(bool) = .empty;
     defer undefined_names.deinit(file_allocator);
@@ -197,10 +184,7 @@ fn markUndefinedStorageGroups(
         if (declarations_end == statements.len) {
             for (statements[start..declarations_end]) |declaration| {
                 try addMissingUndefinedUse(
-                    diagnostic_allocator,
-                    path,
-                    file,
-                    diagnostics,
+                    context,
                     expectUndefinedVariableNameToken(ast, declaration),
                 );
             }
@@ -216,7 +200,7 @@ fn markUndefinedStorageGroups(
         for (statements[start..declarations_end]) |declaration| {
             const name_token = expectUndefinedVariableNameToken(ast, declaration);
 
-            try undefined_names.put(file_allocator, ast.tokenSlice(name_token), false);
+            try undefined_names.put(file_allocator, identifierText(ast, name_token), false);
         }
 
         markReferencedIdentifiers(ast, consumer, &undefined_names);
@@ -224,14 +208,8 @@ fn markUndefinedStorageGroups(
         for (statements[start..declarations_end]) |declaration| {
             const name_token = expectUndefinedVariableNameToken(ast, declaration);
 
-            if (!(undefined_names.get(ast.tokenSlice(name_token)) orelse false)) {
-                try addMissingUndefinedUse(
-                    diagnostic_allocator,
-                    path,
-                    file,
-                    diagnostics,
-                    name_token,
-                );
+            if (!(undefined_names.get(identifierText(ast, name_token)) orelse false)) {
+                try addMissingUndefinedUse(context, name_token);
             }
         }
 
@@ -242,7 +220,6 @@ fn markUndefinedStorageGroups(
 
         while (group_end + 1 < statements.len and isCleanup(ast.nodeTag(statements[group_end + 1]))) {
             group_end += 1;
-            grouped_cleanup[group_end] = true;
 
             forbidBlank(gaps, group_end, .cleanup_internal);
         }
@@ -254,20 +231,25 @@ fn markUndefinedStorageGroups(
 }
 
 fn undefinedVariableNameToken(ast: Ast, node: Ast.Node.Index) ?Ast.TokenIndex {
-    const variable = ast.fullVarDecl(node) orelse {
-        return null;
-    };
+    switch (ast.nodeTag(node)) {
+        .global_var_decl, .local_var_decl, .simple_var_decl, .aligned_var_decl => {},
+        else => return null,
+    }
 
-    if (ast.tokenTag(variable.ast.mut_token) != .keyword_var) {
+    if (ast.tokenTag(ast.nodeMainToken(node)) != .keyword_var) {
         return null;
     }
+
+    const variable = ast.fullVarDecl(node) orelse {
+        unreachable;
+    };
 
     const initializer = variable.ast.init_node.unwrap() orelse {
         return null;
     };
 
     if (ast.nodeTag(initializer) != .identifier or
-        !std.mem.eql(u8, ast.tokenSlice(ast.nodeMainToken(initializer)), "undefined"))
+        !std.mem.eql(u8, identifierText(ast, ast.nodeMainToken(initializer)), "undefined"))
     {
         return null;
     }
@@ -287,42 +269,32 @@ fn expectUndefinedVariableNameToken(ast: Ast, node: Ast.Node.Index) Ast.TokenInd
 }
 
 fn addMissingUndefinedUse(
-    diagnostic_allocator: std.mem.Allocator,
-    path: []const u8,
-    file: *const FileContext,
-    diagnostics: *Diagnostics,
+    context: *LintContext,
     name_token: Ast.TokenIndex,
-) std.mem.Allocator.Error!void {
-    try diagnostics.add_at_token(
-        diagnostic_allocator,
-        path,
-        file,
-        name_token,
-        rule_name,
-        .{
-            .message = "`var = undefined` storage is not used by the next statement",
-            .help = "reference this variable in the statement immediately after the storage group",
-            .note = "the first statement must reference every variable in the group",
-        },
-    );
+) Rule.Error!void {
+    try context.report(.{
+        .token = name_token,
+        .message = "`var = undefined` storage is not used by the next statement",
+        .help = "reference this variable in the statement immediately after the storage group",
+        .note = "the first statement must reference every variable in the group",
+    });
 }
 
 // ─── Resource Cleanup ────────────────────────────────────────────────
 
 fn markCleanupGroups(
     file_allocator: std.mem.Allocator,
-    report: *Diagnostics.Report,
+    context: *LintContext,
     block: Ast.Node.Index,
     statements: []const Ast.Node.Index,
     gaps: []Gap,
-    grouped_cleanup: []const bool,
-) std.mem.Allocator.Error!void {
-    const file = report.file;
+) Rule.Error!void {
+    const file = context;
     const ast = file.ast;
     var index: usize = 0;
 
     while (index < statements.len) {
-        if (!isCleanup(ast.nodeTag(statements[index])) or grouped_cleanup[index]) {
+        if (!isCleanup(ast.nodeTag(statements[index])) or gaps[index].reason == .cleanup_internal) {
             index += 1;
 
             continue;
@@ -353,18 +325,14 @@ fn markCleanupGroups(
 
         const token = ast.nodeMainToken(statement);
 
-        if (token > 0 and file.tokensOnSameLine(token - 1, token)) {
-            const fix = if (report.fixes != null)
+        if (token > 0 and file.areTokensOnSameLine(token - 1, token)) {
+            const fix = if (context.fixes_enabled)
                 try lineBreakFix(file_allocator, file, ast.firstToken(block), token - 1, token, false)
             else
                 null;
-            defer if (fix) |edit| {
-                file_allocator.free(edit.replacement);
-            };
 
-            try report.add(.{
+            try context.report(.{
                 .token = token,
-                .rule_name = rule_name,
                 .message = "cleanup registration must start on its own line",
                 .help = "move this cleanup registration below its setup statement",
                 .fix = fix,
@@ -380,7 +348,7 @@ fn isCleanup(tag: Ast.Node.Tag) bool {
 // ─── Compact Semantic Pairs ─────────────────────────────────────────
 
 fn markProducerGuardAndAssertGroups(
-    file: *const FileContext,
+    file: *const LintContext,
     statements: []const Ast.Node.Index,
     gaps: []Gap,
 ) void {
@@ -399,7 +367,7 @@ fn markProducerGuardAndAssertGroups(
             continue;
         };
 
-        const name = ast.tokenSlice(name_token);
+        const name = identifierText(ast, name_token);
 
         if (isEarlyExitGuard(ast, statement, name)) {
             forbidBlank(gaps, index, .producer_guard);
@@ -438,10 +406,10 @@ fn isEarlyExitGuard(ast: Ast, node: Ast.Node.Index, producer_name: []const u8) b
 
     var block_buffer: [2]Ast.Node.Index = undefined;
     if (ast.blockStatements(&block_buffer, body)) |statements| {
-        return statements.len != 0 and isExit(ast.nodeTag(statements[statements.len - 1]));
+        return statements.len != 0 and nodeTagIsExit(ast.nodeTag(statements[statements.len - 1]));
     }
 
-    return isExit(ast.nodeTag(body));
+    return nodeTagIsExit(ast.nodeTag(body));
 }
 
 fn isAssertCall(ast: Ast, node: Ast.Node.Index) bool {
@@ -451,8 +419,8 @@ fn isAssertCall(ast: Ast, node: Ast.Node.Index) bool {
     };
 
     return switch (ast.nodeTag(call.ast.fn_expr)) {
-        .identifier => std.mem.eql(u8, ast.tokenSlice(ast.nodeMainToken(call.ast.fn_expr)), "assert"),
-        .field_access => std.mem.eql(u8, ast.tokenSlice(ast.nodeData(call.ast.fn_expr).node_and_token[1]), "assert"),
+        .identifier => std.mem.eql(u8, identifierText(ast, ast.nodeMainToken(call.ast.fn_expr)), "assert"),
+        .field_access => std.mem.eql(u8, identifierText(ast, ast.nodeData(call.ast.fn_expr).node_and_token[1]), "assert"),
         else => false,
     };
 }
@@ -465,13 +433,12 @@ const Category = enum {
     scope,
     call,
     assignment,
-    cleanup,
     exit,
     other,
 };
 
 fn markGenericParagraphs(
-    file: *const FileContext,
+    file: *const LintContext,
     statements: []const Ast.Node.Index,
     gaps: []Gap,
 ) void {
@@ -517,7 +484,25 @@ fn markGenericParagraphs(
 }
 
 fn category(ast: Ast, node: Ast.Node.Index) Category {
-    return switch (ast.nodeTag(node)) {
+    const tag = ast.nodeTag(node);
+
+    if (nodeIsBlock(ast, node)) {
+        return .scope;
+    }
+
+    if (nodeTagIsCall(tag)) {
+        return .call;
+    }
+
+    if (nodeTagIsAssignment(tag)) {
+        return .assignment;
+    }
+
+    if (nodeTagIsExit(tag)) {
+        return .exit;
+    }
+
+    return switch (tag) {
         .global_var_decl, .local_var_decl, .simple_var_decl, .aligned_var_decl => .declaration,
         .assign_destructure => categoryForDestructure(ast, node),
 
@@ -532,17 +517,8 @@ fn category(ast: Ast, node: Ast.Node.Index) Category {
         .switch_comma,
         => .control,
 
-        .block_two, .block_two_semicolon, .block, .block_semicolon => .scope,
-        .@"comptime" => category(ast, ast.nodeData(node).node),
+        .@"comptime", .@"try", .@"nosuspend" => category(ast, ast.nodeData(node).node),
 
-        .call_one,
-        .call_one_comma,
-        .call,
-        .call_comma,
-        .builtin_call_two,
-        .builtin_call_two_comma,
-        .builtin_call,
-        .builtin_call_comma,
         .@"catch",
         .@"orelse",
         .@"suspend",
@@ -550,30 +526,7 @@ fn category(ast: Ast, node: Ast.Node.Index) Category {
         .@"asm",
         .asm_simple,
         => .call,
-        .@"try", .@"nosuspend" => category(ast, ast.nodeData(node).node),
 
-        .assign_mul,
-        .assign_div,
-        .assign_mod,
-        .assign_add,
-        .assign_sub,
-        .assign_shl,
-        .assign_shl_sat,
-        .assign_shr,
-        .assign_bit_and,
-        .assign_bit_xor,
-        .assign_bit_or,
-        .assign_mul_wrap,
-        .assign_add_wrap,
-        .assign_sub_wrap,
-        .assign_mul_sat,
-        .assign_add_sat,
-        .assign_sub_sat,
-        .assign,
-        => .assignment,
-
-        .@"defer", .@"errdefer" => .cleanup,
-        .@"return", .@"break", .@"continue", .unreachable_literal => .exit,
         else => .other,
     };
 }
@@ -590,15 +543,8 @@ fn categoryForDestructure(ast: Ast, node: Ast.Node.Index) Category {
     return .assignment;
 }
 
-fn isMultiline(file: *const FileContext, node: Ast.Node.Index) bool {
-    return !file.tokensOnSameLine(file.ast.firstToken(node), file.ast.lastToken(node));
-}
-
-fn isExit(tag: Ast.Node.Tag) bool {
-    return switch (tag) {
-        .@"return", .@"break", .@"continue", .unreachable_literal => true,
-        else => false,
-    };
+fn isMultiline(file: *const LintContext, node: Ast.Node.Index) bool {
+    return !file.areTokensOnSameLine(file.ast.firstToken(node), file.ast.lastToken(node));
 }
 
 fn unwrapStatement(ast: Ast, node: Ast.Node.Index) Ast.Node.Index {
@@ -621,7 +567,7 @@ fn markReferencedIdentifiers(
             continue;
         }
 
-        if (names.getPtr(ast.tokenSlice(token))) |referenced| {
+        if (names.getPtr(identifierText(ast, token))) |referenced| {
             referenced.* = true;
         }
     }
@@ -632,7 +578,7 @@ fn nodeReferencesIdentifier(ast: Ast, node: Ast.Node.Index, name: []const u8) bo
     const last_token = ast.lastToken(node);
 
     while (token <= last_token) : (token += 1) {
-        if (ast.tokenTag(token) == .identifier and std.mem.eql(u8, ast.tokenSlice(token), name)) {
+        if (ast.tokenTag(token) == .identifier and std.mem.eql(u8, identifierText(ast, token), name)) {
             return true;
         }
     }
@@ -644,12 +590,12 @@ fn nodeReferencesIdentifier(ast: Ast, node: Ast.Node.Index, name: []const u8) bo
 
 fn paragraphGapFix(
     allocator: std.mem.Allocator,
-    file: *const FileContext,
+    file: *const LintContext,
     owner_token: Ast.TokenIndex,
     left_token: Ast.TokenIndex,
     right_token: Ast.TokenIndex,
     constraint: Constraint,
-) std.mem.Allocator.Error!?Fixes.ProposedEdit {
+) std.mem.Allocator.Error!?Rule.Fix {
     switch (constraint) {
         .unconstrained => return null,
         .required_blank => return try lineBreakFix(allocator, file, owner_token, left_token, right_token, true),
@@ -662,8 +608,8 @@ fn paragraphGapFix(
                 return null;
             }
 
-            const source_start_offset = file.line_starts[left_line + 1];
-            const source_end_offset = file.line_starts[right_line];
+            const source_start_offset = file.line_start_offsets[left_line + 1];
+            const source_end_offset = file.line_start_offsets[right_line];
 
             var replacement: std.ArrayList(u8) = .empty;
             defer replacement.deinit(allocator);
@@ -678,7 +624,7 @@ fn paragraphGapFix(
 
                 try replacement.appendSlice(
                     allocator,
-                    file.ast.source[file.line_starts[line]..file.line_starts[line + 1]],
+                    file.ast.source[file.line_start_offsets[line]..file.line_start_offsets[line + 1]],
                 );
             }
 
@@ -686,10 +632,14 @@ fn paragraphGapFix(
                 return null;
             }
 
+            const owned_replacement = try replacement.toOwnedSlice(allocator);
+
             return .{
-                .source_start_offset = source_start_offset,
-                .removal_size = source_end_offset - source_start_offset,
-                .replacement = try replacement.toOwnedSlice(allocator),
+                .range = .{
+                    .start_offset = source_start_offset,
+                    .end_offset = source_end_offset,
+                },
+                .replacement = owned_replacement,
             };
         },
     }
@@ -697,27 +647,16 @@ fn paragraphGapFix(
 
 fn lineBreakFix(
     allocator: std.mem.Allocator,
-    file: *const FileContext,
+    file: *const LintContext,
     owner_token: Ast.TokenIndex,
     left_token: Ast.TokenIndex,
     right_token: Ast.TokenIndex,
     blank_line: bool,
-) std.mem.Allocator.Error!?Fixes.ProposedEdit {
+) std.mem.Allocator.Error!?Rule.Fix {
     const ast = file.ast;
     const left_line = file.tokenLocation(left_token).line;
     const right_line = file.tokenLocation(right_token).line;
-
-    // Preserve the local LF or CRLF spelling. At EOF, use the preceding line's
-    // terminator without adding a final newline to the file itself.
-    const newline_offset = if (left_line + 1 < file.line_starts.len)
-        file.line_starts[left_line + 1]
-    else
-        file.line_starts[left_line];
-
-    const newline = if (newline_offset >= 2 and ast.source[newline_offset - 2] == '\r')
-        "\r\n"
-    else
-        "\n";
+    const layout = file.lineLayout(left_token);
 
     if (left_line != right_line) {
         if (!blank_line) {
@@ -726,10 +665,16 @@ fn lineBreakFix(
 
         // Insert after the preceding statement's complete line, not at the
         // next statement or arm's first token: attached comments stay attached.
+        const replacement = try allocator.dupe(u8, layout.newline);
+
+        const insertion_offset = file.line_start_offsets[left_line + 1];
+
         return .{
-            .source_start_offset = file.line_starts[left_line + 1],
-            .removal_size = 0,
-            .replacement = try allocator.dupe(u8, newline),
+            .range = .{
+                .start_offset = insertion_offset,
+                .end_offset = insertion_offset,
+            },
+            .replacement = replacement,
         };
     }
 
@@ -743,22 +688,21 @@ fn lineBreakFix(
     // Splitting statements sharing one line also requires indentation choices.
     // Keep the existing statement indentation; add one level only when the
     // containing block or switch also opens on this physical line.
-    const text = file.lineText(left_line);
-    const indent_size = text.len - std.mem.trimStart(u8, text, " \t").len;
-    const indent = text[0..indent_size];
+    const extra_indent = if (file.areTokensOnSameLine(owner_token, left_token)) layout.indent_unit else "";
 
-    const indent_unit = if (std.mem.indexOfScalar(u8, indent, '\t') != null) "\t" else "    ";
-    const extra_indent = if (file.tokensOnSameLine(owner_token, left_token)) indent_unit else "";
+    const replacement = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}", .{
+        layout.newline,
+        if (blank_line) layout.newline else "",
+        layout.indent,
+        extra_indent,
+    });
 
     return .{
-        .source_start_offset = @intCast(source_start_offset),
-        .removal_size = @intCast(source_end_offset - source_start_offset),
-        .replacement = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}", .{
-            newline,
-            if (blank_line) newline else "",
-            indent,
-            extra_indent,
-        }),
+        .range = .{
+            .start_offset = @intCast(source_start_offset),
+            .end_offset = @intCast(source_end_offset),
+        },
+        .replacement = replacement,
     };
 }
 
@@ -767,7 +711,6 @@ fn terminatedToken(ast: Ast, last_token: Ast.TokenIndex, right_token: Ast.TokenI
     // Those tokens may be on a separate line; that line still belongs to the
     // preceding statement, never to the editable paragraph gap.
     const next_token = last_token + 1;
-
     if (next_token < right_token and
         (ast.tokenTag(next_token) == .semicolon or ast.tokenTag(next_token) == .comma))
     {
@@ -778,7 +721,7 @@ fn terminatedToken(ast: Ast, last_token: Ast.TokenIndex, right_token: Ast.TokenI
 }
 
 fn hasParagraphBreak(
-    file: *const FileContext,
+    file: *const LintContext,
     left_token: Ast.TokenIndex,
     right_token: Ast.TokenIndex,
 ) bool {
@@ -812,9 +755,9 @@ fn hasParagraphBreak(
 
 fn lintSwitchArmParagraphs(
     file_allocator: std.mem.Allocator,
-    report: *Diagnostics.Report,
-) std.mem.Allocator.Error!void {
-    const file = report.file;
+    context: *LintContext,
+) Rule.Error!void {
+    const file = context;
     const ast = file.ast;
 
     for (ast.nodes.items(.tag), 0..) |tag, index_usize| {
@@ -836,8 +779,8 @@ fn lintSwitchArmParagraphs(
             const right_case = switchCase(ast, right);
 
             // Only block → block needs a separator; either simple arm ends the run.
-            if (!isBlock(ast.nodeTag(left_case.ast.target_expr)) or
-                !isBlock(ast.nodeTag(right_case.ast.target_expr)))
+            if (!nodeIsBlock(ast, left_case.ast.target_expr) or
+                !nodeIsBlock(ast, right_case.ast.target_expr))
             {
                 continue;
             }
@@ -849,17 +792,13 @@ fn lintSwitchArmParagraphs(
                 continue;
             }
 
-            const fix = if (report.fixes != null)
+            const fix = if (context.fixes_enabled)
                 try lineBreakFix(file_allocator, file, ast.firstToken(node), left_token, right_token, true)
             else
                 null;
-            defer if (fix) |edit| {
-                file_allocator.free(edit.replacement);
-            };
 
-            try report.add(.{
+            try context.report(.{
                 .token = right_token,
-                .rule_name = rule_name,
                 .message = "adjacent braced switch arms must be separated by a blank line",
                 .help = "insert a blank line before this switch arm",
                 .fix = fix,
@@ -876,19 +815,18 @@ fn switchCase(ast: Ast, node: Ast.Node.Index) Ast.full.SwitchCase {
     };
 }
 
-fn isBlock(tag: Ast.Node.Tag) bool {
-    return switch (tag) {
-        .block_two, .block_two_semicolon, .block, .block_semicolon => true,
-        else => false,
-    };
-}
+const DiagnosticText = struct {
+    message: []const u8,
+    help: ?[]const u8 = null,
+    note: ?[]const u8 = null,
+};
 
 fn descriptionFor(
-    file: *const FileContext,
+    file: *const LintContext,
     left: Ast.Node.Index,
     right: Ast.Node.Index,
     reason: Reason,
-) Diagnostics.Description {
+) DiagnosticText {
     const ast = file.ast;
 
     return switch (reason) {
@@ -1006,7 +944,7 @@ fn descriptionFor(
     };
 }
 
-fn controlDescription(ast: Ast, left: Ast.Node.Index, right: Ast.Node.Index) Diagnostics.Description {
+fn controlDescription(ast: Ast, left: Ast.Node.Index, right: Ast.Node.Index) DiagnosticText {
     const starts_paragraph = category(ast, right) == .control;
     const control = unwrapStatement(ast, if (starts_paragraph) right else left);
 
@@ -1055,7 +993,7 @@ fn controlDescription(ast: Ast, left: Ast.Node.Index, right: Ast.Node.Index) Dia
     };
 }
 
-fn exitDescription(ast: Ast, node: Ast.Node.Index) Diagnostics.Description {
+fn exitDescription(ast: Ast, node: Ast.Node.Index) DiagnosticText {
     return switch (ast.nodeTag(unwrapStatement(ast, node))) {
         .@"return" => .{
             .message = "`return` must start a new paragraph",

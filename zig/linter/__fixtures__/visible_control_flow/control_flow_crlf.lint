@@ -1,0 +1,23 @@
+error[visible_control_flow]: `if` body requires braces
+ --> zig/linter/__fixtures__/visible_control_flow/control_flow_crlf.input.zig:2:12
+  |
+2 |     if (flag) work();
+  |               ^^^^
+  |
+  = help: wrap the body in `{ ... }`
+
+error[visible_control_flow]: `return` must start on its own line
+  --> zig/linter/__fixtures__/visible_control_flow/control_flow_crlf.input.zig:11:17
+   |
+11 | fn load() !u8 { return 1; }
+   |                 ^^^^^^
+   |
+   = help: move `return` to a new line or brace its containing control-flow body
+
+error[visible_control_flow]: `return` must start on its own line
+  --> zig/linter/__fixtures__/visible_control_flow/control_flow_crlf.input.zig:12:17
+   |
+12 | fn eof() void { return; }
+   |                 ^^^^^^
+   |
+   = help: move `return` to a new line or brace its containing control-flow body
