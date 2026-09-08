@@ -80,7 +80,7 @@ pub const Server = struct {
         defer init.gpa.free(path);
         const runtime_root = init.environ_map.get("XDG_RUNTIME_DIR").?;
         const runtime_dir = std.Io.Dir.cwd().openDir(init.io, runtime_root, .{}) catch |err| {
-            log.err(.{}, "Runtime directory unavailable: path=\"{f}\", error={s}", .{ std.zig.fmtString(runtime_root), @errorName(err) });
+            log.err(.{}, .runtime_directory_unavailable, "path=\"{f}\" error={s}", .{ std.zig.fmtString(runtime_root), @errorName(err) });
             return error.UnsafeRuntimeDirectory;
         };
         defer runtime_dir.close(init.io);
@@ -122,22 +122,22 @@ pub const Server = struct {
                 try directory.deleteFile(init.io, "control.sock");
                 const retry_result = linux.bind(listener, @ptrCast(&address), address_size);
                 if (linux.errno(retry_result) != .SUCCESS) {
-                    log.err(.{}, "Control bind failed: operation=bind, errno={f}", .{logging.fmtErrno(linux.errno(retry_result))});
+                    log.err(.{}, .control_bind_failed, "operation=bind system_error={f}", .{logging.fmtErrno(linux.errno(retry_result))});
                     return error.ControlBindFailed;
                 }
             },
             else => {
-                log.err(.{}, "Control bind failed: operation=bind, errno={f}", .{logging.fmtErrno(linux.errno(bind_result))});
+                log.err(.{}, .control_bind_failed, "operation=bind system_error={f}", .{logging.fmtErrno(linux.errno(bind_result))});
                 return error.ControlBindFailed;
             },
         }
         errdefer directory.deleteFile(init.io, "control.sock") catch |err| {
-            if (err != error.FileNotFound) log.err(.{}, "Control socket cleanup failed: operation=unlink, error={s}", .{@errorName(err)});
+            if (err != error.FileNotFound) log.err(.{}, .control_cleanup_failed, "operation=unlink error={s}", .{@errorName(err)});
         };
         try directory.setFilePermissions(init.io, "control.sock", .fromMode(0o600), .{});
         const listen_result = linux.listen(listener, clients_count_max);
         if (linux.errno(listen_result) != .SUCCESS) {
-            log.err(.{}, "Control listen failed: operation=listen, errno={f}", .{logging.fmtErrno(linux.errno(listen_result))});
+            log.err(.{}, .control_listen_failed, "operation=listen system_error={f}", .{logging.fmtErrno(linux.errno(listen_result))});
             return error.ControlListenFailed;
         }
         try register(epoll_fd, listener, listener_tag, linux.EPOLL.IN);
@@ -148,7 +148,7 @@ pub const Server = struct {
         for (0..server.clients.len) |index| server.closeClient(index);
         close(server.listener);
         server.directory.deleteFile(io, "control.sock") catch |err| {
-            if (err != error.FileNotFound) log.err(.{}, "Control socket cleanup failed: operation=unlink, error={s}", .{@errorName(err)});
+            if (err != error.FileNotFound) log.err(.{}, .control_cleanup_failed, "operation=unlink error={s}", .{@errorName(err)});
         };
         server.directory.close(io);
     }
@@ -160,7 +160,7 @@ pub const Server = struct {
         // readiness too, or shutdown spins while a blocked reply awaits expiry.
         const errno = linux.errno(linux.epoll_ctl(server.epoll_fd, linux.EPOLL.CTL_DEL, server.listener, null));
         if (errno != .SUCCESS) {
-            log.err(.{}, "Control shutdown failed: operation=epoll_ctl_del, errno={f}", .{logging.fmtErrno(errno)});
+            log.err(.{}, .control_shutdown_failed, "operation=epoll_ctl_del system_error={f}", .{logging.fmtErrno(errno)});
             return error.ControlUnregisterFailed;
         }
         server.accepting = false;
@@ -177,7 +177,7 @@ pub const Server = struct {
                     return;
                 },
                 else => {
-                    log.err(.{}, "Control accept failed: operation=accept4, errno={f}", .{logging.fmtErrno(linux.errno(result))});
+                    log.err(.{}, .control_accept_failed, "operation=accept4 system_error={f}", .{logging.fmtErrno(linux.errno(result))});
                     return error.ControlAcceptFailed;
                 },
             }
@@ -301,7 +301,7 @@ pub const Server = struct {
             switch (linux.errno(result)) {
                 // A short record is a failure, never a reason to send a suffix.
                 .SUCCESS => {
-                    if (result != bytes.len) log.err(.{}, "Control reply failed: short record, bytes={d}", .{result});
+                    if (result != bytes.len) log.err(.{}, .control_reply_failed, "reason=short_write write_size={d} expected_size={d}", .{ result, bytes.len });
                     break;
                 },
                 .INTR => continue,
@@ -407,15 +407,15 @@ fn requireOwnedPrivateDirectory(handle: std.posix.fd_t, path: []const u8) !void 
     var stat: linux.Statx = undefined;
     const stat_errno = linux.errno(linux.statx(handle, "", linux.AT.EMPTY_PATH, .BASIC_STATS, &stat));
     if (stat_errno != .SUCCESS) {
-        log.err(.{}, "Runtime directory inspection failed: path=\"{f}\", operation=statx, errno={f}", .{ std.zig.fmtString(path), logging.fmtErrno(stat_errno) });
+        log.err(.{}, .runtime_directory_inspection_failed, "path=\"{f}\" operation=statx system_error={f}", .{ std.zig.fmtString(path), logging.fmtErrno(stat_errno) });
         return error.ControlDirectoryStatFailed;
     }
     if (!stat.mask.TYPE or stat.mode & linux.S.IFMT != linux.S.IFDIR) {
-        log.err(.{}, "Runtime directory is not a directory: path=\"{f}\"", .{std.zig.fmtString(path)});
+        log.err(.{}, .runtime_directory_invalid, "reason=not_directory path=\"{f}\"", .{std.zig.fmtString(path)});
         return error.UnsafeRuntimeDirectory;
     }
     if (!stat.mask.UID or !stat.mask.MODE or stat.uid != linux.geteuid() or stat.mode & 0o077 != 0) {
-        log.err(.{}, "Runtime directory is not private: path=\"{f}\", uid={d}, expected_uid={d}, mode={o}, uid_available={}, mode_available={}", .{ std.zig.fmtString(path), stat.uid, linux.geteuid(), stat.mode & 0o777, stat.mask.UID, stat.mask.MODE });
+        log.err(.{}, .runtime_directory_invalid, "reason=not_private path=\"{f}\" uid={d} uid_expected={d} mode={o} uid_available={} mode_available={}", .{ std.zig.fmtString(path), stat.uid, linux.geteuid(), stat.mode & 0o777, stat.mask.UID, stat.mask.MODE });
         return error.UnsafeRuntimeDirectory;
     }
 }
@@ -453,7 +453,7 @@ fn unixAddress(path: []const u8) !linux.sockaddr.un {
 fn createSocket(nonblocking: bool) !std.posix.fd_t {
     const result = linux.socket(linux.AF.UNIX, linux.SOCK.SEQPACKET | linux.SOCK.CLOEXEC | (if (nonblocking) @as(u32, linux.SOCK.NONBLOCK) else 0), 0);
     if (linux.errno(result) != .SUCCESS) {
-        log.err(.{}, "Control socket failed: operation=socket, errno={f}", .{logging.fmtErrno(linux.errno(result))});
+        log.err(.{}, .control_socket_failed, "operation=socket system_error={f}", .{logging.fmtErrno(linux.errno(result))});
         return error.ControlSocketFailed;
     }
     return @intCast(result);
@@ -463,12 +463,12 @@ fn register(epoll_fd: std.posix.fd_t, descriptor: std.posix.fd_t, tag: u64, even
     var event: linux.epoll_event = .{ .events = events | linux.EPOLL.RDHUP, .data = .{ .u64 = tag } };
     const result = linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, descriptor, &event);
     if (linux.errno(result) != .SUCCESS) {
-        log.err(.{}, "Control registration failed: operation=epoll_ctl_add, fd={d}, errno={f}", .{ descriptor, logging.fmtErrno(linux.errno(result)) });
+        log.err(.{}, .control_registration_failed, "operation=epoll_ctl_add descriptor={d} system_error={f}", .{ descriptor, logging.fmtErrno(linux.errno(result)) });
         return error.ControlRegisterFailed;
     }
 }
 
 fn close(descriptor: std.posix.fd_t) void {
     const errno = linux.errno(linux.close(descriptor));
-    if (errno != .SUCCESS) log.err(.{}, "Control cleanup failed: operation=close, fd={d}, errno={f}", .{ descriptor, logging.fmtErrno(errno) });
+    if (errno != .SUCCESS) log.err(.{}, .control_cleanup_failed, "operation=close descriptor={d} system_error={f}", .{ descriptor, logging.fmtErrno(errno) });
 }

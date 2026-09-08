@@ -10,6 +10,6 @@
         "build.zig.zon",
         "scripts",
         "src",
-        "runtime",
+        "inference",
     },
 }

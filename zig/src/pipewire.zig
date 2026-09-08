@@ -36,6 +36,7 @@ pub const Source = union(enum) {
 };
 
 pub const Launch = struct {
+    recording_id: u64,
     exchange: *AudioExchange,
     publication_event_fd: std.posix.fd_t,
     control_event_fd: std.posix.fd_t,
@@ -97,7 +98,7 @@ pub const Result = union(enum) { ok: Success, err: Error };
 pub const MemoryLockResult = union(enum) {
     locked: u64,
     unavailable: struct {
-        error_code: i32,
+        errno: linux.E,
         limit_bytes: u64,
     },
 };
@@ -210,7 +211,7 @@ pub fn run(launch: Launch) Result {
     // metadata below; native.Client.createStream writes each complete Port before
     // increasing ports_count, and readers use only that initialized prefix.
     // Measured 2026-09-07 with stock Zig 0.16.0/LLVM, host x86-64, ReleaseSafe
-    // application/inference, static PIE, -Dcrash-diagnostics=false and GNU strip:
+    // application/inference, static PIE, crash diagnostics disabled and GNU strip:
     // connection metadata-only initialization saved about 131 KB; leaving unused
     // port slots untouched removed an 8,576-byte template. Capacities, layouts
     // and allocation policy are unchanged; no resident-memory saving is claimed.
@@ -282,7 +283,7 @@ fn runCapture(launch: Launch, client: *native.Client, report: *Report) !CaptureR
     };
     var socket_buffer: [108]u8 = undefined;
     const socket_path = if (std.fs.path.isAbsolute(launch.environment.remote)) launch.environment.remote else try std.fmt.bufPrint(&socket_buffer, "{s}/{s}", .{ launch.environment.runtime_directory orelse return error.PipeWireRuntimeDirectoryMissing, launch.environment.remote });
-    realtime_scheduling.acquire(launch.environment.system_bus_address, launch.control_event_fd);
+    realtime_scheduling.acquire(launch.recording_id, launch.environment.system_bus_address, launch.control_event_fd);
     try client.init(socket_path);
     var capture: RealtimeCapture = .{
         .exchange = launch.exchange,
@@ -482,7 +483,7 @@ fn runCapture(launch: Launch, client: *native.Client, report: *Report) !CaptureR
     report.samples_count = capture.samples_count;
     report.published_samples_count = capture.published_samples_count;
     report.slot_publications_count = capture.publications_count;
-    report.memory_lock = if (lock_errno == .SUCCESS) .{ .locked = limits.cur } else .{ .unavailable = .{ .error_code = @intFromEnum(lock_errno), .limit_bytes = limits.cur } };
+    report.memory_lock = if (lock_errno == .SUCCESS) .{ .locked = limits.cur } else .{ .unavailable = .{ .errno = lock_errno, .limit_bytes = limits.cur } };
     report.main_loop_thread_id = linux.gettid();
     if (capture.callback_state == .observed) {
         const metrics = capture.callback_state.observed;
@@ -853,8 +854,8 @@ fn monotonicNanoseconds() u64 {
 }
 pub fn schedulerPolicyName(policy: i32) []const u8 {
     const name = switch (policy) {
-        @intFromEnum(linux.SCHED.Mode.FIFO) => "FIFO",
-        @intFromEnum(linux.SCHED.Mode.RR) => "round-robin",
+        @intFromEnum(linux.SCHED.Mode.FIFO) => "fifo",
+        @intFromEnum(linux.SCHED.Mode.RR) => "round_robin",
         @intFromEnum(linux.SCHED.Mode.NORMAL) => "normal",
         else => "other",
     };
@@ -865,9 +866,4 @@ pub fn schedulerPolicyName(policy: i32) []const u8 {
 pub fn schedulerPolicyIsRealtime(policy: i32) bool {
     return policy == @intFromEnum(linux.SCHED.Mode.FIFO) or
         policy == @intFromEnum(linux.SCHED.Mode.RR);
-}
-
-pub fn linuxErrorNameFromCode(error_code: i32) []const u8 {
-    assert(error_code > 0);
-    return @tagName(@as(linux.E, @enumFromInt(error_code)));
 }

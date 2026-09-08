@@ -3,7 +3,7 @@
 const std = @import("std");
 const decimal = @import("decimal.zig");
 const logging = @import("logging.zig");
-const log = logging.scoped(.transcription_capture);
+const log = logging.scoped(.transcription);
 const builtin = @import("builtin");
 const inference = @import("inference");
 const linux = std.os.linux;
@@ -87,9 +87,9 @@ pub const Result = union(enum) { ok: void, err: Error };
 
 pub fn logError(context: logging.Context, err: Error, path: []const u8) void {
     switch (err) {
-        .publish, .stat_directory => |errno| log.err(context, "Failed transcription capture: stage={t}, errno={f}, path=\"{f}\"", .{ std.meta.activeTag(err), logging.fmtErrno(errno), std.zig.fmtString(path) }),
-        .unsafe_directory => |detail| log.err(context, "Failed transcription capture: stage=unsafe_directory, uid={d}, expected_uid={d}, mode={o}, uid_available={}, mode_available={}, path=\"{f}\"", .{ detail.uid, detail.expected_uid, detail.mode, detail.uid_available, detail.mode_available, std.zig.fmtString(path) }),
-        inline else => |cause| log.err(context, "Failed transcription capture: stage={t}, detail=\"{f}\", path=\"{f}\"", .{ std.meta.activeTag(err), std.zig.fmtString(@errorName(cause)), std.zig.fmtString(path) }),
+        .publish, .stat_directory => |errno| log.err(context, .transcription_capture_failed, "stage={t} system_error={f} path=\"{f}\"", .{ std.meta.activeTag(err), logging.fmtErrno(errno), std.zig.fmtString(path) }),
+        .unsafe_directory => |detail| log.err(context, .transcription_capture_failed, "stage=unsafe_directory uid={d} uid_expected={d} mode={o} uid_available={} mode_available={} path=\"{f}\"", .{ detail.uid, detail.expected_uid, detail.mode, detail.uid_available, detail.mode_available, std.zig.fmtString(path) }),
+        inline else => |cause| log.err(context, .transcription_capture_failed, "stage={t} detail=\"{f}\" path=\"{f}\"", .{ std.meta.activeTag(err), std.zig.fmtString(@errorName(cause)), std.zig.fmtString(path) }),
     }
 }
 
@@ -123,15 +123,15 @@ pub fn save(io: std.Io, directory_path: []const u8, samples: []const f32, text: 
         // The old generation now has the staging name. A cleanup problem does
         // not invalidate the new capture; retain and log it independently.
         const old = base.openDir(io, "last-failed.pending", .{ .iterate = true, .follow_symlinks = false }) catch |err| {
-            log.err(.{ .recording_ordinal = metadata.session_id }, "Failed transcription capture cleanup: detail=\"{f}\"", .{std.zig.fmtString(@errorName(err))});
+            log.err(.{ .recording_id = metadata.session_id }, .transcription_capture_cleanup_failed, "detail=\"{f}\"", .{std.zig.fmtString(@errorName(err))});
             return .{ .ok = {} };
         };
         defer old.close(io);
         clearFiles(io, old) catch |err| {
-            log.err(.{ .recording_ordinal = metadata.session_id }, "Failed transcription capture cleanup: detail=\"{f}\"", .{std.zig.fmtString(@errorName(err))});
+            log.err(.{ .recording_id = metadata.session_id }, .transcription_capture_cleanup_failed, "detail=\"{f}\"", .{std.zig.fmtString(@errorName(err))});
             return .{ .ok = {} };
         };
-        base.deleteDir(io, "last-failed.pending") catch |err| log.err(.{ .recording_ordinal = metadata.session_id }, "Failed transcription capture cleanup: detail=\"{f}\"", .{std.zig.fmtString(@errorName(err))});
+        base.deleteDir(io, "last-failed.pending") catch |err| log.err(.{ .recording_id = metadata.session_id }, .transcription_capture_cleanup_failed, "detail=\"{f}\"", .{std.zig.fmtString(@errorName(err))});
     } else if (errno != .SUCCESS) return .{ .err = .{ .publish = errno } };
     return .{ .ok = {} };
 }

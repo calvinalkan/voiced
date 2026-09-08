@@ -83,7 +83,7 @@ pub fn loadModel(context: Context, selected: models.Model, cancellation: ?*const
 
     const directory = openCacheDirectory(context, selected, cancellation) catch |err| unavailable: {
         if (err == error.Cancelled) return err;
-        log.warn(.{}, "Model cache unavailable: error={s}\n", .{@errorName(err)});
+        log.warn(.{}, .model_cache_unavailable, "error={s}", .{@errorName(err)});
         break :unavailable null;
     };
     defer if (directory) |dir| dir.close(context.io);
@@ -91,7 +91,7 @@ pub fn loadModel(context: Context, selected: models.Model, cancellation: ?*const
 
     if (directory) |dir| {
         if (tryReadCached(context.io, dir, kind, source_digest)) |loaded| {
-            log.info(.{}, "Model cache loaded: model={s}, model_cache_load_duration_ms={f}", .{ selected.name(), decimal.fmt(@as(f64, @floatFromInt(cache_started.untilNow(context.io, .awake).nanoseconds)) / std.time.ns_per_ms, 3) });
+            log.debug(.{}, .model_cache_loaded, "model={s} model_cache_load_duration_ms={f}", .{ selected.name(), decimal.fmt(@as(f64, @floatFromInt(cache_started.untilNow(context.io, .awake).nanoseconds)) / std.time.ns_per_ms, 3) });
             return loaded;
         }
     }
@@ -100,7 +100,7 @@ pub fn loadModel(context: Context, selected: models.Model, cancellation: ?*const
     // Unmap the source before inference workspace allocation. Keeping both
     // model representations for the worker's lifetime doubles retained data.
 
-    log.debug(.{}, "Model cache lookup completed: model={s}, cache_available={}, cache_hit=false, model_cache_lookup_duration_ms={f}", .{ selected.name(), directory != null, decimal.fmt(@as(f64, @floatFromInt(cache_started.untilNow(context.io, .awake).nanoseconds)) / std.time.ns_per_ms, 3) });
+    log.debug(.{}, .model_cache_lookup_finished, "model={s} model_cache_available={} model_cache_hit=false model_cache_lookup_duration_ms={f}", .{ selected.name(), directory != null, decimal.fmt(@as(f64, @floatFromInt(cache_started.untilNow(context.io, .awake).nanoseconds)) / std.time.ns_per_ms, 3) });
     const conversion_started = std.Io.Clock.awake.now(context.io);
     try checkCancellation(cancellation);
     var loaded: LoadedModel = block: {
@@ -130,7 +130,7 @@ pub fn loadModel(context: Context, selected: models.Model, cancellation: ?*const
     // A failed microphone can cancel preparation during conversion. Do not
     // start a large cache write/fsync after the caller has abandoned this load.
     try checkCancellation(cancellation);
-    log.info(.{}, "Model converted: model={s}, model_convert_duration_ms={f}", .{ selected.name(), decimal.fmt(@as(f64, @floatFromInt(conversion_started.untilNow(context.io, .awake).nanoseconds)) / std.time.ns_per_ms, 3) });
+    log.debug(.{}, .model_converted, "model={s} model_convert_duration_ms={f}", .{ selected.name(), decimal.fmt(@as(f64, @floatFromInt(conversion_started.untilNow(context.io, .awake).nanoseconds)) / std.time.ns_per_ms, 3) });
 
     // ── Publish One Complete Cache Entry ──
     // The envelope and image share one atomic rename; there is no separately
@@ -139,14 +139,14 @@ pub fn loadModel(context: Context, selected: models.Model, cancellation: ?*const
     if (directory) |dir| {
         const publication_started = std.Io.Clock.awake.now(context.io);
         saveCached(context.io, dir, loaded.model.packedImage(), source_digest) catch |err| {
-            log.warn(.{}, "Model cache save failed: error={s}\n", .{@errorName(err)});
+            log.warn(.{}, .model_cache_save_failed, "error={s}", .{@errorName(err)});
             return loaded;
         };
-        log.debug(.{}, "Model cache published: model={s}, model_cache_publish_duration_ms={f}", .{ selected.name(), decimal.fmt(@as(f64, @floatFromInt(publication_started.untilNow(context.io, .awake).nanoseconds)) / std.time.ns_per_ms, 3) });
+        log.debug(.{}, .model_cache_published, "model={s} model_cache_publish_duration_ms={f}", .{ selected.name(), decimal.fmt(@as(f64, @floatFromInt(publication_started.untilNow(context.io, .awake).nanoseconds)) / std.time.ns_per_ms, 3) });
         try checkCancellation(cancellation);
         const remap_started = std.Io.Clock.awake.now(context.io);
         if (tryReadCached(context.io, dir, kind, source_digest)) |mapped| {
-            log.debug(.{}, "Model cache remapped: model={s}, model_cache_remap_duration_ms={f}", .{ selected.name(), decimal.fmt(@as(f64, @floatFromInt(remap_started.untilNow(context.io, .awake).nanoseconds)) / std.time.ns_per_ms, 3) });
+            log.debug(.{}, .model_cache_remapped, "model={s} model_cache_remap_duration_ms={f}", .{ selected.name(), decimal.fmt(@as(f64, @floatFromInt(remap_started.untilNow(context.io, .awake).nanoseconds)) / std.time.ns_per_ms, 3) });
             loaded.deinit();
             return mapped;
         }
@@ -205,7 +205,7 @@ fn openCacheDirectory(context: Context, selected: models.Model, cancellation: ?*
 
 fn tryReadCached(io: std.Io, directory: std.Io.Dir, kind: inference.ModelKind, source_digest: [32]u8) ?LoadedModel {
     return readCached(io, directory, kind, source_digest) catch |err| {
-        if (err != error.FileNotFound) log.warn(.{}, "Model cache rejected: error={s}\n", .{@errorName(err)});
+        if (err != error.FileNotFound) log.warn(.{}, .model_cache_rejected, "error={s}", .{@errorName(err)});
         return null;
     };
 }

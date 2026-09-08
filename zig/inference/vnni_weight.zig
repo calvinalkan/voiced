@@ -56,29 +56,8 @@ pub const Layout = struct {
         return std.math.mul(usize, layout.output_rows_count, layout.input_values_count) catch unreachable;
     }
 
-    pub fn outputBlocksCount(layout: Layout) usize {
-        return @divExact(layout.output_rows_count, output_rows_per_block);
-    }
-
     pub fn outputBlockSize(layout: Layout) usize {
         return output_rows_per_block * layout.input_values_count;
-    }
-
-    pub fn outputBlockOffset(layout: Layout, output_block_index: usize) usize {
-        assert(output_block_index < layout.outputBlocksCount());
-
-        return output_block_index * layout.outputBlockSize();
-    }
-
-    pub fn depthGroupOffset(layout: Layout, input_value_start_index: usize) usize {
-        assert(input_value_start_index < layout.input_values_count);
-        assert(input_value_start_index % input_values_per_group == 0);
-
-        return @divExact(input_value_start_index, input_values_per_group) * values_per_group;
-    }
-
-    pub fn groupOffset(layout: Layout, output_block_index: usize, input_value_start_index: usize) usize {
-        return layout.outputBlockOffset(output_block_index) + layout.depthGroupOffset(input_value_start_index);
     }
 
     pub fn valueOffset(layout: Layout, output_row_index: usize, input_value_index: usize) usize {
@@ -87,10 +66,13 @@ pub const Layout = struct {
 
         const output_block_index = output_row_index / output_rows_per_block;
         const block_row_index = output_row_index % output_rows_per_block;
-        const input_value_start_index = input_value_index / input_values_per_group * input_values_per_group;
+        const input_group_index = input_value_index / input_values_per_group;
         const group_value_index = input_value_index % input_values_per_group;
 
-        return layout.groupOffset(output_block_index, input_value_start_index) + block_row_index * input_values_per_group + group_value_index;
+        return output_block_index * layout.outputBlockSize() +
+            input_group_index * values_per_group +
+            block_row_index * input_values_per_group +
+            group_value_index;
     }
 };
 

@@ -1,7 +1,9 @@
 //! Desktop clipboard facade. A session selects exactly one native backend:
-//! Wayland when WAYLAND_DISPLAY is present, otherwise X11 when DISPLAY is
-//! present. Both implementations retain the same bounded borrowed-text contract.
+//! Wayland when WAYLAND_DISPLAY is present, otherwise the compositor default
+//! `wayland-0` socket when it exists, otherwise X11 when DISPLAY is present.
+//! Both implementations retain the same bounded borrowed-text contract.
 const std = @import("std");
+const linux = std.os.linux;
 const wayland = @import("clipboard_wayland.zig");
 const x11 = @import("clipboard_x11.zig");
 
@@ -41,13 +43,20 @@ pub const Client = struct {
 
     /// Initializes fresh or deinitialized storage. Presence selects one backend;
     /// an initialization failure never publishes through the other display.
+    /// Unset WAYLAND_DISPLAY uses `wayland-0` when that socket exists now.
     pub fn init(self: *Client, epoll_fd: i32, tag: u64, environment: Environment, fallback_only: bool, now_ns: u64) Result(void) {
         self.backend = .none;
         self.mode = .core;
         self.transfers_completed = 0;
         self.transfers_expired = 0;
         self.transfers_rejected = 0;
-        if (environment.wayland_display) |display| {
+        // Re-select on every init, including delivery reconnect, instead of
+        // caching the first backend. A systemd user unit can start before
+        // graphical-session imports WAYLAND_DISPLAY, and a compositor restart
+        // after lock-screen or a new login can drop the connection while voiced
+        // keeps running. Caching the first miss would leave clipboard unavailable
+        // for the rest of the process.
+        if (environment.wayland_display orelse defaultWaylandDisplay(environment)) |display| {
             self.backend = .{ .wayland = undefined };
             const result = self.backend.wayland.init(epoll_fd, tag, .{ .runtime_directory = environment.runtime_directory, .display = display }, fallback_only, now_ns);
             self.syncMetrics();
@@ -172,6 +181,19 @@ pub const Client = struct {
         }
     }
 };
+
+// Probe instead of assuming `wayland-0`: a failed Wayland init never falls
+// through to X11, so a missing socket must leave DISPLAY available.
+fn defaultWaylandDisplay(environment: Environment) ?[]const u8 {
+    const runtime_directory = environment.runtime_directory orelse return null;
+    var path: [108]u8 = undefined;
+    const socket = std.fmt.bufPrint(path[0 .. path.len - 1], "{s}/wayland-0", .{runtime_directory}) catch return null;
+    path[socket.len] = 0;
+    var stat: linux.Statx = undefined;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, @ptrCast(&path), 0, .BASIC_STATS, &stat)) != .SUCCESS) return null;
+    if (!stat.mask.TYPE or stat.mode & linux.S.IFMT != linux.S.IFSOCK) return null;
+    return "wayland-0";
+}
 
 fn mapWaylandError(err: wayland.Error) Error {
     return switch (err) {

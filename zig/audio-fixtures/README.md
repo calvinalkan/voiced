@@ -35,13 +35,13 @@ in `manifest.tsv`; migrating checksum algorithms does not resample the corpus.
 Run every audio fixture with the default `base.en` model from the repository root:
 
 ```bash
-zig test zig/runtime/transcription_test.zig -OReleaseFast -mcpu=native
+zig test zig/inference/transcription_test.zig -OReleaseFast -mcpu=native
 ```
 
 Select `small.en` with:
 
 ```bash
-VOICED_RUNTIME_MODEL=small.en zig test zig/runtime/transcription_test.zig -OReleaseFast -mcpu=native
+VOICED_RUNTIME_MODEL=small.en zig test zig/inference/transcription_test.zig -OReleaseFast -mcpu=native
 ```
 
 `VOICED_RUNTIME_MODEL` accepts `base.en` and `small.en`. Select the per-transcription encoder tail with `VOICED_RUNTIME_TRAILING_PADDING_SECONDS`; accepted values are `5`, `10`, and the default `30`:
@@ -49,7 +49,7 @@ VOICED_RUNTIME_MODEL=small.en zig test zig/runtime/transcription_test.zig -ORele
 ```bash
 VOICED_RUNTIME_MODEL=small.en \
 VOICED_RUNTIME_TRAILING_PADDING_SECONDS=10 \
-zig test zig/runtime/transcription_test.zig -OReleaseFast -fllvm -mcpu=native
+zig test zig/inference/transcription_test.zig -OReleaseFast -fllvm -mcpu=native
 ```
 
 The runtime always retains capacity for `Policy.samples_count_max`. Shorter trailing padding changes only the logical feature and encoder lengths for that call; it does not resize or allocate runtime memory.
@@ -57,13 +57,13 @@ The runtime always retains capacity for `Policy.samples_count_max`. Shorter trai
 Debug inference must use `-fllvm` because Zig's self-hosted x86 backend does not support the runtime's AVX-VNNI inline assembly:
 
 ```bash
-VOICED_RUNTIME_AUDIO_FIXTURE=librispeech-test-clean-6829-68769-0026 zig test zig/runtime/transcription_test.zig -ODebug -fllvm -mcpu=native
+VOICED_RUNTIME_AUDIO_FIXTURE=librispeech-test-clean-6829-68769-0026 zig test zig/inference/transcription_test.zig -ODebug -fllvm -mcpu=native
 ```
 
 Select one fixture during development:
 
 ```bash
-VOICED_RUNTIME_AUDIO_FIXTURE=librispeech-test-clean-6829-68769-0026 zig test zig/runtime/transcription_test.zig -OReleaseFast -mcpu=native
+VOICED_RUNTIME_AUDIO_FIXTURE=librispeech-test-clean-6829-68769-0026 zig test zig/inference/transcription_test.zig -OReleaseFast -mcpu=native
 ```
 
 An external directory can supply additional fixtures through `VOICED_RUNTIME_AUDIO_FIXTURES_DIRECTORY`. It must follow the same adjacent `.wav` and `.transcript` convention.

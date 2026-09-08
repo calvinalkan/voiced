@@ -198,13 +198,15 @@ def setup(peer, fragment=False):
         reply(peer, serial, endian=">" if fragment else "<", fragment=fragment)
 
 
-def notification(peer, client, command="a", replaces=0, endian="<", fragment=False):
+def notification(peer, client, command="a", replaces=0, endian="<", fragment=False, body_contains=None):
     client.command(command)
     serial, header, body = receive(peer)
     assert b"Notify\0" in header
     string_length = struct.unpack_from("<I", body)[0]
     offset = (4 + string_length + 1 + 3) & ~3
     assert struct.unpack_from("<I", body, offset)[0] == replaces, body
+    if body_contains is not None:
+        assert body_contains.encode() in body, body
     reply(peer, serial, "u", [7], sender=":1.7", endian=endian, fragment=fragment)
     return serial
 
@@ -233,7 +235,7 @@ def private_tests(binary, root):
     with scenario("fragmented-big-endian") as (client, peer, _):
         setup(peer, fragment=True)
         notification(peer, client, endian=">", fragment=True)
-        client.wait_log("Desktop notification accepted")
+        client.wait_log("notification_accepted")
         # A different application cannot dismiss our ID with a forged signal.
         peer.sendall(frame(4, 100, [(7, "s", ":1.99"), (1, "o", PATH),
                                    (2, "s", SERVICE), (3, "s", "NotificationClosed")], "uu", [7, 2]))
@@ -241,19 +243,24 @@ def private_tests(binary, root):
         client.wait_log("problem=transcription_failed")
         peer.sendall(frame(4, 101, [(7, "s", ":1.7"), (1, "o", PATH),
                                    (2, "s", SERVICE), (3, "s", "NotificationClosed")], "uu", [7, 2]))
-        client.wait_log("Desktop notification closed:")
+        client.wait_log("notification_closed")
         notification(peer, client, "c", replaces=0)
         client.wait_log("problem=transcript_save_failed")
         client.command("r")
         serial, header, body = receive(peer)
         assert b"CloseNotification" in header and body == struct.pack("<I", 7)
         reply(peer, serial, sender=":1.7")
-        client.wait_log("close accepted")
+        client.wait_log("notification_close_accepted")
+
+    with scenario("saved-transcript-path") as (client, peer, _):
+        setup(peer)
+        notification(peer, client, "d", body_contains="Saved to ~/.local/state/voiced/transcript.txt.")
+        client.wait_log("problem=clipboard_failed")
 
     with scenario("rejected-authentication") as (client, peer, _):
         auth(peer)
         peer.sendall(b"REJECTED EXTERNAL\r\n")
-        client.wait_log("AuthenticationRejected")
+        client.wait_log("notification_authentication_rejected")
         client.command("a")
 
     with scenario("authentication-timeout") as (client, peer, _):
@@ -269,7 +276,7 @@ def private_tests(binary, root):
     ]:
         with scenario(name) as (client, peer, _):
             setup(peer)
-            client.wait_log("bus ready")
+            client.wait_log("notification_bus_ready")
             peer.sendall(packet)
             client.wait_log(error)
             client.command("a")
@@ -281,16 +288,16 @@ def private_tests(binary, root):
                                 (2, "s", "org.example.Other"), (3, "s", "Changed")])
         peer.sendall(packet * 80)
         notification(peer, client)
-        client.wait_log("Desktop notification accepted")
+        client.wait_log("notification_accepted")
 
     with scenario("bus-reconnect") as (client, peer, listener):
         setup(peer)
         notification(peer, client)
-        client.wait_log("Desktop notification accepted")
+        client.wait_log("notification_accepted")
         before = len(client.logs)
         peer.shutdown(socket.SHUT_RDWR)
         peer.close()
-        client.wait_log("Desktop notifications disconnected", after=before)
+        client.wait_log("notification_transport_failed outcome=disconnected", after=before)
         client.command("b")
         second, _ = listener.accept()
         with second:
@@ -308,7 +315,7 @@ def private_tests(binary, root):
     with scenario("runtime,%directory", fallback=True) as (client, peer, _):
         setup(peer)
         notification(peer, client)
-        client.wait_log("Desktop notification accepted")
+        client.wait_log("notification_accepted")
 
     with driver(binary, root / "unsupported-address", address="tcp:host=localhost,port=1") as client:
         client.wait_log("UnsupportedAddress")
@@ -323,7 +330,7 @@ def desktop_test(binary, root):
     with driver(binary, root / "desktop") as client:
         closed = False
         try:
-            client.wait_log("bus ready", timeout=5)
+            client.wait_log("notification_bus_ready", timeout=5)
             client.command("a")
             client.wait_log("problem=microphone_failed")
             print("1/3: Microphone error accepted. Leaving it visible for four seconds.", flush=True)
@@ -333,14 +340,14 @@ def desktop_test(binary, root):
             print("2/3: Transcription error accepted as a replacement. Waiting four seconds.", flush=True)
             time.sleep(4)
             client.command("r")
-            client.wait_log("close accepted")
+            client.wait_log("notification_close_accepted")
             closed = True
             print("3/3: Close request accepted. The test popup should disappear.", flush=True)
         finally:
             if not closed and client.process.poll() is None:
                 with contextlib.suppress(Exception):
                     client.command("r")
-                    client.wait_log("close accepted", timeout=1.5)
+                    client.wait_log("notification_close_accepted", timeout=1.5)
     return ["show", "replace", "close"]
 
 

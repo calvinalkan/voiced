@@ -12,36 +12,39 @@ const stderr = std.debug.print;
 
 // ── Crash Diagnostics ──
 //
-// -Dcrash-diagnostics=false opts out of in-process crash reporting (default: true).
-// Runtime safety checks and normal logs remain; panics print a short message and
-// abort. Keeping both panic and fault paths out of stack symbolization discards
-// ELF/DWARF parsing, symbol lookup/sorting, and their diagnostic dependencies.
-// Configure external core collection separately and retain the matching
-// unstripped executable so GDB can resolve the core's addresses to source lines.
-// Stripping removes debug data, not the executable code that prints stack traces;
-// this build option removes that code by eliminating its compile-time references.
+// `-Ddeveloper=false` omits in-process panic and fault stack traces. Runtime
+// safety checks and normal logs remain; panics print a best-effort message to
+// stderr and abort with SIGABRT. Keeping both panic and fault paths out of stack
+// symbolization discards ELF/DWARF parsing, symbol lookup/sorting, unwind tables,
+// and their diagnostic dependencies.
+//
+// Configure external core collection separately. GDB needs the exact unstripped
+// build companion to resolve deployment addresses to source lines, but the
+// deployment profile does not yet emit one. Stripping removes debug data, not
+// the code that prints stack traces; the non-developer profile also removes that
+// code through this compile-time value.
 //
 // Measured on this workstation: Intel Core i7-13700HX (x86-64), Ubuntu 24.04.3 LTS,
 // Zig 0.16.0/LLVM, native PipeWire, ReleaseSafe + PIE. GNU-stripped size fell from
 // 1,565,784 to 1,314,072 bytes (-251,712, or 16.1%).
-const crash_diagnostics = @import("build_options").crash_diagnostics;
+const developer = @import("build_options").developer;
 
 pub const std_options: std.Options = options: {
     var configured: std.Options = .{
-        .allow_stack_tracing = crash_diagnostics,
-        .enable_segfault_handler = crash_diagnostics and std.debug.default_enable_segfault_handler,
+        .allow_stack_tracing = developer,
+        .enable_segfault_handler = developer and std.debug.default_enable_segfault_handler,
         // IPC and D-Bus use raw Unix sockets; PipeWire uses its own API.
         // The separate model-setup executable retains std.Io networking.
         .networking = false,
     };
     // Thread entry allocates an alternate signal stack independently of the
     // segfault-handler setting. Keep the standard size only when that handler
-    // is enabled by this build's crash-diagnostics policy.
-    if (!crash_diagnostics) configured.signal_stack_size = null;
+    // is enabled by the developer profile.
+    if (!developer) configured.signal_stack_size = null;
     break :options configured;
 };
 
-pub const panic = std.debug.FullPanic(if (crash_diagnostics) std.debug.defaultPanic else panicWithoutTrace);
+pub const panic = std.debug.FullPanic(if (developer) std.debug.defaultPanic else panicWithoutTrace);
 
 fn panicWithoutTrace(message: []const u8, first_trace_addr: ?usize) noreturn {
     @branchHint(.cold);
@@ -247,8 +250,8 @@ fn runCommandLine(init: std.process.Init) u8 {
     execution catch |err| {
         if (invocation == .serve) {
             switch (err) {
-                error.DaemonAlreadyRunning, error.RuntimeDirectoryNotSet, error.RuntimeDirectoryNotAbsolute, error.InvalidInstance, error.UnsafeRuntimeDirectory, error.UnsafeControlSocket, error.SocketPathTooLong => log.err(.{}, "Service startup refused: error={s}", .{@errorName(err)}),
-                else => log.critical(.{}, "Service stopped: error={s}", .{@errorName(err)}),
+                error.DaemonAlreadyRunning, error.RuntimeDirectoryNotSet, error.RuntimeDirectoryNotAbsolute, error.InvalidInstance, error.UnsafeRuntimeDirectory, error.UnsafeControlSocket, error.SocketPathTooLong => log.err(.{}, .service_startup_refused, "error={s}", .{@errorName(err)}),
+                else => log.critical(.{}, .service_failed, "error={s}", .{@errorName(err)}),
             }
             return 1;
         }
@@ -268,7 +271,7 @@ fn runCommandLine(init: std.process.Init) u8 {
         return 1;
     };
 
-    if (invocation == .serve) log.info(.{}, "Service stopped", .{});
+    if (invocation == .serve) log.info(.{}, .service_stopped, "", .{});
     return 0;
 }
 
@@ -429,7 +432,8 @@ const general_help =
     \\
     \\Environment:
     \\  XDG_RUNTIME_DIR User session runtime directory and Wayland socket location.
-    \\  WAYLAND_DISPLAY Preferred native Wayland display when set.
+    \\  WAYLAND_DISPLAY Preferred native Wayland display when set; otherwise
+    \\                  wayland-0 when that socket exists.
     \\  DISPLAY         Local X11 fallback when WAYLAND_DISPLAY is unset.
     \\  XAUTHORITY      Optional X11 authority file (defaults to ~/.Xauthority).
     \\  VOICED_INSTANCE Optional isolated instance name; use the same value

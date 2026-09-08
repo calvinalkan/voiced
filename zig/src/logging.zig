@@ -6,8 +6,8 @@ const linux = std.os.linux;
 const decimal = @import("decimal.zig");
 
 pub const Level = enum(u8) { critical = 2, err = 3, warn = 4, info = 6, debug = 7 };
-pub const Context = struct { recording_ordinal: ?u64 = null };
-pub const record_bytes_max = 4096;
+pub const Context = struct { recording_id: ?u64 = null };
+const record_bytes_max = 4096;
 const message_bytes_max = 3584;
 const Sink = union(enum) { disabled, journal: struct { fd: i32, connected: bool }, cli };
 var sink: Sink = .disabled;
@@ -47,10 +47,6 @@ pub fn deinit() void {
     if (sink == .journal) _ = linux.close(sink.journal.fd);
     sink = .disabled;
     dropped.store(0, .monotonic);
-}
-
-pub fn level() Level {
-    return threshold;
 }
 
 pub fn parseLevel(text: []const u8) ?Level {
@@ -93,10 +89,11 @@ const ErrnoFormat = struct {
 /// The event function filters before formatting. Guard expensive argument
 /// preparation at the call site with enabled(); Zig evaluates arguments first.
 pub fn enabled(value: Level) bool {
-    return @intFromEnum(value) <= @intFromEnum(threshold);
+    return sink != .disabled and @intFromEnum(value) <= @intFromEnum(threshold);
 }
 
 pub const Field = union(enum) {
+    name: []const u8,
     str: []const u8,
     u: u64,
     i: i64,
@@ -110,74 +107,94 @@ pub const Entry = struct { []const u8, Field };
 
 pub fn scoped(comptime component: @EnumLiteral()) type {
     return struct {
-        pub fn write(severity: Level, context: Context, comptime format: []const u8, args: anytype) void {
+        pub fn write(severity: Level, context: Context, comptime event: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
             // An inline switch would instantiate the formatter for each level.
-            emit(severity, @tagName(component), context, format, args);
+            emit(severity, @tagName(component), @tagName(event), context, format, args);
         }
 
         /// Appends ordered `key=value` fields to the message, quoting and Zig-
-        /// escaping string bytes. Keys must be nonempty ASCII identifiers
-        /// ([A-Za-z_][A-Za-z0-9_]*); the message is trusted event text.
+        /// escaping string bytes. Keys and name values must be nonempty,
+        /// lower-case ASCII identifiers ([a-z_][a-z0-9_]*); the message is
+        /// trusted event text.
         /// Integers are decimal, floats use the requested fractional digits,
         /// and errno requires a named Linux value, as with fmtErrno.
         /// Inputs are borrowed only during the call. Filtering precedes
         /// formatting, not argument preparation; use enabled() for costly work.
         /// Delivery, truncation and drop accounting are the same as write().
-        pub fn kv(severity: Level, context: Context, message: []const u8, fields: []const Entry) void {
+        pub fn kv(severity: Level, context: Context, event: []const u8, fields: []const Entry) void {
             comptime std.debug.assert(@tagName(component).len <= 64);
-            emitKv(severity, @tagName(component), context, message, fields);
+            comptime assertIdentifier(@tagName(component));
+            emitKv(severity, @tagName(component), event, context, fields);
         }
 
-        pub fn critical(context: Context, comptime format: []const u8, args: anytype) void {
-            emit(.critical, @tagName(component), context, format, args);
+        pub fn critical(context: Context, comptime event: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
+            emit(.critical, @tagName(component), @tagName(event), context, format, args);
         }
-        pub fn err(context: Context, comptime format: []const u8, args: anytype) void {
-            emit(.err, @tagName(component), context, format, args);
+        pub fn err(context: Context, comptime event: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
+            emit(.err, @tagName(component), @tagName(event), context, format, args);
         }
-        pub fn warn(context: Context, comptime format: []const u8, args: anytype) void {
-            emit(.warn, @tagName(component), context, format, args);
+        pub fn warn(context: Context, comptime event: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
+            emit(.warn, @tagName(component), @tagName(event), context, format, args);
         }
-        pub fn info(context: Context, comptime format: []const u8, args: anytype) void {
-            emit(.info, @tagName(component), context, format, args);
+        pub fn info(context: Context, comptime event: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
+            emit(.info, @tagName(component), @tagName(event), context, format, args);
         }
-        pub fn debug(context: Context, comptime format: []const u8, args: anytype) void {
-            emit(.debug, @tagName(component), context, format, args);
+        pub fn debug(context: Context, comptime event: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
+            emit(.debug, @tagName(component), @tagName(event), context, format, args);
         }
     };
 }
 
-fn emit(severity: Level, comptime component: []const u8, context: Context, comptime format: []const u8, args: anytype) void {
+fn emit(severity: Level, comptime component: []const u8, comptime event: []const u8, context: Context, comptime format: []const u8, args: anytype) void {
     if (!enabled(severity)) return;
     comptime std.debug.assert(component.len <= 64);
+    comptime std.debug.assert(event.len <= 64);
+    comptime assertIdentifier(component);
+    comptime assertIdentifier(event);
     var message_buffer: [message_bytes_max]u8 = undefined;
     var message = std.Io.Writer.fixed(&message_buffer);
     const truncated = failed: {
-        message.print(format, args) catch break :failed true;
+        message.writeAll(event) catch break :failed true;
+        if (context.recording_id) |recording_id| {
+            message.print(" recording_id={d}", .{recording_id}) catch break :failed true;
+        }
+        if (format.len != 0) {
+            message.writeByte(' ') catch break :failed true;
+            message.print(format, args) catch break :failed true;
+        }
         break :failed false;
     };
     // The sender borrows and finalizes this fixed writer synchronously; neither
     // the writer nor its stack buffer may be retained after the call returns.
-    sendRecord(severity, component, context, &message, truncated);
+    sendRecord(severity, component, event, context, &message, truncated);
 }
 
 // PERFORMANCE: Keep this loop non-generic and out-of-line. Specializing on
 // field shapes or inlining into callers duplicates formatting across events.
 // The tagged entries and extra call trade stack space and cold-path dispatch
 // for shared code; no allocation or capture/inference hot-path work is added.
-noinline fn emitKv(severity: Level, component: []const u8, context: Context, text: []const u8, fields: []const Entry) void {
+noinline fn emitKv(severity: Level, component: []const u8, event: []const u8, context: Context, fields: []const Entry) void {
     if (!enabled(severity)) return;
+    std.debug.assert(event.len <= 64);
+    assertIdentifier(event);
     var message_buffer: [message_bytes_max]u8 = undefined;
     var message = std.Io.Writer.fixed(&message_buffer);
     const truncated = failed: {
-        message.writeAll(text) catch break :failed true;
-        for (fields, 0..) |entry, index| {
+        message.writeAll(event) catch break :failed true;
+        if (context.recording_id) |recording_id| {
+            message.print(" recording_id={d}", .{recording_id}) catch break :failed true;
+        }
+        for (fields) |entry| {
             const key, const field = entry;
-            std.debug.assert(key.len > 0);
-            for (key, 0..) |byte, position| std.debug.assert(std.ascii.isAlphabetic(byte) or byte == '_' or (position > 0 and std.ascii.isDigit(byte)));
-            message.writeAll(if (index == 0) ": " else ", ") catch break :failed true;
+            assertIdentifier(key);
+            message.writeByte(' ') catch break :failed true;
             message.writeAll(key) catch break :failed true;
             message.writeByte('=') catch break :failed true;
             switch (field) {
+                .name => |value| {
+                    assertIdentifier(value);
+                    message.writeAll(value) catch break :failed true;
+                },
                 .str => |value| {
                     message.writeByte('"') catch break :failed true;
                     std.zig.stringEscape(value, &message) catch break :failed true;
@@ -193,18 +210,26 @@ noinline fn emitKv(severity: Level, component: []const u8, context: Context, tex
         }
         break :failed false;
     };
-    sendRecord(severity, component, context, &message, truncated);
+    sendRecord(severity, component, event, context, &message, truncated);
+}
+
+fn assertIdentifier(value: []const u8) void {
+    std.debug.assert(value.len > 0);
+    for (value, 0..) |byte, position| {
+        std.debug.assert(std.ascii.isLower(byte) or byte == '_' or
+            (position > 0 and std.ascii.isDigit(byte)));
+    }
 }
 
 // Keep delivery non-generic and out-of-line so journal framing and syscalls are
 // not copied into every message-format specialization. The extra call is on the
 // logging cold path, not capture/inference hot paths. Measured with Zig 0.16 on
 // x86-64 ReleaseSafe: ~151 KiB saved, a ~10% smaller whole stripped daemon.
-noinline fn sendRecord(severity: Level, component: []const u8, context: Context, message: *std.Io.Writer, truncated: bool) void {
+noinline fn sendRecord(severity: Level, component: []const u8, event: []const u8, context: Context, message: *std.Io.Writer, truncated: bool) void {
     // PERFORMANCE: Finalize here, not in generic emit: otherwise every message
     // format can get another copy of trimming and truncation code. Measured
     // 2026-09-07 with stock Zig 0.16.0/LLVM, host x86-64, ReleaseSafe application
-    // and inference, static PIE, -Dcrash-diagnostics=false, GNU strip --strip-all:
+    // and inference, static PIE, crash diagnostics disabled, GNU strip --strip-all:
     // this change alone reduced 1,161,416 to 1,147,032 bytes (14,384 saved).
     // Together with decimal.zig, the applied worktree went from 1,323,960 to
     // 1,301,832 bytes (22,128 saved). The isolated baseline also had initializer
@@ -229,8 +254,8 @@ noinline fn sendRecord(severity: Level, component: []const u8, context: Context,
     const lost = dropped.swap(0, .monotonic);
     var buffer: [record_bytes_max]u8 = undefined;
     var record = std.Io.Writer.fixed(&buffer);
-    record.print("PRIORITY={d}\nSYSLOG_IDENTIFIER=voiced\nVOICED_COMPONENT={s}\n", .{ @intFromEnum(severity), component }) catch unreachable;
-    if (context.recording_ordinal) |value| record.print("VOICED_RECORDING_ORDINAL={d}\n", .{value}) catch unreachable;
+    record.print("PRIORITY={d}\nSYSLOG_IDENTIFIER=voiced\nVOICED_COMPONENT={s}\nVOICED_EVENT={s}\n", .{ @intFromEnum(severity), component, event }) catch unreachable;
+    if (context.recording_id) |value| record.print("VOICED_RECORDING_ID={d}\n", .{value}) catch unreachable;
     if (lost != 0) record.print("VOICED_DROPPED={d}\n", .{lost}) catch unreachable;
     // Always use the native binary MESSAGE encoding. Newlines in native error
     // details remain one message and cannot inject journal metadata fields.

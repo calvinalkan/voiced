@@ -1,5 +1,6 @@
 //! Test driver for the production notification client. Commands on stdin:
-//! a/b/c show errors, n resets suppression, r recovers, q exits. Diagnostics
+//! a/b/c show errors, d shows a saved clipboard error, n resets suppression,
+//! r recovers, q exits. Diagnostics
 //! use the production logger; the runner supplies a private datagram receiver.
 const std = @import("std");
 const notifications = @import("notifications.zig");
@@ -38,6 +39,7 @@ pub fn main(init: std.process.Init) !void {
                 'a' => client.show(.microphone_failed),
                 'b' => client.show(.transcription_failed),
                 'c' => client.show(.transcript_save_failed),
+                'd' => client.showOutput(.clipboard_failed, .{ .saved = notifications.transcriptDirectory("/home/test/.local/state/voiced", "/home/test") }),
                 'r' => client.recover(),
                 'n' => client.resetSuppression(),
                 'q' => return,

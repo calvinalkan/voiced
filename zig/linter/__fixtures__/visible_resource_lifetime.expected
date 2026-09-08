@@ -1,0 +1,55 @@
+visible_resource_lifetime.zig:4:5: visible_resource_lifetime: Other work follows cleanup registrations without an empty line. Insert an empty line after the cleanup group.
+        doWork();
+        ^^^^^^
+
+visible_resource_lifetime.zig:10:5: visible_resource_lifetime: An empty line separates resource setup and cleanup registrations. Keep them together; comments may remain between them.
+        defer client.deinit();
+        ^^^^^
+
+visible_resource_lifetime.zig:18:5: visible_resource_lifetime: Other work follows cleanup registrations without an empty line. Insert an empty line after the cleanup group.
+        doWork();
+        ^^^^^^
+
+visible_resource_lifetime.zig:25:5: visible_resource_lifetime: Other work follows cleanup registrations without an empty line. Insert an empty line after the cleanup group.
+        doWork();
+        ^^^^^^
+
+visible_resource_lifetime.zig:32:5: visible_resource_lifetime: An empty line separates resource setup and cleanup registrations. Keep them together; comments may remain between them.
+        errdefer deleteOutput();
+        ^^^^^^^^
+
+visible_resource_lifetime.zig:39:5: visible_resource_lifetime: Resource setup follows other work without an empty line. Insert an empty line before the setup and its cleanup registrations.
+        var client: Client = .{};
+        ^^^
+
+visible_resource_lifetime.zig:47:5: visible_resource_lifetime: Resource setup follows other work without an empty line. Insert an empty line before the setup and its cleanup registrations.
+        configureSomethingElse();
+        ^^^^^^^^^^^^^^^^^^^^^^
+
+visible_resource_lifetime.zig:56:16: visible_resource_lifetime: Cleanup registration must start on its own line. Put `defer` or `errdefer` below the setup statement.
+        acquire(); defer release();
+                   ^^^^^
+
+visible_resource_lifetime.zig:63:5: visible_resource_lifetime: Other work follows cleanup registrations without an empty line. Insert an empty line after the cleanup group.
+        const second = acquire();
+        ^^^^^
+
+visible_resource_lifetime.zig:70:5: visible_resource_lifetime: An empty line separates resource setup and cleanup registrations. Keep them together; comments may remain between them.
+        try resource.init();
+        ^^^
+
+visible_resource_lifetime.zig:76:5: visible_resource_lifetime: Resource setup follows other work without an empty line. Insert an empty line before the setup and its cleanup registrations.
+        var resource: Resource = undefined;
+        ^^^
+
+visible_resource_lifetime.zig:83:5: visible_resource_lifetime: Resource setup follows other work without an empty line. Insert an empty line before the setup and its cleanup registrations.
+        try other.init();
+        ^^^
+
+visible_resource_lifetime.zig:89:5: visible_resource_lifetime: Resource setup follows other work without an empty line. Insert an empty line before the setup and its cleanup registrations.
+        resource.init();
+        ^^^^^^^^
+
+visible_resource_lifetime.zig:95:5: visible_resource_lifetime: Resource setup follows other work without an empty line. Insert an empty line before the setup and its cleanup registrations.
+        resource.init();
+        ^^^^^^^^

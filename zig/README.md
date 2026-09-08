@@ -13,7 +13,7 @@ main.zig
 │            │   └── audio_exchange.zig    three reusable Float32 slots
 │            ├── transcription.zig         persistent model coordinator thread
 │            │   ├── model_cache.zig       mapped weights
-│            │   └── ../runtime/root.zig   resident inference thread pool
+│            │   └── ../inference/root.zig resident inference thread pool
 │            ├── worker.zig                typed job/result mailboxes and wakeups
 │            ├── clipboard.zig             Wayland/X11 clipboard selection
 │            │   ├── clipboard_wayland.zig native Wayland ownership and transfers
@@ -35,9 +35,9 @@ The supervisor never frees or reuses storage while a worker might still access i
 
 ## Build and install models
 
-All executable targets explicitly use static linkage. The daemon is a static
-PIE by default: address randomization remains enabled, with no ELF interpreter
-or shared-library dependencies. Native Zig clients speak
+All executable targets explicitly use static linkage and PIE: address
+randomization remains enabled, with no ELF interpreter or shared-library
+dependencies. Native Zig clients speak
 PipeWire and D-Bus directly; neither libc nor client development headers are
 required. Inference uses host-targeted
 AVX-VNNI kernels; this is not a portable baseline binary. There is
@@ -56,56 +56,78 @@ It verifies `model.bin` and `vocabulary.txt` against their sizes and BLAKE3-256 
 reusing valid installed payloads. `zig build setup` is an alias for model setup;
 ordinary builds neither download models nor run inference.
 
-Plain `zig build` defaults to ReleaseSafe for both
-application and inference code, retaining lifecycle assertions and Zig runtime
-safety checks. Use `-Doptimize=Debug` for an unoptimized checked build;
-ReleaseFast is not the production policy.
+Plain `zig build` creates a developer build and defaults to ReleaseSafe for
+both application and inference code. It retains symbols, in-process panic and
+fault stack traces, lifecycle assertions, and Zig runtime safety checks.
+`-Doptimize` selects the application mode;
+`-Doptimize-inference-runtime` optionally overrides the complete inference
+module and otherwise follows the application mode. ReleaseSafe inference keeps
+the projection kernel's entry assertions. Its validated k4 depth loop uses a
+proven packed offset instead of repeating per-update layout assertions and
+disables generated bounds and overflow checks. Debug restores the generated
+loop checks. `inference/linear.zig` owns the complete safety and performance
+fence.
 
-For an opt-in compact build, `-Doptimize=ReleaseSmall` compiles the application
-and control code with ReleaseSmall and the inference module with ReleaseFast.
-This profile disables Zig runtime safety checks; it does not replace the
-ReleaseSafe production policy. Debug, ReleaseSafe, and ReleaseFast continue to
-apply their selected mode to both application and inference code.
-
-```bash
-zig build -Doptimize=ReleaseSmall -Dstrip=true
-```
-
-`-Dstrip=true` asks Zig to omit debug information and symbols from `voiced` at
-link time. Omit it to retain an unstripped executable for debugging. One build
-invocation emits the selected form; use separate prefixes when both forms are
-required. `-Dcrash-diagnostics=true` (the default) independently keeps in-process
-panic stack tracing and Zig's mode-dependent fault handler.
-
-To remove in-process symbolization without disabling ReleaseSafe checks:
+Use fully Debug code only when its unoptimized execution is acceptable:
 
 ```bash
-zig build -Doptimize=ReleaseSafe -Dcrash-diagnostics=false -Dstrip=true
+zig build -Doptimize=Debug
 ```
 
-The matching size gate checks Zig's natively stripped static PIE and fails unless
-it remains strictly below 1 MiB:
+For ordinary application debugging without unoptimized inference, retain
+ReleaseSafe inference:
 
 ```bash
-zig build size-check -Doptimize=ReleaseSafe -Dcrash-diagnostics=false -Dstrip=true
+zig build -Doptimize=Debug -Doptimize-inference-runtime=ReleaseSafe
 ```
 
-The step rejects other optimization, crash-diagnostic, stripping, and PIE
-settings so a passing result always represents the documented profile.
+`-Ddeveloper=false` selects the closed deployment profile. It rejects Debug for
+either optimization setting, always emits a stripped static PIE, omits
+in-process crash diagnostics and runtime unwind tables, and makes the sub-1-MiB
+size gate part of the ordinary install step. ReleaseFast remains opt-in rather
+than the default production policy.
 
-This daemon-only option is independent of stripping and optimization mode. Normal
-CLI output and operational logs remain unchanged. Panics print a best-effort
-message to stderr and abort with SIGABRT; memory faults use the OS signal handling
-instead of Zig's rich fault handler. Neither path prints an in-process stack
-trace. Omit `-Dstrip=true` when external debug information is required; Zig's
-native link-time stripping does not emit a separate debug companion.
+```bash
+# ReleaseSafe application and inference.
+zig build -Ddeveloper=false
 
-Before deploying this mode, verify core collection for the actual service; an
-abort does not guarantee a saved core. Ubuntu may use Apport rather than
-systemd-coredump. Deploy the unstripped form when source-level core analysis is
-required. Cores can contain audio, transcripts, and other process memory:
-restrict access and retention. The build does not change the host's collector
-configuration.
+# ReleaseSafe application with ReleaseFast inference.
+zig build -Ddeveloper=false -Doptimize-inference-runtime=ReleaseFast
+```
+
+There is no implicit ReleaseSmall exception. A compact application with
+speed-optimized inference names both modes explicitly; both modes disable Zig
+runtime safety checks:
+
+```bash
+zig build -Ddeveloper=false -Doptimize=ReleaseSmall -Doptimize-inference-runtime=ReleaseFast
+```
+
+The deployment build checks its installed daemon automatically. The named step
+also works from a developer build by compiling a deployment-equivalent stripped
+daemon with the selected non-Debug optimization modes:
+
+```bash
+zig build size-check
+zig build size-check -Ddeveloper=false
+```
+
+The named step reports the effective deployment flags and rejects Debug
+application or inference modes because their unoptimized diagnostic code is not
+a deployment-size target.
+
+The developer profile changes build-time diagnostics, not normal CLI output or
+operational logs. In a deployment build, panics print a best-effort message to
+stderr and abort with SIGABRT; memory faults use the OS signal handling instead
+of Zig's rich fault handler. Neither path prints an in-process stack trace.
+Zig's native link-time stripping does not emit a separate debug companion.
+
+Before using the deployment profile, verify core collection for the actual
+service; an abort does not guarantee a saved core. Ubuntu may use Apport rather
+than systemd-coredump. Source-level analysis requires an exact unstripped build
+companion, which this profile does not yet emit. Cores can contain audio,
+transcripts, and other process memory: restrict access and retention. The build
+does not change the host's collector configuration.
 
 The `Binary Size Optimizations` section in `src/main.zig` owns the daemon's Zig
 root configuration. Unused `std.Io` networking is disabled in every build mode.
@@ -395,9 +417,12 @@ the coordinator thread remains available. Normal service shutdown stops and
 joins both persistent threads before removing the control socket.
 
 Accepted nonempty text is borrowed directly by the selected native clipboard
-client. Wayland is preferred when `WAYLAND_DISPLAY` is present; otherwise screen
-zero of a local X11 `DISPLAY` in `:N`, `:N.0`, `unix:N`, or `unix:N.0` form is
-used. Selection publication has a two-second deadline. On
+client. Wayland is preferred when `WAYLAND_DISPLAY` is present; otherwise the
+compositor default `wayland-0` socket under `XDG_RUNTIME_DIR` is used when that
+socket exists; otherwise screen zero of a local X11 `DISPLAY` in `:N`, `:N.0`,
+`unix:N`, or `unix:N.0` form is used. Delivery reconnects with a fresh selection
+after a lost connection, so a compositor that appeared after startup can still
+be used. Selection publication has a two-second deadline. On
 Wayland, data-control protocols are preferred; the core data-device fallback
 temporarily maps a transparent surface and waits for its destruction to reach
 the compositor before reporting acquisition. The connection and its transparent
@@ -540,30 +565,42 @@ and effective-configuration messages are intentionally filtered.
 ```bash
 journalctl --user -u voiced -f -o short-precise
 journalctl --user -u voiced -p warning
+journalctl --user -u voiced VOICED_EVENT=recording_finished
+journalctl --user -u voiced VOICED_COMPONENT=capture
+journalctl --user -u voiced VOICED_RECORDING_ID=21
 # Foreground serve has no voiced.service unit:
 journalctl --user -t voiced -f
 ```
 
 Every service event is a single native journal datagram with real `PRIORITY`,
-`SYSLOG_IDENTIFIER=voiced`, and `VOICED_COMPONENT`. Where supplied by the caller,
-`VOICED_RECORDING_ORDINAL` provides the same recording identity in supervisor
-and transcription-worker events, without logger-owned recording state. Model
-cache events can instead be correlated by their journal PID. Newlines in error details stay inside one binary-encoded
-`MESSAGE`; they cannot create extra journal fields. Human-readable messages
-use snake_case, concept-first field names. Numeric values carry no unit suffix;
-time fields name their unit, and `size` always means bytes. Free-text strings
-are quoted with escaped quotes, newlines, and control bytes. Typed error payloads
-retain their diagnostic representation; MESSAGE is not a rigid parsing API.
+`SYSLOG_IDENTIFIER=voiced`, `VOICED_COMPONENT`, and `VOICED_EVENT`. Recording
+events also carry `VOICED_RECORDING_ID`; the logger renders the same context once
+in `MESSAGE`, so call sites cannot make the visible and native IDs disagree.
+Model-cache events without a recording can instead be correlated by their
+journal PID. Components are logical owners such as `capture`, `transcription`,
+`clipboard`, `paste`, `storage`, and `supervisor`. The call site need not be in
+that component's file: the supervisor logs a received typed capture report as a
+capture event. `service_started` is emitted after both workers start and carries
+the effective configuration in the same record.
+
+Human-readable messages begin with the lower-case event name and use ordered
+`key=value` fields. Event names, field names, and unquoted enum values are
+lower-case snake_case. Time fields name their unit; `size` always means bytes.
+Free text is quoted with escaped quotes, newlines, and control bytes. Newlines
+in error details stay inside one binary-encoded `MESSAGE` and cannot create
+extra journal fields. `MESSAGE` remains a diagnostic interface rather than a
+versioned machine protocol; use the native fields for filtering.
 
 Records use fixed stack storage, at most 4 KiB per datagram; oversized messages
 end with `[truncated]`. No audio callback or inference kernel logs. Disabled
 events skip formatting, and expensive argument preparation must be guarded with
-`logging.enabled()`. There is no logging queue, thread, or event-loop registration.
-A full or unavailable journal drops the event without blocking or falling back
-to stderr. `VOICED_DROPPED` on the next successfully submitted event counts local
-submission losses; it does not claim that journald persisted an accepted event.
-All threads share the one nonblocking journal socket initialized at startup. Path-based sends allow
-subsequent messages to reach journald after it restarts without reconnect state.
+`logging.enabled()`. There is no logging queue, thread, or event-loop
+registration. A full or unavailable journal drops the event without blocking
+or falling back to stderr. `VOICED_DROPPED` on the next successfully submitted
+event counts local submission losses; it does not claim that journald persisted
+an accepted event. All threads share the one nonblocking journal socket
+initialized at startup. Path-based sends allow subsequent messages to reach
+journald after it restarts without reconnect state.
 
 For isolated service verification, supply a private datagram stderr socket,
 which the logger duplicates instead of writing to the host journal.
@@ -577,63 +614,106 @@ and successful delivery produce no popups. `notification_mode=off` disables the
 connection; `transcript_output=stdout` always disables it.
 
 Each service owns its `Error` tagged union and returns `Result { ok, err }`
-(`Result(T)` for operations with different success values). Capture errors retain
-valid audio and the complete native report, including the exact failed stage and cause.
-Transcription reports preserve the stage and exact Zig error name. Paste errors
-include the syscall errno, ioctl request/argument or chord/frame progress. Save
-errors retain the failing operation, write progress, and any temporary-file
-cleanup error. These operational results do not allocate.
+(`Result(T)` for operations with different success values). Capture errors
+retain valid audio and the complete native report, including the exact failed
+stage and cause. Transcription reports preserve the stage and exact Zig error
+name. Paste errors include the syscall errno, ioctl request/argument or
+chord/frame progress. Save errors retain the failing operation, write progress,
+and any temporary-file cleanup error. These operational results do not allocate.
 
-The supervisor maps those types to concise notifications. It distinguishes
-missing/ambiguous microphones, lost connections, source changes, audio stalls,
-model loading/transcription errors, and clipboard/paste/storage errors. It logs
-full diagnostics before retaining only the notification category and delivery
-outcome. Mic ambiguity logs include the match count and candidate sources; use
-`microphone_node` **instead of** `microphone_serial` to select one input.
+The supervisor consumes those types at each component boundary. After logging
+the complete payload, it retains a compact component-tagged `Problem` containing
+the semantic code needed by lifecycle, the terminal record, and notifications;
+large fixed diagnostic buffers do not become permanent lifecycle state. The
+outer union tag directly supplies `problem_component`. The supervisor maps that
+problem forward to a concise notification only at the presentation boundary;
+notification categories are never reverse-mapped to reconstruct information
+they discarded. Delivery retains the upstream recording problem separately from
+a later clipboard or paste problem, so an output error cannot overwrite the
+original cause; output outcome fields and component errors preserve the later
+problem. The presentation distinguishes missing/ambiguous microphones,
+lost connections, source changes, audio stalls, model loading/transcription
+errors, and clipboard/paste/storage errors. It logs full diagnostics at the
+owning component boundary and preserves its component and semantic code through
+the terminal recording outcome. Mic ambiguity logs list the observed candidate
+sources; use `microphone_node` **instead of** `microphone_serial` to select one
+input.
 
 Clipboard diagnostics retain the selected backend, typed transport/protocol
 errors, and native errno. Wayland reports compositor objects, codes and messages;
 X11 reports authority/setup failures, response sequences, server opcodes and bad
-values. Capture's bounded
-source-list presentation can omit entries; the
-worker journals the complete observed candidate catalog on selection errors.
+values. Capture includes the observed candidate catalog on selection errors;
+the fixed 4 KiB diagnostic can truncate unusually large catalogs.
 For the full cause and affected recording, run:
 
 ```bash
 journalctl --user -u voiced -b -n 50 --no-pager
 ```
 
-The supervisor uses sd-bus on the user session bus through its existing epoll and
-timerfd loop. There is no notification subprocess or thread. One outstanding
-request and one pending operation coalesce bursts; replies have a one-second
-timeout. Repeated identical problem/outcome pairs are suppressed within a recording.
+The supervisor speaks native D-Bus on the user session bus through its existing
+epoll and timerfd loop. There is no notification subprocess, library, or thread.
+One outstanding request and one pending operation coalesce bursts; replies have
+a one-second timeout. Repeated identical problem/outcome pairs are suppressed
+within a recording.
 Each new recording resets suppression; ignored commands do not. The next error
-can replace the existing popup, and a successful recording closes it.
-Dismissal invalidates the held ID; notification
-server restarts reset IDs and redisplay an unresolved problem. Replacement and
-closure address the original server's unique bus name, preventing ID reuse races.
+can replace the existing popup, and a successful recording closes it. Dismissal
+invalidates the held ID; notification server restarts reset IDs and redisplay an
+unresolved problem. Replacement and closure address the original server's
+unique bus name, preventing ID reuse races.
 
 Clipboard/paste failure messages distinguish successful transcript saving from
-failed saving. Popup bodies never contain the transcript. Notification failures
-are logged and leave recording and output working. A missing or disconnected
-session bus disables notifications until voiced restarts; a notification server
-can appear or restart on a live bus without restarting voiced. Shutdown attempts
+failed saving. When copying fails but saving succeeds, the popup includes the
+saved `transcript.txt` path, shortened beneath the home directory with a `~/`
+prefix. Popup bodies never contain the transcript. Notification failures are
+logged and leave recording and output working. An invalid or unsupported
+session-bus address disables notifications until voiced restarts. An unavailable
+or disconnected endpoint is retried every five seconds; the first failure and a
+lost established connection are warnings, while repeated retry failures are
+debug records. A notification server can appear or restart on a live bus without
+restarting voiced. Shutdown attempts
 to close a known popup without waiting or flushing the bus. A timed-out Notify
 whose reply never arrives has no usable ID; its popup follows desktop expiration.
 
 ## Recording metrics
 
-`recording_ordinal` counts accepted recordings within one service lifetime;
-`chunk_ordinal` counts their chunks from zero. Failure and cancellation consume
-an ordinal. Restarting the service resets the recording sequence. Journal PID
-and invocation metadata distinguish service lifetimes.
+`recording_id` counts accepted recordings within one service lifetime; `chunk_id`
+counts their chunks from zero. Failure and cancellation consume an ID. Restarting
+the service resets the sequence. Journal PID and invocation metadata distinguish
+service lifetimes.
 
-`Recording requested` marks acceptance before worker startup. `Capture started`
-marks the supervisor's first observation of a PipeWire callback. That observation
-waits for an event-loop wake-up; it is not the exact first-sample timestamp. `Transcription
-complete` precedes clipboard acquisition, paste, and saving. `Paste shortcut sent`
-confirms keyboard event submission; it cannot confirm application insertion.
-`Desktop notification accepted` confirms the server accepted the request.
+At `info`, each recording that reaches an orderly lifecycle result emits one
+terminal `recording_finished` record. A critical supervisor or worker deadline
+can exit the daemon before that result exists. Clean
+delivery, ordinary no-speech, and cancellation are `info`; a usable degraded or
+partial result is `warning`; a recording with no usable result is `error`.
+`problem_component` and `problem_code` appear only when a problem affected the
+result. Clipboard, paste, and save outcomes appear when desktop delivery was
+attempted. For example:
+
+```text
+recording_finished recording_id=21 outcome=delivered transcription_audio_duration_seconds=8.412 transcription_compute_duration_ms=311.240 transcription_chunks_count=1 transcript_size=126 transcription_compute_speed_ratio=27.02 stop_origin=command recording_finalize_duration_ms=344.112 clipboard_outcome=succeeded paste_outcome=succeeded save_outcome=succeeded
+recording_finished recording_id=22 outcome=failed transcription_audio_duration_seconds=0.000 transcription_compute_duration_ms=0.000 transcription_chunks_count=0 transcript_size=0 stop_origin=command recording_finalize_duration_ms=1001.337 problem_component=capture problem_code=start_timed_out
+```
+
+At `debug`, component events expose phase boundaries and performance evidence:
+
+```text
+recording_started recording_id=21
+capture_started recording_id=21 capture_start_duration_ms=84.192
+capture_finished recording_id=21 outcome=stopped audio_duration_seconds=8.412 ...
+transcription_chunk_finished recording_id=21 chunk_id=0 audio_duration_seconds=8.412 ...
+clipboard_ready clipboard_backend=wayland clipboard_mode=core
+clipboard_acquired recording_id=21 transcript_size=126 ...
+paste_sent recording_id=21 paste_duration_ms=22.268 ...
+transcript_saved recording_id=21 transcript_size=126 transcript_save_duration_ms=0.107
+```
+
+Component warnings and errors retain the local typed evidence under the same
+recording ID. A failed capture promotes its complete final report from debug to
+error. Decoder and chunk limits are warnings when bounded text remains usable;
+hard transcription errors remain errors. Components do not carry debug text through a worker mailbox: coordinators
+log their own debug facts, while hot audio callbacks and inference kernels never
+log. The supervisor consumes typed reports and owns the terminal result.
 
 Field names put the subject before the measurement. Time values use fixed units
 in their names; byte quantities use `size` without another byte suffix:
@@ -642,20 +722,20 @@ in their names; byte quantities use `size` without another byte suffix:
 |---|---|
 | `audio_duration_seconds` | Actual audio duration, excluding encoder silence padding |
 | `audio_samples_count` | Samples in this chunk |
+| `transcription_audio_duration_seconds` | Audio consumed by completed transcription chunks |
 | `features_duration_ms` | Measured feature extraction work |
 | `inference_duration_ms` | Measured encoder, cross-KV, and decoder work |
 | `transcription_compute_duration_ms` | Sum of feature and inference work for consumed results |
 | `transcription_compute_speed_ratio` | Audio duration divided by measured computation duration; 12.5 means 12.5 times realtime |
 | `transcript_size` | UTF-8 bytes: raw chunk text, or accumulated trimmed text at completion/delivery |
-| `tokens_count`, `tokens_count_max` | Generated token count and its inclusive maximum |
+| `transcription_tokens_count`, `transcription_tokens_count_max` | Generated token count and its inclusive maximum |
 
 Recording computation totals include consumed no-speech chunks. They exclude
-model preparation, queueing, failed attempts, text assembly, and desktop delivery;
-they are not end-to-end latency.
-Capture-end audio duration covers all captured samples, which can exceed the
-processed prefix after a failure. A speed with zero audio or computation
-duration is `unavailable`. Discarded
-recordings have `transcript_size=0`. Transcript contents are never diagnostics.
+model preparation, queueing, failed attempts, text assembly, and desktop
+delivery; they are not end-to-end latency. Capture-end audio duration covers all
+captured samples, which can exceed the processed prefix after a failure. A speed
+with zero audio or computation duration is `unavailable`. Discarded recordings
+have `transcript_size=0`. Transcript contents are never diagnostics.
 
 Durations measure one named operation; elapsed fields measure from a named
 reference event. There is no duration relative to the previous log line.
@@ -669,17 +749,18 @@ reference event. There is no duration relative to the previous log line.
 | `clipboard_acquire_duration_ms` | Desktop delivery begins → supervisor observes clipboard acquisition |
 | `paste_duration_ms` | Clipboard acquisition observed → shortcut submission complete, including settle/key waits |
 | `transcript_save_duration_ms` | Save begins → atomic publication finishes, or save returns an error |
-| `recording_stop_elapsed_ms` | Stop reference → this milestone |
+| `recording_finalize_duration_ms` | Stop reference → this milestone |
 
-Cache lookup, publication, remapping, vocabulary loading and runtime initialization
-have additional duration fields at `debug`. Main lifecycle, chunk and completion
-measurements remain at `info`. Synchronous operations use local timestamps; the
-supervisor retains only the recording request timestamp and one delivery boundary,
-reused after clipboard acquisition. No callback or per-token timers were added.
+Cache lookup, publication, remapping, vocabulary loading and runtime
+initialization have additional duration fields at `debug`. Lifecycle and chunk
+measurements are debug details; only the terminal recording summary remains at
+`info`. Synchronous operations use local timestamps; the supervisor retains only
+the recording request timestamp and one delivery boundary, reused after
+clipboard acquisition. No callback or per-token timers were added.
 
-With `recording_stop_origin=command`, the stop reference is the supervisor
+With `stop_origin=command`, the stop reference is the supervisor
 receiving the accepted stop/toggle command. Repeated stops do not reset it.
-With `recording_stop_origin=capture_end`, it is the supervisor observing the
+With `stop_origin=capture_end`, it is the supervisor observing the
 capture thread's final report; work before that observation is outside the elapsed
 measurement.
 Without either reference, origin and elapsed are `unavailable`. These timings
@@ -688,8 +769,8 @@ Each new recording resets the reference.
 
 Requested cancellation is `info`. Service errors retain their typed diagnostics
 at `error`; a missed cancellation or unload deadline is `critical` and exits the
-daemon. Thread crashes follow the configured panic/core-dump behavior. No-speech evidence is
-included in the chunk event instead of a duplicate rejection event.
+daemon. Thread crashes follow the configured panic/core-dump behavior. No-speech
+evidence is included in the chunk event instead of a duplicate rejection event.
 
 Expected startup refusals such as an already running instance are `error`.
 Unrecoverable supervisor operation errors are `critical`. Operational event-loop
@@ -707,8 +788,8 @@ validated, non-finite samples rejected, and finite overdrive clamped before
 publication into three shared slots. Mixing reads borrowed planar graph buffers,
 including wrapped spans, and the resampler writes directly into an unpublished
 slot suffix. A failed conversion leaves the committed prefix unchanged. Audio
-processing performs no allocation,
-logging, model work, or blocking I/O. Inference borrows each sealed slot without
+processing performs no allocation, logging, model work, or blocking I/O.
+Inference borrows each sealed slot without
 quantization or a second waveform allocation. The fixed PCM exchange occupies
 about 5.49 MiB.
 
@@ -716,11 +797,12 @@ about 5.49 MiB.
 `pipewire_native.zig` owns discovery, source identity, graph mappings and DSP
 cycles. The 128-entry catalog stores kind-specific fields and string references;
 a reusable 64 KiB string pool covers every entry at its maximum string lengths.
-Protocol queues reserve 64 KiB input and 32 KiB output. `pipewire.zig` owns recording policy and shared-slot publication through
-one worker poll loop. `audio_resampler.zig` retains the conversion phase and
-filter history. `realtime.zig` requests realtime scheduling directly, falling
-back to RTKit over native D-Bus with a 500 ms deadline. Scheduling and memory
-locking remain best effort and their actual results are reported.
+Protocol queues reserve 64 KiB input and 32 KiB output. `pipewire.zig` owns
+recording policy and shared-slot publication through one worker poll loop.
+`audio_resampler.zig` retains the conversion phase and filter history.
+`realtime.zig` requests realtime scheduling directly, falling back to RTKit over
+native D-Bus with a 500 ms deadline. Scheduling and memory locking remain best
+effort and their actual results are reported.
 
 The compatibility floor is PipeWire 0.3.48 (ClientNode version 4). Tests use
 private 0.3.48, 1.0.5 and 1.6.8 servers. Newer servers negotiate ClientNode
@@ -739,15 +821,18 @@ path is accepted. These environment values are resolved once at service startup.
 
 Chunks are independent, without PCM overlap or previous-text prompting.
 Outside capacity-stop cases, activity and model confidence suppress normal
-no-speech results; disagreement is an explicit failure.
+no-speech results. A disagreement stops the recording and rejects the disputed
+chunk. Voiced retains any earlier accepted chunks as a partial transcript with
+a warning, or produces no output when no accepted prefix exists.
 
 Each transcript buffer is sized once at 64 UTF-8 bytes per configured recording
 second plus one full 4 KiB mailbox result. The one-hour default reserves about
 229 KiB per buffer: one for stdout, two (about 458 KiB) for clipboard/desktop.
-Unused payload pages are not eagerly initialized. Reaching this bound, the 4 KiB chunk-text bound, or the decoder's
-446-token bound stops further recording/transcription and delivers the available
-text. The final prefix ends at a complete UTF-8 character; words or sentences may
-be incomplete. Desktop mode copies, sends the paste shortcut, then saves;
+Unused payload pages are not eagerly initialized. Reaching this bound, the 4 KiB
+chunk-text bound, or the decoder's 446-token bound stops further
+recording/transcription and delivers the available text. The final prefix ends
+at a complete UTF-8 character; words or sentences may be incomplete. Desktop
+mode copies, sends the paste shortcut, then saves;
 clipboard mode copies and saves. Publication, transfers and saving borrow the
 same completed buffer; no buffer grows or is allocated per recording.
 
@@ -756,9 +841,10 @@ limits. Decoder-limit text is retained even when confidence is low: it may repea
 or contain inaccuracies, so the notification asks you to check it. Both chunk
 limits are reported if reached together. Chunk/token limits still attempt the
 `last-failed/` diagnostic capture before returning the prefix. A fatal restart
-during inference or diagnostic saving can lose the current recording. Explicit cancellation suppresses pending output
-and preserves the previous saved transcript. Start a new recording to continue;
-unprocessed audio after the cutoff is not resumed automatically.
+during inference or diagnostic saving can lose the current recording. Explicit
+cancellation suppresses pending output and preserves the previous saved
+transcript. Start a new recording to continue; unprocessed audio after the
+cutoff is not resumed automatically.
 
 The supervisor requires the first callback within three seconds and progress
 at least every two seconds. Each inference has a ten-second deadline; model
@@ -775,11 +861,11 @@ publishes a packed image under `$XDG_CACHE_HOME/voiced/models/`. Cache identity
 includes the model, pristine checksum, packing revision, and image format.
 Cache envelope version 2 uses BLAKE3-256 for both the pinned source identity and
 the cached payload. Older cache entries are ignored and rebuilt from verified
-installed weights; existing model downloads remain usable. Private permissions, a builder lock,
-atomic replacement, and file/directory synchronization prevent partial cache
-publication. Unavailable caches fall back to verified pristine conversion;
-invalid pristine data fails explicitly. Preparation cancellation is checked
-between loading stages and while waiting for the builder lock.
+installed weights; existing model downloads remain usable. Private permissions,
+a builder lock, atomic replacement, and file/directory synchronization prevent
+partial cache publication. Unavailable caches fall back to verified pristine
+conversion; invalid pristine data fails explicitly. Preparation cancellation is
+checked between loading stages and while waiting for the builder lock.
 
 The caller supplies an address-stable runtime and its tensor arena:
 
@@ -798,7 +884,7 @@ mailboxes and audio/transcript buffers are reused. Zig 0.16.0 uses its debug
 allocator in libc-free ReleaseSafe builds, so freed small allocations can
 retain bucket pages between reloads without retaining a loaded model.
 
-[The runtime guide](runtime/README.md) explains the native Whisper implementation.
+[The inference guide](inference/README.md) explains the native Whisper implementation.
 
 The process-level integration harness was removed. Its control, logging,
 notification, capture, delivery, recovery, and cancellation scenarios remain in

@@ -239,9 +239,9 @@ def model_check(root, env):
                 processes.append(subprocess.Popen(args, env=dict(env, **extra), stdout=log, stderr=log))
             time.sleep(0.6)
         with journal_log(log_path) as log:
-            service = subprocess.Popen([str(BINARY), 'serve', '--transcript-output', 'clipboard', '--notification-mode', 'off', '--model', 'Systran/faster-whisper-base.en', '--model-encoder-threads', '8', '--model-decoder-threads', '2', '--microphone-node', 'voiced-test-source'], env=env, stdout=subprocess.DEVNULL, stderr=log)
+            service = subprocess.Popen([str(BINARY), 'serve', '--log-level', 'debug', '--transcript-output', 'clipboard', '--notification-mode', 'off', '--model', 'Systran/faster-whisper-base.en', '--model-encoder-threads', '8', '--model-decoder-threads', '2', '--microphone-node', 'voiced-test-source'], env=env, stdout=subprocess.DEVNULL, stderr=log)
         processes.append(service)
-        wait_for(lambda: 'Supervisor service ready' in log_path.read_text())
+        wait_for(lambda: 'service_started' in log_path.read_text())
         wait_for(lambda: capture_tid() is not None)
         pid = capture_tid()
         idle_descriptors = len(list(Path(f'/proc/{service.pid}/fd').iterdir()))
@@ -256,7 +256,7 @@ def model_check(root, env):
                 saved.rename(previous)
                 saved.mkdir()
             cli('record')
-            wait_for(lambda: f'Capture started: recording_ordinal={ordinal},' in log_path.read_text())
+            wait_for(lambda: f'capture_started recording_id={ordinal} ' in log_path.read_text())
             playback = subprocess.Popen(['pw-cat', '--playback', '--target', '0', '--properties', 'node.name=voiced-fixture-playback', str(REPO / 'test-fixtures/hello_world.wav')], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             processes.append(playback)
             ports = []
@@ -271,18 +271,18 @@ def model_check(root, env):
             cli('stop')
             # Observe completion without waking the supervisor with status
             # requests: ready clipboard work must advance on its own.
-            event = 'Transcript save error' if ordinal == 3 else 'Transcript saved'
-            wait_for(lambda: f'{event}: recording_ordinal={ordinal},' in log_path.read_text())
+            event = 'transcript_save_failed' if ordinal == 3 else 'recording_finished'
+            wait_for(lambda: f'{event} recording_id={ordinal} ' in log_path.read_text())
             assert 'phase=idle' in cli('status')
             assert capture_tid() == pid
             text = server.text()
             assert 'hello' in text.lower(), text
             if ordinal == 3:
-                wait_for(lambda: any(row['MESSAGE'].startswith('Transcript save error:') for row in log.records))
-                failure = next(row for row in log.records if row['MESSAGE'].startswith('Transcript save error:'))
-                assert failure['PRIORITY'] == '3' and failure['VOICED_RECORDING_ORDINAL'] == '3', failure
+                wait_for(lambda: any(row.get('VOICED_EVENT') == 'transcript_save_failed' for row in log.records))
+                failure = next(row for row in log.records if row.get('VOICED_EVENT') == 'transcript_save_failed')
+                assert failure['PRIORITY'] == '3' and failure['VOICED_COMPONENT'] == 'storage' and failure['VOICED_RECORDING_ID'] == '3', failure
                 assert f'directory_path="{saved.parent}"' in failure['MESSAGE'], failure
-                for field in ('file_name="transcript.txt"', 'operation="replace"', 'error="IsDir"', 'transcript_save_duration_ms='):
+                for field in ('file_name="transcript.txt"', 'problem_code=replace', 'error="IsDir"', 'transcript_save_duration_ms='):
                     assert field in failure['MESSAGE'], failure
                 assert 'cleanup_error=' not in failure['MESSAGE'], failure
                 assert {entry.name for entry in saved.parent.iterdir()} == {'transcript.txt', 'previous-transcript.txt'}
@@ -299,17 +299,19 @@ def model_check(root, env):
                 # The next delivery reconstructs Client in the same union
                 # storage after a real disconnect, not fresh process memory.
                 server.close()
-                wait_for(lambda: any(row['MESSAGE'].startswith('Clipboard error:') for row in log.records))
-                failure = next(row for row in log.records if row['MESSAGE'].startswith('Clipboard error:'))
-                for field in ('kind="transport"', 'error="', 'errno=', 'object=', 'opcode='):
+                wait_for(lambda: any(row.get('VOICED_EVENT') == 'clipboard_failed' for row in log.records))
+                failure = next(row for row in log.records if row.get('VOICED_EVENT') == 'clipboard_failed')
+                assert failure['VOICED_COMPONENT'] == 'clipboard' and failure['VOICED_RECORDING_ID'] == '1', failure
+                for field in ('kind="transport"', 'error="', 'system_error=', 'object=', 'opcode='):
                     assert field in failure['MESSAGE'], failure
                 (root / 'wayland-test').unlink()
                 server = Compositor(root)
         assert server.text() == text
         cli('record')
-        wait_for(lambda: 'Capture started: recording_ordinal=5,' in log_path.read_text())
+        wait_for(lambda: 'capture_started recording_id=5 ' in log_path.read_text())
         cli('cancel')
-        wait_for(lambda: 'phase=idle' in cli('status'))
+        wait_for(lambda: 'recording_finished recording_id=5 outcome=cancelled' in log_path.read_text())
+        assert 'phase=idle' in cli('status')
         assert saved.read_text() == text
         cli('kill')
         assert service.wait(timeout=4) == 0

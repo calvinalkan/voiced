@@ -36,6 +36,7 @@ const U8x8 = @Vector(simd_lanes_count, u8);
 
 comptime {
     @setEvalBranchQuota(10_000);
+    assert(bytes_per_weight_group == depth_values_per_group * output_rows_per_block);
 }
 
 pub const Activation = enum {
@@ -428,6 +429,7 @@ inline fn projectOutputBlocksWithLayout(comptime rows_count: usize, comptime out
 // of duplicating the depth loop for each finishing mode.
 noinline fn calculateProjectionAccumulators(comptime rows_count: usize, comptime output_blocks_count: usize, quantized_rows: []const u8, weight: QuantizedWeight, output_block_begin: usize) [rows_count][output_blocks_count]I32x8 {
     const weight_layout = @call(.always_inline, QuantizedWeight.layout, .{weight});
+    const packed_block_values_count = weight_layout.outputBlockSize();
     var accumulators: [rows_count][output_blocks_count]I32x8 = undefined;
     inline for (0..output_blocks_count) |block_offset| {
         const output_begin = (output_block_begin + block_offset) * output_rows_per_block;
@@ -437,35 +439,64 @@ noinline fn calculateProjectionAccumulators(comptime rows_count: usize, comptime
         }
     }
 
-    var depth_begin: usize = 0;
-    while (depth_begin < weight.input_values_count) : (depth_begin += depth_values_per_group) {
+    // PERFORMANCE: ReleaseSafe disables generated safety only for this k4
+    // depth loop and spells out the packed group offset directly. Generated
+    // bounds and overflow checks would run for every activation and weight
+    // load. Deriving each group through the checked scalar layout mapping would
+    // also inline row and input bounds assertions beside every VNNI update.
+    // These checks multiply across the encoder, cross-K/V, and decoder
+    // projections, especially for the wider and deeper small.en model.
+    //
+    // All facts needed by the unchecked loop remain checked before entry.
+    // `projectOutputBlocksWithLayout` validates the active-row storage and the
+    // complete output-block range. `weight.layout()` validates positive o8/k4
+    // dimensions, exact packed storage, and compensation storage. Compensation
+    // loads and `packed_block_values_count` are also evaluated outside this
+    // block.
+    //
+    // The loop starts at depth zero and advances by four through an input depth
+    // divisible by four. One k4 group stores four depths for eight output rows,
+    // so `(depth_begin / 4) * 32` equals `depth_begin * 8`. At the largest valid
+    // block and depth, `packed_offset + 32 == weight.values.len`; for the last
+    // active row, its activation offset plus four is at most
+    // `rows_count * weight.input_values_count <= quantized_rows.len`. The
+    // compile-time group-shape assertion above protects this simplification.
+    //
+    // Debug retains generated arithmetic and slice checks in this block. Keep
+    // the exception within this loop; a new caller or packed-layout change must
+    // preserve the entry checks and both end-bound proofs.
+    {
+        @setRuntimeSafety(builtin.mode == .Debug);
+        var depth_begin: usize = 0;
+        while (depth_begin < weight.input_values_count) : (depth_begin += depth_values_per_group) {
 
-        // PERFORMANCE: One-row tiles let LLVM fold the weight load into VNNI,
-        // rather than spending a separate instruction and YMM register on it.
-        // Fourteen output accumulators hide dot-product latency. Multi-row tiles
-        // instead pin each weight in a register and reuse it across rows;
-        // folding those loads would reread a weight for every activation row.
-        if (rows_count == 1) {
-            const activation_bytes = quantized_rows[depth_begin..][0..depth_values_per_group].*;
-            const activations: I32x8 = @splat(@as(i32, @bitCast(activation_bytes)));
-            inline for (0..output_blocks_count) |block_offset| {
-                const packed_block_index = output_block_begin + block_offset;
-                const packed_offset = @call(.always_inline, vnni_weight.Layout.groupOffset, .{ weight_layout, packed_block_index, depth_begin });
-                const weights = weight.values[packed_offset..][0..bytes_per_weight_group];
-                accumulators[0][block_offset] = dotUnsignedSignedBytesFromMemory(accumulators[0][block_offset], activations, weights);
-            }
-        } else {
-            var weights: [output_blocks_count]I8x32 = undefined;
-            inline for (0..output_blocks_count) |block_offset| {
-                const packed_block_index = output_block_begin + block_offset;
-                const packed_offset = @call(.always_inline, vnni_weight.Layout.groupOffset, .{ weight_layout, packed_block_index, depth_begin });
-                weights[block_offset] = weight.values[packed_offset..][0..bytes_per_weight_group].*;
-            }
-            inline for (0..rows_count) |tile_row| {
-                const activation_bytes = quantized_rows[tile_row * weight.input_values_count + depth_begin ..][0..depth_values_per_group].*;
+            // PERFORMANCE: One-row tiles let LLVM fold the weight load into VNNI,
+            // rather than spending a separate instruction and YMM register on it.
+            // Fourteen output accumulators hide dot-product latency. Multi-row tiles
+            // instead pin each weight in a register and reuse it across rows;
+            // folding those loads would reread a weight for every activation row.
+            if (rows_count == 1) {
+                const activation_bytes = quantized_rows[depth_begin..][0..depth_values_per_group].*;
                 const activations: I32x8 = @splat(@as(i32, @bitCast(activation_bytes)));
                 inline for (0..output_blocks_count) |block_offset| {
-                    accumulators[tile_row][block_offset] = dotUnsignedSignedBytes(accumulators[tile_row][block_offset], activations, weights[block_offset]);
+                    const packed_block_index = output_block_begin + block_offset;
+                    const packed_offset = packed_block_index * packed_block_values_count + depth_begin * output_rows_per_block;
+                    const weights = weight.values[packed_offset..][0..bytes_per_weight_group];
+                    accumulators[0][block_offset] = dotUnsignedSignedBytesFromMemory(accumulators[0][block_offset], activations, weights);
+                }
+            } else {
+                var weights: [output_blocks_count]I8x32 = undefined;
+                inline for (0..output_blocks_count) |block_offset| {
+                    const packed_block_index = output_block_begin + block_offset;
+                    const packed_offset = packed_block_index * packed_block_values_count + depth_begin * output_rows_per_block;
+                    weights[block_offset] = weight.values[packed_offset..][0..bytes_per_weight_group].*;
+                }
+                inline for (0..rows_count) |tile_row| {
+                    const activation_bytes = quantized_rows[tile_row * weight.input_values_count + depth_begin ..][0..depth_values_per_group].*;
+                    const activations: I32x8 = @splat(@as(i32, @bitCast(activation_bytes)));
+                    inline for (0..output_blocks_count) |block_offset| {
+                        accumulators[tile_row][block_offset] = dotUnsignedSignedBytes(accumulators[tile_row][block_offset], activations, weights[block_offset]);
+                    }
                 }
             }
         }

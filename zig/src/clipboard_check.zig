@@ -57,7 +57,7 @@ pub fn main(init: std.process.Init) !void {
     if (with_paste) keyboard = switch (paste.Keyboard.open(now())) {
         .ok => |k| k,
         .err => |err| {
-            logging.scoped(.clipboard).err(.{}, "Paste setup error: detail={any}", .{err});
+            logging.scoped(.clipboard).err(.{}, .paste_setup_failed, "detail={any}", .{err});
             return error.Keyboard;
         },
     };
@@ -79,7 +79,7 @@ pub fn main(init: std.process.Init) !void {
                     emit("{{\"event\":\"pasted\"}}\n", .{});
                 },
                 .err => |err| {
-                    logging.scoped(.clipboard).err(.{}, "Paste error: detail={any}", .{err});
+                    logging.scoped(.clipboard).err(.{}, .paste_failed, "detail={any}", .{err});
                     return error.Keyboard;
                 },
             }
@@ -123,11 +123,11 @@ fn now() u64 {
 fn reportError(err: clipboard.Error) void {
     switch (err) {
         .wayland => |detail| switch (detail) {
-            .server => |server| logging.scoped(.clipboard).err(.{}, "Wayland error: object={d}, code={d}, message={s}, truncated={}", .{ server.object, server.code, server.message[0..server.message_size], server.truncated }),
-            else => logging.scoped(.clipboard).err(.{}, "Wayland clipboard error: detail={any}", .{detail}),
+            .server => |server| logging.scoped(.clipboard).err(.{}, .wayland_protocol_failed, "object={d} code={d} message=\"{f}\" truncated={}", .{ server.object, server.code, std.zig.fmtString(server.message[0..server.message_size]), server.truncated }),
+            else => logging.scoped(.clipboard).err(.{}, .wayland_clipboard_failed, "detail={any}", .{detail}),
         },
-        .x11 => |detail| logging.scoped(.clipboard).err(.{}, "X11 clipboard error: detail={any}", .{detail}),
-        else => logging.scoped(.clipboard).err(.{}, "Native clipboard error: detail={any}", .{err}),
+        .x11 => |detail| logging.scoped(.clipboard).err(.{}, .x11_clipboard_failed, "detail={any}", .{detail}),
+        else => logging.scoped(.clipboard).err(.{}, .clipboard_failed, "detail={any}", .{err}),
     }
     const kind = switch (err) {
         .wayland => |detail| @tagName(std.meta.activeTag(detail)),

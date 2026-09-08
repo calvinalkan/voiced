@@ -6,7 +6,7 @@ application using native Wayland or X11 clipboard support and a persistent uinpu
 
 The daemon, CLI, and worker threads are built from [`zig/`](zig/README.md). That
 README covers dependencies, model setup, configuration, commands, logging, and
-saved transcripts. The [runtime guide](zig/runtime/README.md) explains inference
+saved transcripts. The [inference guide](zig/inference/README.md) explains inference
 and memory ownership.
 
 From the repository root, with Zig 0.16.0 and the native dependencies installed:

@@ -1,6 +1,6 @@
 const std = @import("std");
 const logging = @import("logging.zig");
-const log = logging.scoped(.notifications);
+const log = logging.scoped(.notification);
 const linux = std.os.linux;
 const dbus = @import("dbus.zig");
 
@@ -27,7 +27,6 @@ pub const Problem = enum {
     transcript_directory_unsafe,
 
     microphone_failed,
-    recording_incomplete,
     transcription_failed,
     recording_timed_out,
     speech_unrecognized,
@@ -40,7 +39,43 @@ pub const Problem = enum {
     transcript_save_failed,
 };
 
-pub const Output = enum { unchanged, saved, unsaved, clipboard_saved, clipboard_unsaved, partial_saved, partial_unsaved };
+pub const TranscriptDirectory = union(enum) {
+    absolute: []const u8,
+    home_relative: []const u8,
+};
+
+pub fn transcriptDirectory(directory: []const u8, home_value: ?[]const u8) TranscriptDirectory {
+    const home_text = home_value orelse {
+        return .{ .absolute = directory };
+    };
+    if (home_text.len == 0) {
+        return .{ .absolute = directory };
+    }
+    const home = std.mem.trimEnd(u8, home_text, "/");
+    if (home.len == 0) {
+        if (directory.len > 0 and directory[0] == '/') {
+            return .{ .home_relative = directory[1..] };
+        }
+        return .{ .absolute = directory };
+    }
+    if (std.mem.eql(u8, directory, home)) {
+        return .{ .home_relative = "" };
+    }
+    if (directory.len > home.len and directory[home.len] == '/' and std.mem.startsWith(u8, directory, home)) {
+        return .{ .home_relative = directory[home.len + 1 ..] };
+    }
+    return .{ .absolute = directory };
+}
+
+pub const Output = union(enum) {
+    unchanged,
+    saved: TranscriptDirectory,
+    unsaved,
+    clipboard_saved,
+    clipboard_unsaved,
+    partial_saved,
+    partial_unsaved,
+};
 const Message = struct { problem: Problem, output: Output };
 
 /// One connection, one outstanding request, and one coalesced operation. All
@@ -56,6 +91,7 @@ pub const Client = struct {
     notification: ?struct { id: u32, owner: Name } = null,
     serial: u32 = 0,
     events: u32 = 0,
+    transport_problem_reported: bool = false,
     operation_deadline_ns: u64 = std.math.maxInt(u64),
     deadline_monotonic_ns: u64 = std.math.maxInt(u64),
 
@@ -66,11 +102,11 @@ pub const Client = struct {
     /// address falls back to XDG_RUNTIME_DIR/bus; no shell or autolaunch helper.
     pub fn init(self: *Client, epoll_fd: std.posix.fd_t, tag: u64, bus_address: ?[]const u8, runtime_directory: ?[]const u8) void {
         self.configure(bus_address, runtime_directory) catch |err| {
-            log.warn(.{}, "Desktop notifications unavailable: error={s}", .{@errorName(err)});
+            log.warn(.{}, .notification_unavailable, "error={s}", .{@errorName(err)});
             return;
         };
         self.start(epoll_fd, tag) catch |err| {
-            self.disconnected(epoll_fd, err, true);
+            self.disconnected(epoll_fd, err);
         };
     }
 
@@ -80,7 +116,9 @@ pub const Client = struct {
 
     pub fn showOutput(self: *Client, problem: Problem, output: Output) void {
         const message: Message = .{ .problem = problem, .output = output };
-        if (self.phase == .disabled or (self.last_problem != null and std.meta.eql(self.last_problem.?, message))) return;
+        if (self.phase == .disabled or (self.last_problem != null and self.last_problem.?.problem == problem and std.meta.activeTag(self.last_problem.?.output) == std.meta.activeTag(output))) {
+            return;
+        }
         self.last_problem = message;
         self.pending = .{ .show = message };
     }
@@ -98,7 +136,7 @@ pub const Client = struct {
 
     pub fn advance(self: *Client, epoll_fd: std.posix.fd_t, tag: u64) void {
         if (self.phase == .disabled) return;
-        self.process(epoll_fd, tag) catch |err| self.disconnected(epoll_fd, err, false);
+        self.process(epoll_fd, tag) catch |err| self.disconnected(epoll_fd, err);
     }
 
     pub fn deinit(self: *Client, epoll_fd: std.posix.fd_t) void {
@@ -117,7 +155,7 @@ pub const Client = struct {
         // the connection leaves its buffers untouched. Buffer contents become
         // valid only as counts advance; optional payloads stay unreadable while null.
         // Measured 2026-09-07 with stock Zig 0.16.0/LLVM, host x86-64, ReleaseSafe
-        // application/inference, static PIE, -Dcrash-diagnostics=false and GNU
+        // application/inference, static PIE, crash diagnostics disabled and GNU
         // strip --strip-all: 22,624 bytes saved, including reduced generated code.
         // This preserves buffer capacities and adds no allocation. The combined
         // initializer prototype passed private capture, inference, notification
@@ -186,7 +224,7 @@ pub const Client = struct {
             if (self.phase != .ready) return error.AuthenticationOrSetupTimedOut;
             if (self.connection.output_size != 0) return error.NotificationWriteTimedOut;
             const request = self.request orelse return error.InvalidDeadline;
-            log.warn(.{}, "Desktop notification failed: operation={t}, name=\"org.freedesktop.DBus.Error.NoReply\", message=\"Reply deadline exceeded\", serial={d}", .{ std.meta.activeTag(request.operation.?), request.serial });
+            log.warn(.{}, .notification_request_timed_out, "operation={t} bus_error=\"org.freedesktop.DBus.Error.NoReply\" detail=\"reply deadline exceeded\" serial={d}", .{ std.meta.activeTag(request.operation.?), request.serial });
             self.notification = null;
             self.request = null;
             self.operation_deadline_ns = std.math.maxInt(u64);
@@ -202,7 +240,8 @@ pub const Client = struct {
                 if (std.mem.indexOf(u8, bytes, "\r\n")) |end| {
                     const line = bytes[0..end];
                     if (line.len != 35 or !std.mem.startsWith(u8, line, "OK ")) {
-                        log.warn(.{}, "Desktop notification authentication rejected: response=\"{f}\"", .{std.zig.fmtString(line)});
+                        log.write(if (self.transport_problem_reported) .debug else .warn, .{}, .notification_authentication_rejected, "response=\"{f}\"", .{std.zig.fmtString(line)});
+                        self.transport_problem_reported = true;
                         return error.AuthenticationRejected;
                     }
                     for (line[3..]) |byte| if (!std.ascii.isHex(byte)) return error.InvalidAuthenticationReply;
@@ -268,8 +307,11 @@ pub const Client = struct {
                     try writer.string("voiced");
                     try writer.uint32(if (self.notification) |notification| notification.id else 0);
                     try writer.string("dialog-error");
-                    try writer.string(std.mem.span(text.title));
-                    try writer.string(std.mem.span(text.body));
+                    try writer.string(text.title);
+                    switch (text.body) {
+                        .plain => |body| try writer.string(body),
+                        .saved => |directory| try writeSavedBody(&writer, directory),
+                    }
                     try writer.uint32(0); // Empty actions array, element alignment 4.
                     try writer.uint32(0); // Empty hints array, element alignment 8.
                     try writer.alignTo(8);
@@ -308,7 +350,7 @@ pub const Client = struct {
                     self.pending = null;
                 }
                 if (next.len != 0 and self.last_problem != null and (self.request == null or self.request.?.invalidated)) self.pending = .{ .show = self.last_problem.? };
-                log.debug(.{}, "Desktop notification owner changed: previous=\"{f}\", next=\"{f}\"", .{ std.zig.fmtString(previous), std.zig.fmtString(next) });
+                log.debug(.{}, .notification_owner_changed, "owner_previous=\"{f}\" owner_next=\"{f}\"", .{ std.zig.fmtString(previous), std.zig.fmtString(next) });
             } else if (self.notification) |notification| {
                 if (!std.mem.eql(u8, message.sender, notification.owner.slice()) or !std.mem.eql(u8, message.path, path) or !std.mem.eql(u8, message.interface, destination) or !std.mem.eql(u8, message.member, "NotificationClosed")) return;
                 if (!std.mem.eql(u8, message.signature, "uu")) return error.InvalidClosedSignal;
@@ -317,7 +359,7 @@ pub const Client = struct {
                 try body.end();
                 if (id == notification.id) {
                     self.notification = null;
-                    log.debug(.{}, "Desktop notification closed: id={d}, reason={d}", .{ id, reason });
+                    log.debug(.{}, .notification_closed, "notification_id={d} reason={d}", .{ id, reason });
                 }
             }
             return;
@@ -336,7 +378,7 @@ pub const Client = struct {
         if (request.invalidated) return;
         if (message.kind == .err) {
             const detail = if (std.mem.startsWith(u8, message.signature, "s")) try body.string() else "";
-            log.warn(.{}, "Desktop notification failed: operation={s}, name=\"{f}\", message=\"{f}\", serial={d}", .{ if (request.operation) |op| @tagName(op) else @tagName(self.phase), std.zig.fmtString(message.error_name), std.zig.fmtString(detail), message.reply_serial });
+            log.warn(.{}, .notification_request_failed, "operation={s} bus_error=\"{f}\" detail=\"{f}\" serial={d}", .{ if (request.operation) |op| @tagName(op) else @tagName(self.phase), std.zig.fmtString(message.error_name), std.zig.fmtString(detail), message.reply_serial });
             self.notification = null;
             if (request.operation == null) return error.BusSetupRejected;
             return;
@@ -351,32 +393,43 @@ pub const Client = struct {
                 if (message.signature.len != 0) return error.InvalidMatchReply;
                 try body.end();
                 self.phase = if (self.phase == .match_closed) .match_owner else .ready;
-                if (self.phase == .ready) log.debug(.{}, "Desktop notification bus ready: transport=native", .{});
+                if (self.phase == .ready) {
+                    self.transport_problem_reported = false;
+                    log.debug(.{}, .notification_bus_ready, "transport=native", .{});
+                }
             },
             .ready => switch (request.operation.?) {
                 .show => |problem| {
                     const id = if (std.mem.eql(u8, message.signature, "u")) try body.uint32() else 0;
                     if (id == 0 or from_bus) {
                         self.notification = null;
-                        log.warn(.{}, "Desktop notification failed: invalid reply", .{});
+                        log.warn(.{}, .notification_reply_invalid, "", .{});
                         return;
                     }
                     try body.end();
                     self.notification = .{ .id = id, .owner = try Name.init(message.sender) };
-                    log.info(.{}, "Desktop notification accepted: problem={s}", .{@tagName(problem.problem)});
+                    log.debug(.{}, .notification_accepted, "problem={s}", .{@tagName(problem.problem)});
                 },
                 .close => {
                     if (message.signature.len != 0) return error.InvalidCloseReply;
                     try body.end();
-                    log.debug(.{}, "Desktop notification close accepted", .{});
+                    log.debug(.{}, .notification_close_accepted, "", .{});
                 },
             },
             else => return error.UnexpectedReply,
         }
     }
 
-    fn disconnected(self: *Client, epoll_fd: std.posix.fd_t, err: anyerror, initial: bool) void {
-        log.warn(.{}, "Desktop notifications {s}: error={s}, phase={t}, errno={f}({d}), retry_duration=5s", .{ if (initial) "unavailable" else "disconnected", @errorName(err), self.phase, logging.fmtErrno(self.connection.errno), @intFromEnum(self.connection.errno) });
+    fn disconnected(self: *Client, epoll_fd: std.posix.fd_t, err: anyerror) void {
+        const established = self.phase == .ready;
+        const repeated = self.transport_problem_reported and !established;
+        log.write(if (repeated) .debug else .warn, .{}, .notification_transport_failed, "outcome={s} error={s} phase={t} system_error={f} retry_duration_seconds=5", .{
+            if (established) "disconnected" else if (repeated) "retry_failed" else "unavailable",
+            @errorName(err),
+            self.phase,
+            logging.fmtErrno(self.connection.errno),
+        });
+        self.transport_problem_reported = true;
         self.close(epoll_fd);
         self.request = null;
         self.notification = null;
@@ -420,8 +473,11 @@ const Operation = union(enum) { show: Message, close };
 const destination = "org.freedesktop.Notifications";
 const path = "/org/freedesktop/Notifications";
 
-fn problemText(message: Message) struct { title: [*:0]const u8, body: [*:0]const u8 } {
-    const text: struct { title: [*:0]const u8, body: [*:0]const u8 } = switch (message.problem) {
+const Body = union(enum) { plain: []const u8, saved: TranscriptDirectory };
+
+fn problemText(message: Message) struct { title: []const u8, body: Body } {
+    const partial_text_delivered = message.output == .partial_saved or message.output == .partial_unsaved;
+    const text: struct { title: []const u8, body: []const u8 } = switch (message.problem) {
         .model_load_timed_out => .{ .title = "Voiced: model loading timed out", .body = "See service logs for the stalled operation." },
         .transcription_timed_out => .{ .title = "Voiced: transcription timed out", .body = "See service logs for the stalled operation." },
         .audio_start_timed_out => .{ .title = "Voiced: microphone startup timed out", .body = "No audio arrived. Check the mic and audio service." },
@@ -434,7 +490,10 @@ fn problemText(message: Message) struct { title: [*:0]const u8, body: [*:0]const
         .audio_processing_behind => .{ .title = "Voiced: audio processing fell behind", .body = "Recording stopped. See service logs." },
         .audio_setup_failed => .{ .title = "Voiced: audio setup failed", .body = "See service logs for the cause." },
         .model_load_failed => .{ .title = "Voiced: cannot load the model", .body = "See service logs for the model error." },
-        .speech_detection_conflict => .{ .title = "Voiced: speech detectors disagreed", .body = "No text was delivered. Try recording again." },
+        .speech_detection_conflict => if (partial_text_delivered)
+            .{ .title = "Voiced: uncertain ending omitted", .body = "Partial text was delivered. Check the ending." }
+        else
+            .{ .title = "Voiced: speech could not be confirmed", .body = "No text was delivered. Try recording again." },
         .paste_permission_denied => .{ .title = "Voiced: paste permission denied", .body = "Voiced cannot open /dev/uinput. Paste manually." },
         .paste_device_missing => .{ .title = "Voiced: paste device unavailable", .body = "/dev/uinput is missing. Paste manually." },
         .paste_incomplete => .{ .title = "Voiced: paste may be incomplete", .body = "Check the text before pasting again." },
@@ -443,7 +502,6 @@ fn problemText(message: Message) struct { title: [*:0]const u8, body: [*:0]const
         .transcript_directory_unsafe => .{ .title = "Voiced: transcript directory owner mismatch", .body = "Check its owner. See service logs." },
 
         .microphone_failed => .{ .title = "Voiced: microphone unavailable", .body = "See service logs for the audio error." },
-        .recording_incomplete => .{ .title = "Voiced: recording interrupted", .body = "Check the partial transcript." },
         .transcription_failed => .{ .title = "Voiced: transcription failed", .body = "Try again; see logs for details." },
         .recording_timed_out => .{ .title = "Voiced: recording timed out", .body = "The recording exceeded its processing deadline." },
         .speech_unrecognized => .{ .title = "Voiced: speech not recognized", .body = "Try recording again." },
@@ -456,18 +514,38 @@ fn problemText(message: Message) struct { title: [*:0]const u8, body: [*:0]const
         .transcript_save_failed => .{ .title = "Voiced: transcript save failed", .body = "See service logs for the storage error." },
     };
     return .{ .title = text.title, .body = switch (message.output) {
-        .unchanged => text.body,
-        .saved => "Text was saved to transcript.txt. See logs.",
-        .unsaved => "Copy and save failed. See service logs.",
-        .clipboard_saved => "Text copied and saved. Check before pasting.",
-        .clipboard_unsaved => "Text is on the clipboard; save failed. See logs.",
-        .partial_saved => switch (message.problem) {
+        .unchanged => .{ .plain = text.body },
+        .saved => |directory| .{ .saved = directory },
+        .unsaved => .{ .plain = "Copy and save failed. See service logs." },
+        .clipboard_saved => .{ .plain = "Text copied and saved. Check before pasting." },
+        .clipboard_unsaved => .{ .plain = "Text is on the clipboard; save failed. See logs." },
+        .partial_saved => .{ .plain = switch (message.problem) {
+            .speech_detection_conflict => "Partial text delivered and saved. Check the ending.",
             .transcript_token_limit, .transcript_chunk_and_token_limit => "Text delivered and saved. Check for repetition.",
             else => "Partial text delivered and saved. Check it.",
-        },
-        .partial_unsaved => switch (message.problem) {
+        } },
+        .partial_unsaved => .{ .plain = switch (message.problem) {
+            .speech_detection_conflict => "Partial text delivered; save failed. Check the ending and logs.",
             .transcript_token_limit, .transcript_chunk_and_token_limit => "Text delivered; save failed. Check for repetition.",
             else => "Partial text delivered; save failed. See logs.",
-        },
+        } },
     } };
 }
+
+fn pathSeparator(directory: []const u8) []const u8 {
+    return if (directory.len != 0 and directory[directory.len - 1] != '/') "/" else "";
+}
+
+fn writeSavedBody(writer: *dbus.Writer, directory: TranscriptDirectory) dbus.Error!void {
+    const display: struct { prefix: []const u8, directory: []const u8 } = switch (directory) {
+        .absolute => |value| .{ .prefix = "", .directory = value },
+        .home_relative => |value| .{ .prefix = "~/", .directory = value },
+    };
+    if (display.directory.len > saved_directory_size_max) {
+        try writer.string("Text was saved to transcript.txt. See logs.");
+        return;
+    }
+    try writer.stringParts(&.{ "Saved to ", display.prefix, display.directory, pathSeparator(display.directory), "transcript.txt." });
+}
+
+const saved_directory_size_max = 1024;

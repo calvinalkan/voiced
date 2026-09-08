@@ -198,11 +198,11 @@ pub const Keyboard = struct {
 
             const written = linux.write(self.fd, bytes.ptr, bytes.len);
             if (linux.errno(written) != .SUCCESS or written != bytes.len)
-                log.err(.{}, "Paste cleanup write: errno={f}, syscall_result={d}, expected_size={d}", .{ logging.fmtErrno(linux.errno(written)), written, bytes.len });
+                log.err(.{}, .paste_cleanup_write_failed, "system_error={f} syscall_result={d} write_size={d}", .{ logging.fmtErrno(linux.errno(written)), written, bytes.len });
         }
 
         const destroy_errno = linux.errno(linux.ioctl(self.fd, linux.IOCTL.IO('U', 2), 0)); // UI_DEV_DESTROY
-        if (destroy_errno != .SUCCESS) log.err(.{}, "Paste cleanup destroy: errno={f}", .{logging.fmtErrno(destroy_errno)});
+        if (destroy_errno != .SUCCESS) log.err(.{}, .paste_cleanup_destroy_failed, "system_error={f}", .{logging.fmtErrno(destroy_errno)});
         _ = linux.close(self.fd);
 
         self.* = undefined;

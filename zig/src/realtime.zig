@@ -5,17 +5,17 @@ const std = @import("std");
 const linux = std.os.linux;
 const dbus = @import("dbus.zig");
 const logging = @import("logging.zig");
-const log = logging.scoped(.audio);
+const log = logging.scoped(.capture);
 const destination = "org.freedesktop.RealtimeKit1";
 const path = "/org/freedesktop/RealtimeKit1";
 
-pub fn acquire(address: []const u8, control_fd: linux.fd_t) void {
+pub fn acquire(recording_id: u64, address: []const u8, control_fd: linux.fd_t) void {
     const params: linux.sched_param = .{ .priority = 20 };
     if (linux.errno(linux.sched_setscheduler(0, .{ .mode = .FIFO, .RESET_ON_FORK = true }, &params)) == .SUCCESS) return;
     var request: Request = .{ .deadline = now() + 500 * std.time.ns_per_ms, .control_fd = control_fd };
     defer request.connection.close();
     request.run(address) catch |err| {
-        log.warn(.{}, "Realtime scheduling unavailable: operation={s}, errno={f}, bus_error=\"{f}\", detail=\"{f}\"", .{ @errorName(err), logging.fmtErrno(request.connection.errno), std.zig.fmtString(request.error_name[0..request.error_name_size]), std.zig.fmtString(request.error_message[0..request.error_message_size]) });
+        log.warn(.{ .recording_id = recording_id }, .realtime_scheduling_unavailable, "operation={s} system_error={f} bus_error=\"{f}\" detail=\"{f}\"", .{ @errorName(err), logging.fmtErrno(request.connection.errno), std.zig.fmtString(request.error_name[0..request.error_name_size]), std.zig.fmtString(request.error_message[0..request.error_message_size]) });
     };
 }
 

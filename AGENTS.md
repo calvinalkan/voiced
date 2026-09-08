@@ -1,7 +1,7 @@
 # voiced
 
 Voiced is a native Zig dictation daemon for Linux Wayland and X11 desktops. The current usage and
-implementation documentation is in `zig/README.md` and `zig/runtime/README.md`.
+implementation documentation is in `zig/README.md` and `zig/inference/README.md`.
 The Python application has been removed; remaining Python code supports tests
 and offline reference comparisons.
 
@@ -30,7 +30,7 @@ From the repository root:
 
 ```bash
 agent-run 'cd zig && zig build -Doptimize=ReleaseSafe install replay'
-agent-run 'zig fmt --check zig/src zig/runtime zig/scripts/setup.zig zig/build.zig zig/build.zig.zon'
+agent-run 'zig fmt --check zig/src zig/inference zig/scripts/setup.zig zig/build.zig zig/build.zig.zon'
 ```
 
 Offline replay uses the optional reference environment documented in the native

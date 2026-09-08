@@ -33,8 +33,8 @@ pub const Format = struct {
     // Keep std's conversion and rounding: integer-only formatting would change
     // rounding boundaries and lose full-precision failed-transcription evidence.
     // Measured 2026-09-07 with stock Zig 0.16.0/LLVM, host x86-64, ReleaseSafe
-    // application and inference, static PIE, -Dcrash-diagnostics=false, and GNU
-    // strip --strip-all: this change alone reduced 1,161,416 to 1,153,000 bytes
+    // application and inference, static PIE, crash diagnostics disabled, and
+    // GNU strip --strip-all: this change alone reduced 1,161,416 to 1,153,000 bytes
     // (8,416 saved). The 5,216- and 5,472-byte full tables disappeared; .rodata
     // shrank 10,000 bytes while .text grew 1,904. Runtime cost was not benchmarked.
     // 8,092,160 byte-for-byte comparisons matched the full-table formatter:

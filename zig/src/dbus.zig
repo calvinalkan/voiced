@@ -282,6 +282,18 @@ pub const Writer = struct {
         try self.append(&.{0});
     }
 
+    pub fn stringParts(self: *Writer, parts: []const []const u8) Error!void {
+        var size: usize = 0;
+        for (parts) |part| {
+            size = std.math.add(usize, size, part.len) catch return error.BufferFull;
+        }
+        try self.uint32(std.math.cast(u32, size) orelse return error.BufferFull);
+        for (parts) |part| {
+            try self.append(part);
+        }
+        try self.append(&.{0});
+    }
+
     fn signature(self: *Writer, value: []const u8) Error!void {
         try self.append(&.{std.math.cast(u8, value.len) orelse return error.BufferFull});
         try self.append(value);

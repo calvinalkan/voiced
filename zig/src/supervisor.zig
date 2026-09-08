@@ -7,6 +7,11 @@ const std = @import("std");
 const decimal = @import("decimal.zig");
 const logging = @import("logging.zig");
 const log = logging.scoped(.supervisor);
+const capture_log = logging.scoped(.capture);
+const transcription_log = logging.scoped(.transcription);
+const clipboard_log = logging.scoped(.clipboard);
+const paste_log = logging.scoped(.paste);
+const storage_log = logging.scoped(.storage);
 const notifications = @import("notifications.zig");
 const transcript_file = @import("transcript_file.zig");
 const audio_exchange = @import("audio_exchange.zig");
@@ -67,27 +72,126 @@ const EventSource = enum(u64) {
 
 const FinishReason = union(enum) {
     audio_completed,
-    audio_stopped: ?notifications.Problem,
-    pipeline_full: notifications.Problem,
-    audio_failed_with_valid_prefix: notifications.Problem,
+    audio_stopped: ?Problem,
+    pipeline_full: Problem,
+    audio_failed_with_valid_prefix: Problem,
 };
 
-const TranscriptionRejection = struct {
-    samples_count: u32,
-    contains_activity: bool,
-    no_speech_probability: f32,
-    average_log_probability: f32,
+const CaptureProblem = enum {
+    source_not_found,
+    source_ambiguous,
+    source_connection_lost,
+    source_changed,
+    pipeline_full,
+    setup,
+    unexpected_format,
+    timeline_discontinuity,
+    stream_error,
+    stream_disconnected,
+    invalid_buffer,
+    corrupted_buffer,
+    start_timed_out,
+    stalled,
+};
+
+const TranscriptionProblem = enum {
+    model_load,
+    feature_extraction,
+    inference,
+    text_decode,
+    model_load_timed_out,
+    inference_timed_out,
+    transcript_recording_size_reached,
+    transcript_chunk_size_reached,
+    decoder_token_limit_reached,
+    transcript_chunk_size_and_decoder_token_limit_reached,
+    speech_detection_conflict,
+    speech_unrecognized,
+};
+
+const ClipboardProblem = enum {
+    wayland_transport,
+    wayland_server,
+    wayland_unsupported,
+    wayland_timed_out,
+    x11_transport,
+    x11_setup,
+    x11_server,
+    x11_authority,
+    x11_unsupported,
+    x11_timed_out,
+    unavailable,
+    busy,
+    invalid_text,
+    selection_lost,
+};
+
+const PasteProblem = enum {
+    permission_denied,
+    device_missing,
+    failed,
+    incomplete,
+};
+
+const DeliveryProblem = union(enum) {
+    clipboard: ClipboardProblem,
+    paste: PasteProblem,
+};
+
+const StorageProblem = enum {
+    state_directory_unavailable,
+    storage_full,
+    save_denied,
+    directory_unsafe,
+    save_failed,
+};
+
+const TranscriptSave = union(enum) {
+    saved: []const u8,
+    failed: StorageProblem,
+};
+
+const SupervisorProblem = enum {
+    recording_timed_out,
+};
+
+// Component boundaries consume and log their complete typed Error payloads.
+// Keep only the semantic decision needed by lifecycle, terminal logging, and
+// notifications here: retaining service Errors would make every SessionPhase
+// carry their large fixed diagnostic buffers.
+const Problem = union(enum) {
+    capture: CaptureProblem,
+    transcription: TranscriptionProblem,
+    clipboard: ClipboardProblem,
+    paste: PasteProblem,
+    storage: StorageProblem,
+    supervisor: SupervisorProblem,
+};
+
+const RecordingOutcome = enum {
+    delivered,
+    copied,
+    saved,
+    partial,
+    no_speech,
+    cancelled,
+    failed,
+};
+
+const OutputOutcome = enum { succeeded, failed, cancelled, not_attempted };
+
+const RecordingCompletion = struct {
+    outcome: RecordingOutcome,
+    problem: ?Problem = null,
+    clipboard: ?OutputOutcome = null,
+    paste: ?OutputOutcome = null,
+    save: ?OutputOutcome = null,
 };
 
 const AbortReason = union(enum) {
     service_signal,
     user_cancelled,
-    audio_failed: notifications.Problem,
-    transcription_failed: notifications.Problem,
-    deadline: enum { recording, model_load, transcription },
-    transcript_limit: enum { recording_size, chunk_size, decoder_tokens, chunk_size_and_decoder_tokens },
-    speech_detection_conflict: TranscriptionRejection,
-    speech_unrecognized: TranscriptionRejection,
+    problem: Problem,
 };
 
 const SessionPhase = union(enum) {
@@ -98,8 +202,8 @@ const SessionPhase = union(enum) {
         // One boundary reused after acquisition: delivery start, then clipboard
         // acquisition. The paste interval intentionally includes settle waits.
         boundary_monotonic_ns: u64,
-        problem: ?notifications.Problem = null,
-        paste: union(enum) { waiting, acquiring, settling: u64, sending, done } = .waiting,
+        upstream_problem: ?Problem = null,
+        paste: union(enum) { waiting, acquiring, settling: u64, sending, done: ?DeliveryProblem } = .waiting,
     },
     aborting: AbortReason,
 };
@@ -153,7 +257,7 @@ const TranscriptProgress = struct {
 
 const KeyboardState = union(enum) {
     disabled,
-    unavailable: notifications.Problem,
+    unavailable: PasteProblem,
     ready: paste_keyboard.Keyboard,
 };
 
@@ -274,7 +378,7 @@ pub fn runService(init: std.process.Init, options: ServiceOptions) !void {
         init.environ_map.get("HOME"),
         init.environ_map.get("VOICED_INSTANCE") orelse "",
     ) catch |err| unavailable: {
-        log.err(.{}, "State storage unavailable: error={s}; transcript saving and failed-transcription capture disabled", .{@errorName(err)});
+        storage_log.err(.{}, .state_storage_unavailable, "error={s} transcript_save_outcome=disabled transcription_capture_outcome=disabled", .{@errorName(err)});
         break :unavailable null;
     };
     defer if (state_directory) |path| init.gpa.free(path);
@@ -362,7 +466,23 @@ pub fn runService(init: std.process.Init, options: ServiceOptions) !void {
         .node_name => |name| .{ .key = "microphone_node", .value = name },
         .device_serial => |serial| .{ .key = "microphone_serial", .value = serial },
     };
-    log.info(.{}, "Effective config: log_level={s}, model={s}, model_encoder_threads={d}, model_decoder_threads={d}, model_encoder_padding_seconds={d}, model_idle_seconds_max={d}, recording_seconds_max={d}, transcript_output={s}, paste_shortcut={s}, paste_settle_ms={d}, paste_key_gap_ms={d}, notification_mode={s}, {s}=\"{f}\"", .{
+    defer {
+        if (supervisor.keyboard == .ready) supervisor.keyboard.ready.deinit();
+        closeClipboard(&supervisor);
+    }
+
+    if (options.output == .desktop) openPasteKeyboard(&supervisor);
+    if (options.output != .stdout) openClipboard(&supervisor);
+    const capture_thread = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, capture_module.Worker.run, .{&capture_worker});
+    // Once threads can borrow this frame, an unrecoverable supervisor error must
+    // exit the process before any defer frees their storage. Linux terminates
+    // every thread; systemd Restart=on-failure supplies the fresh daemon.
+    errdefer |err| {
+        log.critical(recordingContext(&supervisor), .supervisor_failed, "error={s} worker_storage=retained", .{@errorName(err)});
+        linux.exit_group(1);
+    }
+    const model_thread = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, transcription_module.Worker.run, .{&model_worker});
+    log.info(.{}, .service_started, "log_level={s} model={s} model_encoder_threads={d} model_decoder_threads={d} model_encoder_padding_seconds={d} model_idle_seconds_max={d} recording_seconds_max={d} transcript_output={s} paste_shortcut={s} paste_settle_ms={d} paste_key_gap_ms={d} notification_mode={s} {s}=\"{f}\"", .{
         logging.levelName(options.log_level),
         model.model.name(),
         model.inference_threads_count,
@@ -382,23 +502,6 @@ pub fn runService(init: std.process.Init, options: ServiceOptions) !void {
         microphone.key,
         std.zig.fmtString(microphone.value),
     });
-    log.info(.{}, "Supervisor service ready\n", .{});
-    defer {
-        if (supervisor.keyboard == .ready) supervisor.keyboard.ready.deinit();
-        closeClipboard(&supervisor);
-    }
-
-    if (options.output == .desktop) openPasteKeyboard(&supervisor);
-    if (options.output != .stdout) openClipboard(&supervisor);
-    const capture_thread = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, capture_module.Worker.run, .{&capture_worker});
-    // Once threads can borrow this frame, an unrecoverable supervisor error must
-    // exit the process before any defer frees their storage. Linux terminates
-    // every thread; systemd Restart=on-failure supplies the fresh daemon.
-    errdefer |err| {
-        log.critical(.{ .recording_ordinal = supervisor.recording_ordinal }, "Supervisor stopped: error={s}; exiting with worker storage retained", .{@errorName(err)});
-        linux.exit_group(1);
-    }
-    const model_thread = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, transcription_module.Worker.run, .{&model_worker});
 
     while (true) {
         if (supervisor.service.shutdown_requested and supervisor.phase == .idle and
@@ -499,7 +602,7 @@ pub fn runService(init: std.process.Init, options: ServiceOptions) !void {
                 supervisor.phase = .active;
                 if (supervisor.transcription == .idle) supervisor.transcription.idle = null;
                 supervisor.session_deadline_monotonic_ns = sessionDeadline(configuration.*);
-                log.info(.{ .recording_ordinal = supervisor.recording_ordinal }, "Recording requested: recording_ordinal={d}", .{supervisor.recording_ordinal});
+                log.debug(.{ .recording_id = supervisor.recording_ordinal }, .recording_started, "", .{});
                 if (supervisor.transcription == .absent) startTranscription(&supervisor);
                 startAudio(&supervisor);
             }
@@ -558,7 +661,7 @@ noinline fn dispatchControl(supervisor: *Supervisor, client_index: usize, reques
         },
         .status => {},
     }
-    if (ignored) log.debug(.{ .recording_ordinal = supervisor.recording_ordinal }, "Command ignored: recording_ordinal={d}, command={s}, phase={s}", .{ supervisor.recording_ordinal, @tagName(request.cmd), @tagName(supervisor.phase) });
+    if (ignored) log.debug(recordingContext(supervisor), .command_ignored, "command={s} phase={s}", .{ @tagName(request.cmd), @tagName(supervisor.phase) });
     const phase: control_socket.Phase = switch (supervisor.phase) {
         .idle => if (service.pending_recording != null) .capturing else .idle,
         .active => .capturing,
@@ -585,7 +688,7 @@ fn requestAudioFinish(supervisor: *Supervisor, request_received_monotonic_ns: u6
     assert(supervisor.phase == .active);
     assert(supervisor.recording_stop == null);
     supervisor.recording_stop = .{ .monotonic_ns = request_received_monotonic_ns, .origin = .command };
-    log.info(.{ .recording_ordinal = supervisor.recording_ordinal }, "Recording stop requested: recording_ordinal={d}, recording_stop_origin=command", .{supervisor.recording_ordinal});
+    log.debug(.{ .recording_id = supervisor.recording_ordinal }, .recording_stop_requested, "stop_origin=command", .{});
     supervisor.phase = .{ .finishing = .{ .audio_stopped = null } };
     switch (supervisor.audio.operation) {
         .starting, .capturing => {
@@ -612,6 +715,7 @@ fn startAudio(supervisor: *Supervisor) void {
     const audio = &supervisor.audio;
     assert(audio.operation == .idle);
     audio.worker.start(.{
+        .recording_id = supervisor.recording_ordinal,
         .source = supervisor.options.capture.source,
         .recording_samples_target = @as(u32, supervisor.options.capture.recording_seconds) * capture_module.sample_rate_hz,
     });
@@ -645,14 +749,13 @@ fn drainAudioResult(supervisor: *Supervisor) !void {
                 }
             },
             .err => |err| {
-                const problem = audioProblem(err);
-                log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Audio service error: recording_ordinal={d}, kind={t}", .{ supervisor.recording_ordinal, std.meta.activeTag(err) });
+                const problem: Problem = .{ .capture = captureProblem(err) };
                 switch (err) {
                     .source_not_found, .source_ambiguous, .setup => |detail| {
                         const cause = captureFailureCause(detail.cause);
-                        log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Capture setup error: recording_ordinal={d}, kind={t}, stage={t}, error_domain={s}, error_code={d}, pipewire_server_version=\"{f}\", client_node_version_advertised={d}, client_node_version_selected={d}, detail=\"{f}\"", .{ supervisor.recording_ordinal, std.meta.activeTag(err), detail.stage, cause.domain, cause.code, std.zig.fmtString(detail.pipewire_version[0..detail.pipewire_version_size]), detail.client_node_version_advertised, detail.client_node_version_selected, std.zig.fmtString(detail.message[0..detail.message_size]) });
-                        if (std.meta.activeTag(err) == .source_ambiguous) log.err(.{}, "Microphone selection: sources_expected_count=1; replace microphone_serial with a microphone_node from the candidate list", .{});
-                        try beginAbort(supervisor, .{ .audio_failed = problem });
+                        const action = if (std.meta.activeTag(err) == .source_ambiguous) " action=configure_microphone_node" else "";
+                        capture_log.err(.{ .recording_id = supervisor.recording_ordinal }, .capture_failed, "problem_code={t} stage={t} cause_domain={s} cause_code={d} pipewire_server_version=\"{f}\" pipewire_client_node_version_advertised={d} pipewire_client_node_version_selected={d} detail=\"{f}\"{s}", .{ std.meta.activeTag(err), detail.stage, cause.domain, cause.code, std.zig.fmtString(detail.pipewire_version[0..detail.pipewire_version_size]), detail.client_node_version_advertised, detail.client_node_version_selected, std.zig.fmtString(detail.message[0..detail.message_size]), action });
+                        try beginAbort(supervisor, .{ .problem = problem });
                         continue;
                     },
                     .source_connection_lost,
@@ -671,7 +774,7 @@ fn drainAudioResult(supervisor: *Supervisor) !void {
                             if (std.meta.activeTag(err) == .pipeline_full) {
                                 supervisor.phase = .{ .finishing = .{ .pipeline_full = problem } };
                             } else if (runtime.report.published_samples_count == 0) {
-                                try beginAbort(supervisor, .{ .audio_failed = problem });
+                                try beginAbort(supervisor, .{ .problem = problem });
                             } else {
                                 // PipeWire reports preserve every complete block before a
                                 // disconnect, malformed buffer, or timeline failure. Drain
@@ -694,7 +797,7 @@ fn observeCaptureEnd(supervisor: *Supervisor) void {
     // Automatic and source-driven stops occur inside capture. This observer
     // must not masquerade as command-to-done time.
     supervisor.recording_stop = .{ .monotonic_ns = monotonicNanoseconds(), .origin = .capture_end };
-    log.info(.{ .recording_ordinal = supervisor.recording_ordinal }, "Recording stop observed: recording_ordinal={d}, recording_stop_origin=capture_end", .{supervisor.recording_ordinal});
+    capture_log.debug(.{ .recording_id = supervisor.recording_ordinal }, .recording_stop_observed, "stop_origin=capture_end", .{});
 }
 
 fn observePipeWireProgress(supervisor: *Supervisor) !void {
@@ -717,8 +820,7 @@ fn observePipeWireProgress(supervisor: *Supervisor) !void {
     }
 
     if (capture_is_starting) {
-        log.info(.{ .recording_ordinal = supervisor.recording_ordinal }, "Capture started: recording_ordinal={d}, capture_start_duration_ms={f}", .{
-            supervisor.recording_ordinal,
+        capture_log.debug(.{ .recording_id = supervisor.recording_ordinal }, .capture_started, "capture_start_duration_ms={f}", .{
             decimal.fmt(@as(f64, @floatFromInt(monotonicNanoseconds() - supervisor.recording_requested_monotonic_ns)) / std.time.ns_per_ms, 3),
         });
     }
@@ -735,13 +837,13 @@ fn drainTranscriptionResult(supervisor: *Supervisor) !void {
     switch (report) {
         .err => |err| {
             supervisor.transcription = if (err == .model_load) .absent else .{ .idle = null };
-            try beginAbort(supervisor, .{ .transcription_failed = transcriptionProblem(err) });
+            try beginAbort(supervisor, .{ .problem = .{ .transcription = transcriptionProblem(err) } });
         },
         .ok => |event| switch (event) {
             .ready => |ready| {
                 assert(supervisor.transcription == .starting or supervisor.transcription == .stopping);
                 supervisor.transcription = .{ .idle = null };
-                log.info(.{ .recording_ordinal = supervisor.recording_ordinal }, "Model prepared: recording_ordinal={d}, model_prepare_duration_ms={f}", .{ supervisor.recording_ordinal, decimal.fmt(@as(f64, @floatFromInt(ready.model_prepare_duration_ns)) / std.time.ns_per_ms, 3) });
+                transcription_log.debug(.{ .recording_id = supervisor.recording_ordinal }, .model_prepared, "model_prepare_duration_ms={f}", .{decimal.fmt(@as(f64, @floatFromInt(ready.model_prepare_duration_ns)) / std.time.ns_per_ms, 3)});
             },
             .result => |result| {
                 const previous = supervisor.transcription;
@@ -763,10 +865,12 @@ fn drainTranscriptionResult(supervisor: *Supervisor) !void {
     }
 }
 
-fn transcriptionProblem(err: transcription_module.Error) notifications.Problem {
+fn transcriptionProblem(err: transcription_module.Error) TranscriptionProblem {
     return switch (err) {
-        .model_load => .model_load_failed,
-        .feature_extraction, .inference, .text_decode => .transcription_failed,
+        .model_load => .model_load,
+        .feature_extraction => .feature_extraction,
+        .inference => .inference,
+        .text_decode => .text_decode,
     };
 }
 
@@ -800,18 +904,18 @@ fn consumeTranscript(supervisor: *Supervisor, slot_index: audio_exchange.SlotInd
     supervisor.transcript.processed_samples_count += result.samples_count;
     supervisor.transcript.compute_duration_ns += compute_duration_ns;
 
-    if (logging.enabled(.info)) {
+    if (logging.enabled(.debug)) {
         var features_buffer: [32]u8 = undefined;
         var inference_buffer: [32]u8 = undefined;
         var processing_buffer: [32]u8 = undefined;
         var speed_buffer: [32]u8 = undefined;
-        log.info(
-            .{ .recording_ordinal = supervisor.recording_ordinal },
-            "Transcription chunk: recording_ordinal={d}, chunk_ordinal={d}, audio_duration_seconds={f}, audio_samples_count={d}, " ++
-                "features_duration_ms={s}, inference_duration_ms={s}, transcription_compute_duration_ms={s}, transcription_compute_speed_ratio={s}, " ++
-                "transcript_size={d}, disposition={s}, chunk_limit={t}, recording_size_exceeded={}, activity_observed={}, text_empty={}, no_speech_probability={f}, no_speech_inactive_probability_min={f}, average_log_probability={f}\n",
+        transcription_log.debug(
+            .{ .recording_id = supervisor.recording_ordinal },
+            .transcription_chunk_finished,
+            "chunk_id={d} audio_duration_seconds={f} audio_samples_count={d} " ++
+                "features_duration_ms={s} inference_duration_ms={s} transcription_compute_duration_ms={s} transcription_compute_speed_ratio={s} " ++
+                "transcript_size={d} disposition={s} chunk_limit={t} recording_size_exceeded={} activity_observed={} text_empty={} no_speech_probability={f} no_speech_probability_inactive_min={f} average_log_probability={f}",
             .{
-                supervisor.recording_ordinal,
                 chunk_ordinal,
                 decimal.fmt(@as(f64, @floatFromInt(result.samples_count)) / capture_module.sample_rate_hz, 3),
                 result.samples_count,
@@ -835,9 +939,10 @@ fn consumeTranscript(supervisor: *Supervisor, slot_index: audio_exchange.SlotInd
         .accepted, .partial => {
             const available = transcript_bytes.len - supervisor.transcript.bytes_count;
             const text = if (output_fits) result.bytes else transcription_module.utf8Prefix(result.bytes[0..available]);
-            if (!output_fits) log.warn(.{ .recording_ordinal = supervisor.recording_ordinal }, "Transcript capacity reached: recording_ordinal={d}, chunk_ordinal={d}, transcript_size_max={d}, transcript_committed_size={d}, chunk_transcript_size={d}, chunk_retained_size={d}", .{
-                supervisor.recording_ordinal,      chunk_ordinal,    transcript_bytes.len,
-                supervisor.transcript.bytes_count, result.bytes.len, text.len,
+            if (!output_fits) transcription_log.warn(.{ .recording_id = supervisor.recording_ordinal }, .transcript_capacity_reached, "chunk_id={d} transcript_size_max={d} transcript_committed_size={d} chunk_transcript_size={d} chunk_retained_size={d}", .{
+                chunk_ordinal,                     transcript_bytes.len,
+                supervisor.transcript.bytes_count, result.bytes.len,
+                text.len,
             });
             @memcpy(transcript_bytes[supervisor.transcript.bytes_count..][0..text.len], text);
             supervisor.transcript.bytes_count += @intCast(text.len);
@@ -847,19 +952,32 @@ fn consumeTranscript(supervisor: *Supervisor, slot_index: audio_exchange.SlotInd
             supervisor.transcript.no_speech_chunks_count += 1;
         },
         .speech_detection_conflict, .speech_unrecognized => {
-            const rejection: TranscriptionRejection = .{
-                .samples_count = result.samples_count,
-                .contains_activity = result.contains_activity,
-                .no_speech_probability = result.no_speech_probability,
-                .average_log_probability = result.average_log_probability,
-            };
-            try beginAbort(supervisor, switch (disposition) {
-                .speech_detection_conflict => .{
-                    .speech_detection_conflict = rejection,
-                },
-                .speech_unrecognized => .{ .speech_unrecognized = rejection },
+            const problem: TranscriptionProblem = switch (disposition) {
+                .speech_detection_conflict => .speech_detection_conflict,
+                .speech_unrecognized => .speech_unrecognized,
                 .accepted, .partial, .no_speech => unreachable,
-            });
+            };
+            transcription_log.write(
+                if (supervisor.transcript.accepted_chunks_count > 0) .warn else .err,
+                .{ .recording_id = supervisor.recording_ordinal },
+                .transcription_rejected,
+                "problem_code={t} model={s} chunk_id={d} audio_samples_count={d} " ++
+                    "activity_observed={} no_speech_probability={f} " ++
+                    "no_speech_probability_inactive_min={f} no_speech_probability_active_min={f} " ++
+                    "average_log_probability={f}",
+                .{
+                    problem,
+                    supervisor.options.capture.transcription.model.name(),
+                    chunk_ordinal,
+                    result.samples_count,
+                    result.contains_activity,
+                    decimal.fmt(result.no_speech_probability, 6),
+                    decimal.fmt(transcription_module.no_activity_no_speech_probability_reject_min, 2),
+                    decimal.fmt(transcription_module.active_no_speech_probability_conflict_min, 2),
+                    decimal.fmt(result.average_log_probability, 6),
+                },
+            );
+            try beginAbort(supervisor, .{ .problem = .{ .transcription = problem } });
             return;
         },
     }
@@ -867,12 +985,12 @@ fn consumeTranscript(supervisor: *Supervisor, slot_index: audio_exchange.SlotInd
         // Stop further work while retaining copied text until delivery finishes.
         // Prefer the decoder warning if both chunk and recording limits apply;
         // the chunk event and capacity event preserve every limit in the journal.
-        try beginAbort(supervisor, .{ .transcript_limit = switch (result.limit) {
-            .none => .recording_size,
-            .text_size => .chunk_size,
-            .tokens_count => .decoder_tokens,
-            .text_size_and_tokens_count => .chunk_size_and_decoder_tokens,
-        } });
+        try beginAbort(supervisor, .{ .problem = .{ .transcription = switch (result.limit) {
+            .none => .transcript_recording_size_reached,
+            .text_size => .transcript_chunk_size_reached,
+            .tokens_count => .decoder_token_limit_reached,
+            .text_size_and_tokens_count => .transcript_chunk_size_and_decoder_token_limit_reached,
+        } } });
     } else audio_exchange.releaseConsumedSlot(slot);
 }
 
@@ -907,19 +1025,30 @@ fn requestTranscriptionShutdown(supervisor: *Supervisor) void {
     supervisor.transcription = .{ .stopping = monotonicNanoseconds() + std.time.ns_per_s };
 }
 
-fn finishValidAudioPrefixOrDiscard(supervisor: *Supervisor, problem: notifications.Problem) !void {
+fn finishValidAudioPrefixOrDiscard(supervisor: *Supervisor, problem: Problem) !void {
     assert(supervisor.phase == .active);
 
     if (processedChunksCount(&supervisor.transcript) > 0 or publishedSlots(supervisor) > 0) {
         supervisor.phase = .{ .finishing = .{ .audio_failed_with_valid_prefix = problem } };
-    } else try beginAbort(supervisor, .{ .audio_failed = problem });
+    } else try beginAbort(supervisor, .{ .problem = problem });
 }
 
 fn beginAbort(supervisor: *Supervisor, reason: AbortReason) !void {
     if (supervisor.phase == .delivering) {
         // Accepted text may already be on the clipboard or pasted. Cancellation
         // stops further output; it cannot undo those external effects.
-        cancelDelivery(supervisor);
+        const paste = supervisor.phase.delivering.paste;
+        const clipboard_acquired = paste == .settling or paste == .sending or paste == .done;
+        logRecordingFinished(supervisor, .{
+            .outcome = .cancelled,
+            .clipboard = if (clipboard_acquired) .succeeded else .cancelled,
+            .paste = if (supervisor.options.output == .desktop)
+                if (paste == .done) if (paste.done == null) .succeeded else .failed else .cancelled
+            else
+                null,
+            .save = .not_attempted,
+        });
+        cancelDelivery(supervisor, null);
         // Closing the clipboard also closes every transfer before text can be reused.
         // Explicit cancellation preserves the previous saved transcript.
         if (reason == .user_cancelled or reason == .service_signal) supervisor.transcript.bytes_count = 0;
@@ -957,14 +1086,14 @@ fn requestAudioDiscard(supervisor: *Supervisor) void {
 noinline fn applyExpiredDeadlines(supervisor: *Supervisor) !void {
     const now = monotonicNanoseconds();
     if (supervisor.phase != .idle and supervisor.phase != .aborting and supervisor.phase != .delivering and now >= supervisor.session_deadline_monotonic_ns) {
-        try beginAbort(supervisor, .{ .deadline = .recording });
+        try beginAbort(supervisor, .{ .problem = .{ .supervisor = .recording_timed_out } });
     }
     if (supervisor.audio.operation.deadlineMonotonicNs()) |deadline| {
         if (now >= deadline) {
-            log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Capture deadline exceeded: recording_ordinal={d}, stage={t}", .{ supervisor.recording_ordinal, std.meta.activeTag(supervisor.audio.operation) });
+            capture_log.err(.{ .recording_id = supervisor.recording_ordinal }, .capture_timed_out, "stage={t}", .{std.meta.activeTag(supervisor.audio.operation)});
             switch (supervisor.audio.operation) {
                 .starting, .capturing => {
-                    const problem: notifications.Problem = if (supervisor.audio.operation == .starting) .audio_start_timed_out else .audio_stalled;
+                    const problem: Problem = .{ .capture = if (supervisor.audio.operation == .starting) .start_timed_out else .stalled };
                     requestAudioDiscard(supervisor);
                     if (supervisor.phase == .active) try finishValidAudioPrefixOrDiscard(supervisor, problem);
                 },
@@ -977,8 +1106,8 @@ noinline fn applyExpiredDeadlines(supervisor: *Supervisor) !void {
         if (now >= deadline) switch (supervisor.transcription) {
             .starting, .busy => {
                 const loading = supervisor.transcription == .starting;
-                log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Transcription deadline exceeded: recording_ordinal={d}, stage={t}", .{ supervisor.recording_ordinal, std.meta.activeTag(supervisor.transcription) });
-                try beginAbort(supervisor, .{ .deadline = if (loading) .model_load else .transcription });
+                transcription_log.err(.{ .recording_id = supervisor.recording_ordinal }, .transcription_timed_out, "stage={t}", .{std.meta.activeTag(supervisor.transcription)});
+                try beginAbort(supervisor, .{ .problem = .{ .transcription = if (loading) .model_load_timed_out else .inference_timed_out } });
             },
             .stopping => return error.TranscriptionStopDeadlineExceeded,
             .idle => |warm_deadline| {
@@ -1050,85 +1179,53 @@ fn sessionIsComplete(supervisor: *Supervisor) bool {
 fn finishSession(supervisor: *Supervisor) !void {
     assert(sessionIsComplete(supervisor));
 
-    var processing_buffer: [32]u8 = undefined;
-    var speed_buffer: [32]u8 = undefined;
-    var stop_buffer: [32]u8 = undefined;
-    const stop_origin = if (supervisor.recording_stop) |stop| @tagName(stop.origin) else "unavailable";
-    const audio_seconds = @as(f64, @floatFromInt(supervisor.transcript.processed_samples_count)) / capture_module.sample_rate_hz;
-    const processing = formatDurationMilliseconds(&processing_buffer, supervisor.transcript.compute_duration_ns);
-    const realtime_speed = formatComputeSpeedRatio(&speed_buffer, supervisor.transcript.processed_samples_count, supervisor.transcript.compute_duration_ns);
-
     switch (supervisor.phase) {
         .active, .idle, .delivering => unreachable,
         .finishing => |reason| {
             assert(publishedSlots(supervisor) == 0);
-            const outcome = if (supervisor.transcript.accepted_chunks_count == 0 and supervisor.transcript.no_speech_chunks_count > 0)
-                "no_speech"
-            else
-                @tagName(std.meta.activeTag(reason));
-            try finishTranscription(supervisor, outcome, switch (reason) {
+            try finishTranscription(supervisor, switch (reason) {
                 .audio_failed_with_valid_prefix, .pipeline_full => |problem| problem,
                 .audio_stopped => |problem| problem,
                 .audio_completed => null,
-            }, false);
+            });
         },
         .aborting => |reason| {
-            if (reason == .transcript_limit) {
-                try finishTranscription(supervisor, @tagName(reason.transcript_limit), switch (reason.transcript_limit) {
-                    .recording_size => .transcript_too_large,
-                    .chunk_size => .transcript_chunk_too_large,
-                    .decoder_tokens => .transcript_token_limit,
-                    .chunk_size_and_decoder_tokens => .transcript_chunk_and_token_limit,
-                }, true);
+            const problem: ?Problem = switch (reason) {
+                .service_signal, .user_cancelled => null,
+                .problem => |problem| problem,
+            };
+            if (problem) |cause| {
+                if (cause == .transcription) switch (cause.transcription) {
+                    .transcript_recording_size_reached,
+                    .transcript_chunk_size_reached,
+                    .decoder_token_limit_reached,
+                    .transcript_chunk_size_and_decoder_token_limit_reached,
+                    => {
+                        try finishTranscription(supervisor, cause);
+                        return;
+                    },
+                    else => {},
+                };
+            }
+            const partial_speech = if (problem) |cause|
+                cause == .transcription and cause.transcription == .speech_detection_conflict and
+                    supervisor.transcript.accepted_chunks_count > 0
+            else
+                false;
+            if (partial_speech) {
+                // Classification rejects the current chunk before copying its text.
+                // Earlier chunks are independent, so deliver their accepted prefix.
+                try finishTranscription(supervisor, problem);
                 return;
             }
+
             // Neither thread can still publish into cancelled storage. The next
             // service recording resets both exchanges before either role starts.
-            log.write(if (reason == .user_cancelled or reason == .service_signal) .info else .warn, .{ .recording_ordinal = supervisor.recording_ordinal }, "Recording discarded: recording_ordinal={d}, reason={s}, audio_duration_seconds={f}, transcription_compute_duration_ms={s}, transcription_compute_speed_ratio={s}, transcript_size=0, recording_stop_origin={s}, recording_stop_elapsed_ms={s}", .{
-                supervisor.recording_ordinal, @tagName(std.meta.activeTag(reason)),                             decimal.fmt(audio_seconds, 3), processing, realtime_speed,
-                stop_origin,                  formatRecordingStopElapsedMilliseconds(&stop_buffer, supervisor),
+            logRecordingFinished(supervisor, .{
+                .outcome = if (problem == null) .cancelled else .failed,
+                .problem = problem,
             });
-            switch (reason) {
-                .service_signal, .user_cancelled => {},
-                .audio_failed, .transcription_failed => |problem| supervisor.notifications.show(problem),
-                .deadline => |stage| supervisor.notifications.show(switch (stage) {
-                    .recording => .recording_timed_out,
-                    .model_load => .model_load_timed_out,
-                    .transcription => .transcription_timed_out,
-                }),
-                .transcript_limit => unreachable,
-                .speech_detection_conflict => supervisor.notifications.show(.speech_detection_conflict),
-                .speech_unrecognized => supervisor.notifications.show(.speech_unrecognized),
-            }
-            switch (reason) {
-                .speech_detection_conflict, .speech_unrecognized => |rejection| {
-                    log.err(
-                        .{ .recording_ordinal = supervisor.recording_ordinal },
-                        "Transcription evidence: recording_ordinal={d}, model={s}, chunk_ordinal={d}, audio_samples_count={d}, " ++
-                            "activity_observed={}, no_speech_probability={f}, " ++
-                            "no_speech_inactive_probability_min={f}, no_speech_active_probability_min={f}, " ++
-                            "average_log_probability={f}\n",
-                        .{
-                            supervisor.recording_ordinal,
-                            supervisor.options.capture.transcription.model.name(),
-                            processedChunksCount(&supervisor.transcript),
-                            rejection.samples_count,
-                            rejection.contains_activity,
-                            decimal.fmt(rejection.no_speech_probability, 6),
-                            decimal.fmt(transcription_module.no_activity_no_speech_probability_reject_min, 2),
-                            decimal.fmt(transcription_module.active_no_speech_probability_conflict_min, 2),
-                            decimal.fmt(rejection.average_log_probability, 6),
-                        },
-                    );
-                },
-                .transcript_limit => unreachable,
-                .service_signal,
-                .user_cancelled,
-                .audio_failed,
-                .transcription_failed,
-                .deadline,
-                => {},
-            }
+            if (problem) |cause| supervisor.notifications.show(notificationProblem(&cause));
         },
     }
 }
@@ -1136,45 +1233,145 @@ fn finishSession(supervisor: *Supervisor) !void {
 // Both normal completion and a capacity stop deliver the one accumulated buffer.
 // A limit may leave sealed audio unprocessed; capture has released its stream
 // and no worker is consuming a slot before this call.
-fn finishTranscription(supervisor: *Supervisor, outcome_name: []const u8, problem: ?notifications.Problem, limited: bool) !void {
-    var processing_buffer: [32]u8 = undefined;
-    var speed_buffer: [32]u8 = undefined;
-    var stop_buffer: [32]u8 = undefined;
-    const stop_origin = if (supervisor.recording_stop) |stop| @tagName(stop.origin) else "unavailable";
-    const audio_seconds = @as(f64, @floatFromInt(supervisor.transcript.processed_samples_count)) / capture_module.sample_rate_hz;
-    const processing = formatDurationMilliseconds(&processing_buffer, supervisor.transcript.compute_duration_ns);
-    const realtime_speed = formatComputeSpeedRatio(&speed_buffer, supervisor.transcript.processed_samples_count, supervisor.transcript.compute_duration_ns);
+fn finishTranscription(supervisor: *Supervisor, problem: ?Problem) !void {
+    const transcript = std.mem.trim(
+        u8,
+        transcriptBytes(supervisor)[0..supervisor.transcript.bytes_count],
+        " \t\r\n",
+    );
+    if (transcript.len == 0) {
+        logRecordingFinished(supervisor, .{
+            .outcome = if (problem == null and supervisor.transcript.no_speech_chunks_count > 0) .no_speech else .failed,
+            .problem = problem,
+        });
+        if (problem) |cause| supervisor.notifications.show(notificationProblem(&cause));
+        return;
+    }
+    if (supervisor.options.output == .stdout) {
+        try printOutput(supervisor.io, transcript);
+        log.debug(.{ .recording_id = supervisor.recording_ordinal }, .transcript_written, "transcript_size={d}", .{transcript.len});
+        logRecordingFinished(supervisor, .{ .outcome = if (problem == null) .delivered else .partial, .problem = problem });
+        if (problem) |cause| supervisor.notifications.show(notificationProblem(&cause));
+    } else beginDelivery(supervisor, problem);
+}
+
+// One terminal event summarizes the complete recording. Component-owned
+// warnings and errors retain their detailed evidence separately under the same
+// recording ID; this record states the final result visible to the caller.
+noinline fn logRecordingFinished(supervisor: *const Supervisor, completion: RecordingCompletion) void {
+    const severity: logging.Level = if (completion.outcome == .failed)
+        .err
+    else if (completion.problem != null or completion.outcome == .partial or
+        completion.outcome == .copied or completion.outcome == .saved)
+        .warn
+    else
+        .info;
+    if (!logging.enabled(severity)) return;
 
     const transcript = std.mem.trim(
         u8,
         transcriptBytes(supervisor)[0..supervisor.transcript.bytes_count],
         " \t\r\n",
     );
-    log.write(if (limited) .warn else .info, .{ .recording_ordinal = supervisor.recording_ordinal }, "Transcription complete: recording_ordinal={d}, outcome={s}, chunks_accepted_count={d}, chunks_no_speech_count={d}, chunks_count={d}, audio_duration_seconds={f}, transcription_compute_duration_ms={s}, transcription_compute_speed_ratio={s}, transcript_size={d}, recording_stop_origin={s}, recording_stop_elapsed_ms={s}", .{
-        supervisor.recording_ordinal,
-        outcome_name,
-        supervisor.transcript.accepted_chunks_count,
-        supervisor.transcript.no_speech_chunks_count,
-        processedChunksCount(&supervisor.transcript),
-        decimal.fmt(audio_seconds, 3),
-        processing,
-        realtime_speed,
-        transcript.len,
-        stop_origin,
-        formatRecordingStopElapsedMilliseconds(&stop_buffer, supervisor),
+    var storage: [16]logging.Entry = undefined;
+    var fields: std.ArrayList(logging.Entry) = .initBuffer(&storage);
+    fields.appendSliceAssumeCapacity(&.{
+        .{ "outcome", .{ .name = @tagName(completion.outcome) } },
+        .{ "transcription_audio_duration_seconds", .{ .f = .{
+            .value = @as(f64, @floatFromInt(supervisor.transcript.processed_samples_count)) / capture_module.sample_rate_hz,
+            .digits = 3,
+        } } },
+        .{ "transcription_compute_duration_ms", .{ .f = .{
+            .value = @as(f64, @floatFromInt(supervisor.transcript.compute_duration_ns)) / std.time.ns_per_ms,
+            .digits = 3,
+        } } },
+        .{ "transcription_chunks_count", .{ .u = processedChunksCount(&supervisor.transcript) } },
+        .{ "transcript_size", .{ .u = transcript.len } },
     });
-
-    if (transcript.len == 0) {
-        if (problem) |cause| supervisor.notifications.show(cause);
-        return;
+    if (supervisor.transcript.compute_duration_ns > 0 and supervisor.transcript.processed_samples_count > 0) {
+        const audio_seconds = @as(f64, @floatFromInt(supervisor.transcript.processed_samples_count)) / capture_module.sample_rate_hz;
+        const compute_seconds = @as(f64, @floatFromInt(supervisor.transcript.compute_duration_ns)) / std.time.ns_per_s;
+        fields.appendAssumeCapacity(.{ "transcription_compute_speed_ratio", .{ .f = .{ .value = audio_seconds / compute_seconds, .digits = 2 } } });
     }
-    if (supervisor.options.output == .stdout) {
-        try printOutput(supervisor.io, transcript);
-        log.info(.{ .recording_ordinal = supervisor.recording_ordinal }, "Transcript written: recording_ordinal={d}, transcript_size={d}, recording_stop_origin={s}, recording_stop_elapsed_ms={s}", .{
-            supervisor.recording_ordinal, transcript.len, stop_origin, formatRecordingStopElapsedMilliseconds(&stop_buffer, supervisor),
+    if (supervisor.recording_stop) |stop| {
+        fields.appendSliceAssumeCapacity(&.{
+            .{ "stop_origin", .{ .name = @tagName(stop.origin) } },
+            .{ "recording_finalize_duration_ms", .{ .f = .{
+                .value = @as(f64, @floatFromInt(monotonicNanoseconds() - stop.monotonic_ns)) / std.time.ns_per_ms,
+                .digits = 3,
+            } } },
         });
-        if (problem) |cause| supervisor.notifications.show(cause);
-    } else beginDelivery(supervisor, problem);
+    }
+    if (completion.problem) |problem| {
+        fields.appendSliceAssumeCapacity(&.{
+            .{ "problem_component", .{ .name = @tagName(std.meta.activeTag(problem)) } },
+            .{ "problem_code", .{ .name = problemCode(&problem) } },
+        });
+    }
+    if (completion.clipboard) |outcome| fields.appendAssumeCapacity(.{ "clipboard_outcome", .{ .name = @tagName(outcome) } });
+    if (completion.paste) |outcome| fields.appendAssumeCapacity(.{ "paste_outcome", .{ .name = @tagName(outcome) } });
+    if (completion.save) |outcome| fields.appendAssumeCapacity(.{ "save_outcome", .{ .name = @tagName(outcome) } });
+    log.kv(severity, .{ .recording_id = supervisor.recording_ordinal }, "recording_finished", fields.items);
+}
+
+fn problemCode(problem: *const Problem) []const u8 {
+    return switch (problem.*) {
+        .capture => |code| @tagName(code),
+        .transcription => |code| @tagName(code),
+        .clipboard => |code| @tagName(code),
+        .paste => |code| @tagName(code),
+        .storage => |code| @tagName(code),
+        .supervisor => |code| @tagName(code),
+    };
+}
+
+fn notificationProblem(problem: *const Problem) notifications.Problem {
+    return switch (problem.*) {
+        .capture => |code| switch (code) {
+            .start_timed_out => .audio_start_timed_out,
+            .stalled => .audio_stalled,
+            .source_not_found => .microphone_not_found,
+            .source_ambiguous => .microphone_ambiguous,
+            .source_connection_lost => .microphone_connection_lost,
+            .source_changed => .microphone_changed,
+            .pipeline_full => .audio_processing_behind,
+            .setup => .audio_setup_failed,
+            .unexpected_format,
+            .timeline_discontinuity,
+            .stream_error,
+            .stream_disconnected,
+            .invalid_buffer,
+            .corrupted_buffer,
+            => .microphone_failed,
+        },
+        .transcription => |code| switch (code) {
+            .model_load => .model_load_failed,
+            .feature_extraction, .inference, .text_decode => .transcription_failed,
+            .model_load_timed_out => .model_load_timed_out,
+            .inference_timed_out => .transcription_timed_out,
+            .transcript_recording_size_reached => .transcript_too_large,
+            .transcript_chunk_size_reached => .transcript_chunk_too_large,
+            .decoder_token_limit_reached => .transcript_token_limit,
+            .transcript_chunk_size_and_decoder_token_limit_reached => .transcript_chunk_and_token_limit,
+            .speech_detection_conflict => .speech_detection_conflict,
+            .speech_unrecognized => .speech_unrecognized,
+        },
+        .clipboard => .clipboard_failed,
+        .paste => |code| switch (code) {
+            .permission_denied => .paste_permission_denied,
+            .device_missing => .paste_device_missing,
+            .failed => .paste_failed,
+            .incomplete => .paste_incomplete,
+        },
+        .storage => |code| switch (code) {
+            .state_directory_unavailable => .transcript_save_failed,
+            .storage_full => .transcript_storage_full,
+            .save_denied => .transcript_save_denied,
+            .directory_unsafe => .transcript_directory_unsafe,
+            .save_failed => .transcript_save_failed,
+        },
+        .supervisor => .recording_timed_out,
+    };
 }
 
 fn formatDurationMilliseconds(buffer: *[32]u8, elapsed_ns: ?u64) []const u8 {
@@ -1197,9 +1394,9 @@ fn printOutput(io: std.Io, transcript: []const u8) !void {
     try stdout.writeStreamingAll(io, "\n");
 }
 
-fn beginDelivery(supervisor: *Supervisor, problem: ?notifications.Problem) void {
+fn beginDelivery(supervisor: *Supervisor, problem: ?Problem) void {
+    supervisor.phase = .{ .delivering = .{ .boundary_monotonic_ns = monotonicNanoseconds(), .upstream_problem = problem } };
     if (supervisor.options.output == .desktop and supervisor.keyboard != .ready) openPasteKeyboard(supervisor);
-    supervisor.phase = .{ .delivering = .{ .boundary_monotonic_ns = monotonicNanoseconds(), .problem = problem } };
     if (supervisor.clipboard == .disconnected) openClipboard(supervisor);
 }
 
@@ -1225,11 +1422,16 @@ fn advanceOutput(supervisor: *Supervisor) !void {
                 break :failed clipboard_module.Event.none;
             },
         };
+        if (event == .ready) {
+            clipboard_log.debug(deliveryContext(supervisor), .clipboard_ready, "clipboard_backend={s} clipboard_mode={s}", .{
+                supervisor.clipboard.connected.backendName(),
+                @tagName(supervisor.clipboard.connected.mode),
+            });
+        }
         if (event == .acquired and supervisor.phase == .delivering) {
             const delivery = &supervisor.phase.delivering;
             assert(event.acquired == transcriptId(supervisor));
-            log.info(.{ .recording_ordinal = supervisor.recording_ordinal }, "Clipboard acquired: recording_ordinal={d}, transcript_size={d}, recording_stop_origin={s}, recording_stop_elapsed_ms={s}, clipboard_backend={s}, clipboard_mode={s}, clipboard_acquire_duration_ms={f}", .{
-                supervisor.recording_ordinal,
+            clipboard_log.debug(.{ .recording_id = supervisor.recording_ordinal }, .clipboard_acquired, "transcript_size={d} stop_origin={s} recording_finalize_duration_ms={s} clipboard_backend={s} clipboard_mode={s} clipboard_acquire_duration_ms={f}", .{
                 text.len,
                 stop_origin,
                 formatRecordingStopElapsedMilliseconds(&stop_buffer, supervisor),
@@ -1238,15 +1440,16 @@ fn advanceOutput(supervisor: *Supervisor) !void {
                 decimal.fmt(@as(f64, @floatFromInt(now_ns - delivery.boundary_monotonic_ns)) / std.time.ns_per_ms, 3),
             });
             delivery.boundary_monotonic_ns = now_ns;
-            if (supervisor.options.output == .desktop and supervisor.keyboard != .ready)
-                delivery.problem = switch (supervisor.keyboard) {
+            if (supervisor.options.output == .desktop and supervisor.keyboard != .ready) {
+                const problem: DeliveryProblem = .{ .paste = switch (supervisor.keyboard) {
                     .unavailable => |problem| problem,
-                    .disabled, .ready => .paste_failed,
-                };
-            delivery.paste = if (supervisor.options.output == .desktop and supervisor.keyboard == .ready)
+                    .disabled, .ready => unreachable,
+                } };
+                delivery.paste = .{ .done = problem };
+            } else delivery.paste = if (supervisor.options.output == .desktop and supervisor.keyboard == .ready)
                 .{ .settling = @max(now_ns + @as(u64, supervisor.options.paste_settle_ms) * std.time.ns_per_ms, supervisor.keyboard.ready.usable_after_ns) }
             else
-                .done;
+                .{ .done = null };
         }
     }
     if (supervisor.phase != .delivering) return;
@@ -1259,8 +1462,8 @@ fn advanceOutput(supervisor: *Supervisor) !void {
     }
     if (delivery.paste == .settling or delivery.paste == .sending) {
         if (supervisor.clipboard != .connected or !supervisor.clipboard.connected.owns(transcriptId(supervisor))) {
-            delivery.problem = .clipboard_failed;
-            cancelDelivery(supervisor);
+            clipboard_log.err(.{ .recording_id = supervisor.recording_ordinal }, .clipboard_failed, "problem_code=selection_lost", .{});
+            cancelDelivery(supervisor, .{ .clipboard = .selection_lost });
         }
     }
     switch (delivery.paste) {
@@ -1275,24 +1478,25 @@ fn advanceOutput(supervisor: *Supervisor) !void {
         const complete = switch (supervisor.keyboard.ready.advance(now_ns)) {
             .ok => |complete| complete,
             .err => |err| failed: {
-                logPasteError(.err, .{ .recording_ordinal = supervisor.recording_ordinal }, "Paste error; clipboard retained, no retry", &err);
+                logPasteError(.err, .{ .recording_id = supervisor.recording_ordinal }, "paste_failed", &err);
                 supervisor.keyboard.ready.deinit();
-                supervisor.keyboard = .{ .unavailable = pasteProblem(err) };
-                delivery.paste = .done;
-                delivery.problem = pasteProblem(err);
+                const problem = pasteProblem(err);
+                supervisor.keyboard = .{ .unavailable = problem };
+                delivery.paste = .{ .done = .{ .paste = problem } };
                 break :failed false;
             },
         };
         if (complete) {
-            log.info(.{ .recording_ordinal = supervisor.recording_ordinal }, "Paste shortcut sent: recording_ordinal={d}, recording_stop_origin={s}, recording_stop_elapsed_ms={s}, paste_duration_ms={f}", .{
-                supervisor.recording_ordinal,                                                                          stop_origin, formatRecordingStopElapsedMilliseconds(&stop_buffer, supervisor),
+            paste_log.debug(.{ .recording_id = supervisor.recording_ordinal }, .paste_sent, "stop_origin={s} recording_finalize_duration_ms={s} paste_duration_ms={f}", .{
+                stop_origin,
+                formatRecordingStopElapsedMilliseconds(&stop_buffer, supervisor),
                 decimal.fmt(@as(f64, @floatFromInt(now_ns - delivery.boundary_monotonic_ns)) / std.time.ns_per_ms, 3),
             });
-            delivery.paste = .done;
+            delivery.paste = .{ .done = null };
         }
     }
     if (delivery.paste == .done) {
-        completeDelivery(supervisor, delivery.problem);
+        completeDelivery(supervisor, delivery.upstream_problem, delivery.paste.done);
         enterIdle(supervisor);
     }
 }
@@ -1300,64 +1504,95 @@ fn advanceOutput(supervisor: *Supervisor) !void {
 // Save after paste completion, borrowing the same immutable clipboard text.
 // Choose the popup from both outcomes, so it never promises a saved file before
 // the rename succeeds.
-fn completeDelivery(supervisor: *Supervisor, problem: ?notifications.Problem) void {
+fn completeDelivery(supervisor: *Supervisor, upstream_problem: ?Problem, delivery_problem: ?DeliveryProblem) void {
     const text = std.mem.trim(u8, transcriptBytes(supervisor)[0..supervisor.transcript.bytes_count], " \t\r\n");
     if (text.len == 0) return;
-    const save_error = saveTranscript(supervisor, text);
+    const save = saveTranscript(supervisor, text);
+    const save_error: ?StorageProblem = switch (save) {
+        .saved => null,
+        .failed => |problem| problem,
+    };
     const saved = save_error == null;
+    const clipboard_failed = if (delivery_problem) |cause| cause == .clipboard else false;
+    const paste_failed = if (delivery_problem) |cause| cause == .paste else false;
+    const output_problem: ?Problem = if (delivery_problem) |cause| switch (cause) {
+        .clipboard => |problem| .{ .clipboard = problem },
+        .paste => |problem| .{ .paste = problem },
+    } else null;
+    const final_problem: ?Problem = upstream_problem orelse output_problem orelse if (save_error) |failure| .{ .storage = failure } else null;
+    logRecordingFinished(supervisor, .{
+        .outcome = if (clipboard_failed)
+            if (saved) .saved else .failed
+        else if (paste_failed)
+            .copied
+        else if (upstream_problem != null)
+            .partial
+        else
+            .delivered,
+        .problem = final_problem,
+        .clipboard = if (clipboard_failed) .failed else .succeeded,
+        .paste = if (supervisor.options.output == .desktop)
+            if (clipboard_failed) .not_attempted else if (paste_failed) .failed else .succeeded
+        else
+            null,
+        .save = if (saved) .succeeded else .failed,
+    });
     if (supervisor.service.shutdown_requested) return;
-    if (problem) |cause| {
+    if (output_problem orelse upstream_problem) |cause| {
         const output: notifications.Output = switch (cause) {
-            .clipboard_failed => if (saved) .saved else .unsaved,
-            .paste_failed, .paste_permission_denied, .paste_device_missing, .paste_incomplete => if (saved) .clipboard_saved else .clipboard_unsaved,
+            .clipboard => switch (save) {
+                .saved => |directory| .{ .saved = notifications.transcriptDirectory(directory, supervisor.clipboard_environment.home) },
+                .failed => .unsaved,
+            },
+            .paste => if (saved) .clipboard_saved else .clipboard_unsaved,
             else => if (saved) .partial_saved else .partial_unsaved,
         };
-        supervisor.notifications.showOutput(cause, output);
+        supervisor.notifications.showOutput(notificationProblem(&cause), output);
     } else if (save_error) |err| {
-        supervisor.notifications.showOutput(err, .clipboard_unsaved);
+        const cause: Problem = .{ .storage = err };
+        supervisor.notifications.showOutput(notificationProblem(&cause), .clipboard_unsaved);
     } else supervisor.notifications.recover();
 }
 
-fn saveTranscript(supervisor: *const Supervisor, text: []const u8) ?notifications.Problem {
+fn saveTranscript(supervisor: *const Supervisor, text: []const u8) TranscriptSave {
     const directory_path = supervisor.service.transcript_directory orelse {
-        log.err(.{ .recording_ordinal = supervisor.recording_ordinal }, "Transcript not saved: recording_ordinal={d}, reason=state_directory_unavailable", .{supervisor.recording_ordinal});
-        return .transcript_save_failed;
+        storage_log.err(.{ .recording_id = supervisor.recording_ordinal }, .transcript_save_failed, "problem_code=state_directory_unavailable", .{});
+        return .{ .failed = .state_directory_unavailable };
     };
     const started = monotonicNanoseconds();
     var elapsed_buffer: [32]u8 = undefined;
     switch (transcript_file.save(supervisor.io, directory_path, text)) {
         .ok => {},
         .err => |err| {
-            logTranscriptSaveError(.{ .recording_ordinal = supervisor.recording_ordinal }, directory_path, monotonicNanoseconds() - started, &err);
-            return saveProblem(err);
+            logTranscriptSaveError(.{ .recording_id = supervisor.recording_ordinal }, directory_path, monotonicNanoseconds() - started, &err);
+            return .{ .failed = storageProblem(err) };
         },
     }
-    log.info(.{ .recording_ordinal = supervisor.recording_ordinal }, "Transcript saved: recording_ordinal={d}, transcript_size={d}, transcript_save_duration_ms={s}", .{
-        supervisor.recording_ordinal, text.len, formatDurationMilliseconds(&elapsed_buffer, monotonicNanoseconds() - started),
+    storage_log.debug(.{ .recording_id = supervisor.recording_ordinal }, .transcript_saved, "transcript_size={d} transcript_save_duration_ms={s}", .{
+        text.len, formatDurationMilliseconds(&elapsed_buffer, monotonicNanoseconds() - started),
     });
-    return null;
+    return .{ .saved = directory_path };
 }
 
 noinline fn logTranscriptSaveError(context: logging.Context, directory_path: []const u8, duration_ns: u64, err: *const transcript_file.Error) void {
     if (!logging.enabled(.err)) return;
-    // The largest case is unsafe_directory: five common fields plus five
+    // The largest case is unsafe_directory: four common fields plus five
     // inspection fields. Cleanup adds two fields only to write/replace errors.
     var storage: [10]logging.Entry = undefined;
     var fields: std.ArrayList(logging.Entry) = .initBuffer(&storage);
-    if (context.recording_ordinal) |ordinal| fields.appendAssumeCapacity(.{ "recording_ordinal", .{ .u = ordinal } });
     fields.appendSliceAssumeCapacity(&.{
+        .{ "problem_code", .{ .name = @tagName(err.*) } },
         .{ "directory_path", .{ .str = directory_path } },
         .{ "file_name", .{ .str = "transcript.txt" } },
-        .{ "operation", .{ .str = @tagName(err.*) } },
         .{ "transcript_save_duration_ms", .{ .f = .{ .value = @as(f64, @floatFromInt(duration_ns)) / std.time.ns_per_ms, .digits = 3 } } },
     });
     var cleanup: ?*const transcript_file.CleanupError = null;
     switch (err.*) {
         .open_directory, .permissions, .create_temporary => |cause| fields.appendAssumeCapacity(.{ "error", .{ .str = @errorName(cause) } }),
-        .stat_directory => |errno| fields.appendAssumeCapacity(.{ "errno", .{ .errno = errno } }),
+        .stat_directory => |errno| fields.appendAssumeCapacity(.{ "system_error", .{ .errno = errno } }),
         .unsafe_directory => |detail| fields.appendSliceAssumeCapacity(&.{
             .{ "uid", .{ .u = detail.uid } },
-            .{ "expected_uid", .{ .u = detail.expected_uid } },
+            .{ "uid_expected", .{ .u = detail.expected_uid } },
             .{ "mode", .{ .u = detail.mode } },
             .{ "uid_available", .{ .b = detail.uid_available } },
             .{ "mode_available", .{ .b = detail.mode_available } },
@@ -1379,7 +1614,7 @@ noinline fn logTranscriptSaveError(context: logging.Context, directory_path: []c
         .{ "cleanup_error", .{ .str = @errorName(failure.cause) } },
         .{ "temporary_name", .{ .str = &failure.temporary_name } },
     });
-    log.kv(.err, context, "Transcript save error", fields.items);
+    storage_log.kv(.err, context, "transcript_save_failed", fields.items);
 }
 
 fn formatRecordingStopElapsedMilliseconds(buffer: *[32]u8, supervisor: *const Supervisor) []const u8 {
@@ -1387,7 +1622,7 @@ fn formatRecordingStopElapsedMilliseconds(buffer: *[32]u8, supervisor: *const Su
     return formatDurationMilliseconds(buffer, monotonicNanoseconds() - stop.monotonic_ns);
 }
 
-fn cancelDelivery(supervisor: *Supervisor) void {
+fn cancelDelivery(supervisor: *Supervisor, problem: ?DeliveryProblem) void {
     const delivery = &supervisor.phase.delivering;
     closeClipboard(supervisor);
     if (supervisor.keyboard == .ready) {
@@ -1397,7 +1632,7 @@ fn cancelDelivery(supervisor: *Supervisor) void {
             supervisor.keyboard = .disabled;
         }
     }
-    delivery.paste = .done;
+    delivery.paste = .{ .done = problem };
 }
 
 fn transcriptId(supervisor: *const Supervisor) u64 {
@@ -1440,7 +1675,7 @@ fn clipboardError(supervisor: *Supervisor, err: clipboard_module.Error) void {
                 switch (detail.*) {
                     .transport => |failure| fields.appendSliceAssumeCapacity(&.{
                         .{ "error", .{ .str = @errorName(failure.cause) } },
-                        .{ "errno", .{ .errno = failure.errno } },
+                        .{ "system_error", .{ .errno = failure.errno } },
                         .{ "object", .{ .u = failure.object } },
                         .{ "opcode", .{ .u = failure.opcode } },
                     }),
@@ -1466,7 +1701,7 @@ fn clipboardError(supervisor: *Supervisor, err: clipboard_module.Error) void {
                 switch (detail.*) {
                     .transport => |failure| fields.appendSliceAssumeCapacity(&.{
                         .{ "error", .{ .str = @errorName(failure.cause) } },
-                        .{ "errno", .{ .errno = failure.errno } },
+                        .{ "system_error", .{ .errno = failure.errno } },
                         .{ "response_type", .{ .u = failure.response_type } },
                         .{ "sequence", .{ .u = failure.sequence } },
                     }),
@@ -1487,7 +1722,7 @@ fn clipboardError(supervisor: *Supervisor, err: clipboard_module.Error) void {
                     },
                     .authority => |failure| fields.appendSliceAssumeCapacity(&.{
                         .{ "error", .{ .str = @errorName(failure.cause) } },
-                        .{ "errno", .{ .errno = failure.errno } },
+                        .{ "system_error", .{ .errno = failure.errno } },
                     }),
                     .unsupported => |feature| fields.appendAssumeCapacity(.{ "feature", .{ .str = @tagName(feature) } }),
                     .timed_out => |phase| fields.appendAssumeCapacity(.{ "phase", .{ .str = @tagName(phase) } }),
@@ -1497,16 +1732,15 @@ fn clipboardError(supervisor: *Supervisor, err: clipboard_module.Error) void {
             .unavailable, .busy, .invalid_text => fields.appendAssumeCapacity(.{ "kind", .{ .str = @tagName(err) } }),
         }
         fields.appendSliceAssumeCapacity(&.{
-            .{ "transfers_completed", .{ .u = supervisor.clipboard.connected.transfers_completed } },
-            .{ "transfers_expired", .{ .u = supervisor.clipboard.connected.transfers_expired } },
-            .{ "transfers_rejected", .{ .u = supervisor.clipboard.connected.transfers_rejected } },
+            .{ "transfers_completed_count", .{ .u = supervisor.clipboard.connected.transfers_completed } },
+            .{ "transfers_expired_count", .{ .u = supervisor.clipboard.connected.transfers_expired } },
+            .{ "transfers_rejected_count", .{ .u = supervisor.clipboard.connected.transfers_rejected } },
         });
-        log.kv(.err, .{ .recording_ordinal = supervisor.recording_ordinal }, if (protocol_error) "Clipboard protocol error" else "Clipboard error", fields.items);
+        clipboard_log.kv(.err, deliveryContext(supervisor), if (protocol_error) "clipboard_protocol_failed" else "clipboard_failed", fields.items);
     }
     closeClipboard(supervisor);
     if (supervisor.phase == .delivering) {
-        supervisor.phase.delivering.problem = .clipboard_failed;
-        cancelDelivery(supervisor);
+        cancelDelivery(supervisor, .{ .clipboard = clipboardProblem(err) });
     }
 }
 
@@ -1517,30 +1751,29 @@ fn openPasteKeyboard(supervisor: *Supervisor) void {
         },
         .err => |err| {
             supervisor.keyboard = .{ .unavailable = pasteProblem(err) };
-            logPasteError(.warn, .{}, "Automatic paste unavailable; clipboard delivery remains enabled", &err);
+            logPasteError(.warn, deliveryContext(supervisor), "paste_unavailable", &err);
         },
     }
 }
 
 // Share the schema between setup and delivery failures rather than specializing
 // the error union's formatting for each caller's severity and message.
-noinline fn logPasteError(severity: logging.Level, context: logging.Context, message: []const u8, err: *const paste_keyboard.Error) void {
+noinline fn logPasteError(severity: logging.Level, context: logging.Context, event: []const u8, err: *const paste_keyboard.Error) void {
     if (!logging.enabled(severity)) return;
-    // Setup has the most fields: ordinal, operation, request, errno and six
-    // setup members. Only the initialized entries reach the synchronous logger.
+    // Setup has the most fields: problem, request, errno and six setup members.
+    // Only the initialized entries reach the synchronous logger.
     var storage: [10]logging.Entry = undefined;
     var fields: std.ArrayList(logging.Entry) = .initBuffer(&storage);
-    if (context.recording_ordinal) |ordinal| fields.appendAssumeCapacity(.{ "recording_ordinal", .{ .u = ordinal } });
-    fields.appendAssumeCapacity(.{ "operation", .{ .str = @tagName(err.*) } });
+    fields.appendAssumeCapacity(.{ "problem_code", .{ .name = @tagName(err.*) } });
     const progress: ?paste_keyboard.Progress = switch (err.*) {
         .open => |errno| blk: {
-            fields.appendAssumeCapacity(.{ "errno", .{ .errno = errno } });
+            fields.appendAssumeCapacity(.{ "system_error", .{ .errno = errno } });
             break :blk null;
         },
         .configure => |*detail| blk: {
             fields.appendSliceAssumeCapacity(&.{
                 .{ "request", .{ .u = detail.request } },
-                .{ "errno", .{ .errno = detail.errno } },
+                .{ "system_error", .{ .errno = detail.errno } },
             });
             switch (detail.argument) {
                 .value => |value| fields.appendAssumeCapacity(.{ "argument", .{ .u = value } }),
@@ -1556,7 +1789,7 @@ noinline fn logPasteError(severity: logging.Level, context: logging.Context, mes
             break :blk null;
         },
         .write => |detail| blk: {
-            fields.appendAssumeCapacity(.{ "errno", .{ .errno = detail.errno } });
+            fields.appendAssumeCapacity(.{ "system_error", .{ .errno = detail.errno } });
             break :blk detail.progress;
         },
         .ambiguous_write => |detail| blk: {
@@ -1576,24 +1809,23 @@ noinline fn logPasteError(severity: logging.Level, context: logging.Context, mes
         .{ "frame", .{ .u = value.frame } },
         .{ "frame_bytes_sent", .{ .u = value.frame_bytes_sent } },
     });
-    log.kv(severity, context, message, fields.items);
+    paste_log.kv(severity, context, event, fields.items);
 }
 
-fn audioProblem(err: capture_module.Error) notifications.Problem {
+fn captureProblem(err: capture_module.Error) CaptureProblem {
     return switch (err) {
-        .source_not_found => .microphone_not_found,
-        .source_ambiguous => .microphone_ambiguous,
-        .source_connection_lost => .microphone_connection_lost,
-        .source_changed => .microphone_changed,
-        .pipeline_full => .audio_processing_behind,
-        .setup => .audio_setup_failed,
-        .unexpected_format,
-        .timeline_discontinuity,
-        .stream_error,
-        .stream_disconnected,
-        .invalid_buffer,
-        .corrupted_buffer,
-        => .microphone_failed,
+        .source_not_found => .source_not_found,
+        .source_ambiguous => .source_ambiguous,
+        .source_connection_lost => .source_connection_lost,
+        .source_changed => .source_changed,
+        .pipeline_full => .pipeline_full,
+        .setup => .setup,
+        .unexpected_format => .unexpected_format,
+        .timeline_discontinuity => .timeline_discontinuity,
+        .stream_error => .stream_error,
+        .stream_disconnected => .stream_disconnected,
+        .invalid_buffer => .invalid_buffer,
+        .corrupted_buffer => .corrupted_buffer,
     };
 }
 
@@ -1608,30 +1840,58 @@ fn captureFailureCause(cause: capture_module.FailureCause) CaptureFailureCause {
     };
 }
 
-fn pasteProblem(err: paste_keyboard.Error) notifications.Problem {
+fn clipboardProblem(err: clipboard_module.Error) ClipboardProblem {
     return switch (err) {
-        .open => |errno| switch (errno) {
-            .ACCES, .PERM => .paste_permission_denied,
-            .NOENT => .paste_device_missing,
-            else => .paste_failed,
+        .wayland => |detail| switch (detail) {
+            .transport => .wayland_transport,
+            .server => .wayland_server,
+            .unsupported => .wayland_unsupported,
+            .timed_out => .wayland_timed_out,
+            .selection_lost => .selection_lost,
+            .busy => .busy,
+            .invalid_text => .invalid_text,
         },
-        .configure => .paste_failed,
-        .write, .ambiguous_write, .timed_out => .paste_incomplete,
+        .x11 => |detail| switch (detail) {
+            .transport => .x11_transport,
+            .setup => .x11_setup,
+            .server => .x11_server,
+            .authority => .x11_authority,
+            .unsupported => .x11_unsupported,
+            .timed_out => .x11_timed_out,
+            .selection_lost => .selection_lost,
+            .busy => .busy,
+            .invalid_text => .invalid_text,
+        },
+        .unavailable => .unavailable,
+        .busy => .busy,
+        .invalid_text => .invalid_text,
     };
 }
 
-fn saveProblem(err: transcript_file.Error) notifications.Problem {
+fn pasteProblem(err: paste_keyboard.Error) PasteProblem {
+    return switch (err) {
+        .open => |errno| switch (errno) {
+            .ACCES, .PERM => .permission_denied,
+            .NOENT => .device_missing,
+            else => .failed,
+        },
+        .configure => .failed,
+        .write, .ambiguous_write, .timed_out => .incomplete,
+    };
+}
+
+fn storageProblem(err: transcript_file.Error) StorageProblem {
     const cause: anyerror = switch (err) {
         .open_directory, .permissions, .create_temporary => |cause| cause,
         .replace => |detail| detail.cause,
         .write => |detail| detail.cause,
-        .unsafe_directory => return .transcript_directory_unsafe,
-        .stat_directory => return .transcript_save_failed,
+        .unsafe_directory => return .directory_unsafe,
+        .stat_directory => return .save_failed,
     };
     return switch (cause) {
-        error.NoSpaceLeft, error.DiskQuota => .transcript_storage_full,
-        error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem => .transcript_save_denied,
-        else => .transcript_save_failed,
+        error.NoSpaceLeft, error.DiskQuota => .storage_full,
+        error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem => .save_denied,
+        else => .save_failed,
     };
 }
 
@@ -1644,11 +1904,21 @@ fn enterIdle(supervisor: *Supervisor) void {
         null;
 }
 
+fn recordingContext(supervisor: *const Supervisor) logging.Context {
+    return .{ .recording_id = if (supervisor.recording_ordinal == 0 or supervisor.phase == .idle) null else supervisor.recording_ordinal };
+}
+
+fn deliveryContext(supervisor: *const Supervisor) logging.Context {
+    return .{ .recording_id = if (supervisor.phase == .delivering) supervisor.recording_ordinal else null };
+}
+
 // PERFORMANCE: Keep final-report formatting outside result dispatch. Inlining
 // exposes the report's tagged payloads to the caller's branches and expands the
 // diagnostic code in ReleaseSafe. One call per completed capture is off the
 // graph-processing path; the report remains borrowed only during this call.
 noinline fn logCaptureReport(recording_ordinal: u64, outcome_name: []const u8, report: *const capture_module.CaptureReport, failure: ?*const capture_module.RuntimeFailure) void {
+    const report_severity: logging.Level = if (failure == null) .debug else .err;
+    const outcome = if (failure == null) outcome_name else "failed";
     const source_description = if (report.source_identity) |source|
         source.node_description[0..source.node_description_size]
     else
@@ -1662,16 +1932,91 @@ noinline fn logCaptureReport(recording_ordinal: u64, outcome_name: []const u8, r
     else
         -1;
 
-    log.info(.{ .recording_ordinal = recording_ordinal }, "Capture ended: recording_ordinal={d}, outcome={s}, audio_duration_seconds={f}, audio_samples_published_count={d}, audio_samples_captured_count={d}, microphone_description=\"{f}\"", .{ recording_ordinal, outcome_name, decimal.fmt(@as(f64, @floatFromInt(report.samples_count)) / capture_module.sample_rate_hz, 3), report.published_samples_count, report.samples_count, std.zig.fmtString(source_description) });
-
-    log.info(.{ .recording_ordinal = recording_ordinal }, "Capture protocol: recording_ordinal={d}, pipewire_server_version=\"{f}\", client_node_version_advertised={d}, client_node_version_selected={d}, graph_rate_hz={d}, graph_channels_count={d}, callback_duration_ms_max={f}, callback_gap_ms_max={f}", .{ recording_ordinal, std.zig.fmtString(report.pipewire_server_version[0..report.pipewire_server_version_size]), report.client_node_version_advertised, report.client_node_version_selected, if (report.negotiated_format) |format| format.sample_rate_hz else 0, if (report.negotiated_format) |format| format.channels_count else 0, decimal.fmt(if (report.callback) |callback| @as(f64, @floatFromInt(callback.duration_ns_max)) / std.time.ns_per_ms else 0, 3), decimal.fmt(if (report.callback) |callback| @as(f64, @floatFromInt(callback.gap_ns_max)) / std.time.ns_per_ms else 0, 3) });
-
-    if (failure != null) {
-        if (report.source_identity) |source| log.err(.{ .recording_ordinal = recording_ordinal }, "Capture source: recording_ordinal={d}, node_id={d}, node_object_serial={d}, device_id={d}, device_object_serial={d}, node_name=\"{f}\", node_description=\"{f}\", device_serial=\"{f}\", device_description=\"{f}\"", .{ recording_ordinal, source.node_id, source.node_object_serial, source.device_id, source.device_object_serial, std.zig.fmtString(source.node_name[0..source.node_name_size]), std.zig.fmtString(source.node_description[0..source.node_description_size]), std.zig.fmtString(source.device_serial[0..source.device_serial_size]), std.zig.fmtString(source.device_description[0..source.device_description_size]) });
-    }
-    if (failure) |detail| {
-        const cause = captureFailureCause(detail.cause);
-        log.err(.{ .recording_ordinal = recording_ordinal }, "Capture failed: recording_ordinal={d}, stage={s}, error_domain={s}, error_code={d}, detail=\"{f}\"", .{ recording_ordinal, @tagName(detail.stage), cause.domain, cause.code, std.zig.fmtString(detail.message[0..detail.message_size]) });
+    if (logging.enabled(report_severity)) {
+        var storage: [51]logging.Entry = undefined;
+        var fields: std.ArrayList(logging.Entry) = .initBuffer(&storage);
+        fields.appendSliceAssumeCapacity(&.{
+            .{ "outcome", .{ .name = outcome } },
+            .{ "audio_duration_seconds", .{ .f = .{ .value = @as(f64, @floatFromInt(report.samples_count)) / capture_module.sample_rate_hz, .digits = 3 } } },
+            .{ "audio_samples_published_count", .{ .u = report.published_samples_count } },
+            .{ "audio_samples_captured_count", .{ .u = report.samples_count } },
+            .{ "audio_slots_published_count", .{ .u = report.slot_publications_count } },
+            .{ "microphone_description", .{ .str = source_description } },
+            .{ "pipewire_server_version", .{ .str = report.pipewire_server_version[0..report.pipewire_server_version_size] } },
+            .{ "pipewire_client_node_version_advertised", .{ .u = report.client_node_version_advertised } },
+            .{ "pipewire_client_node_version_selected", .{ .u = report.client_node_version_selected } },
+            .{ "capture_thread_id", .{ .i = report.main_loop_thread_id } },
+        });
+        if (report.negotiated_format) |format| fields.appendSliceAssumeCapacity(&.{
+            .{ "graph_rate_hz", .{ .u = format.sample_rate_hz } },
+            .{ "graph_channels_count", .{ .u = format.channels_count } },
+        });
+        if (report.source_identity) |source| {
+            fields.appendSliceAssumeCapacity(&.{
+                .{ "pipewire_node_id", .{ .u = source.node_id } },
+                .{ "pipewire_node_serial", .{ .u = source.node_object_serial } },
+                .{ "microphone_node_name", .{ .str = source.node_name[0..source.node_name_size] } },
+            });
+            if (source.device_id != std.math.maxInt(u32)) fields.appendSliceAssumeCapacity(&.{
+                .{ "pipewire_device_id", .{ .u = source.device_id } },
+                .{ "pipewire_device_serial", .{ .u = source.device_object_serial } },
+                .{ "microphone_serial", .{ .str = source.device_serial[0..source.device_serial_size] } },
+                .{ "microphone_device_description", .{ .str = source.device_description[0..source.device_description_size] } },
+            });
+        }
+        switch (report.memory_lock) {
+            .locked => |size| fields.appendSliceAssumeCapacity(&.{
+                .{ "memory_lock_outcome", .{ .name = "succeeded" } },
+                .{ "memory_lock_size_max", .{ .u = size } },
+            }),
+            .unavailable => |detail| fields.appendSliceAssumeCapacity(&.{
+                .{ "memory_lock_outcome", .{ .name = "failed" } },
+                .{ "memory_lock_system_error", .{ .errno = detail.errno } },
+                .{ "memory_lock_size_max", .{ .u = detail.limit_bytes } },
+            }),
+        }
+        if (report.callback) |callback| {
+            fields.appendSliceAssumeCapacity(&.{
+                .{ "callback_thread_id", .{ .i = callback.thread_id } },
+                .{ "callback_scheduler_policy", .{ .name = capture_module.schedulerPolicyName(callback.scheduler_policy orelse -1) } },
+                .{ "callback_scheduler_priority", .{ .i = callback.scheduler_priority orelse -1 } },
+                .{ "callbacks_count", .{ .u = callback.callbacks_count } },
+                .{ "callback_missing_buffers_count", .{ .u = callback.missing_buffers_count } },
+                .{ "callback_clipped_samples_count", .{ .u = callback.clipped_samples_count } },
+                .{ "callback_header_metadata_buffers_count", .{ .u = callback.header_metadata_buffers_count } },
+                .{ "callback_header_gap_buffers_count", .{ .u = callback.header_gap_buffers_count } },
+                .{ "callback_header_gap_samples_count", .{ .u = callback.header_gap_samples_count } },
+                .{ "callback_duration_ms_max", .{ .f = .{ .value = @as(f64, @floatFromInt(callback.duration_ns_max)) / std.time.ns_per_ms, .digits = 3 } } },
+                .{ "callback_gap_ms_max", .{ .f = .{ .value = @as(f64, @floatFromInt(callback.gap_ns_max)) / std.time.ns_per_ms, .digits = 3 } } },
+                .{ "activity", .{ .name = @tagName(callback.activity.activity) } },
+                .{ "activity_samples_count", .{ .u = callback.activity.activity_samples_count } },
+                .{ "activity_observed_samples_count", .{ .u = callback.activity.observed_samples_count } },
+                .{ "activity_unknown_samples_count", .{ .u = callback.activity.unknown_samples_count } },
+                .{ "activity_quiet_samples_count", .{ .u = callback.activity.quiet_samples_count } },
+                .{ "activity_active_samples_count", .{ .u = callback.activity.active_samples_count } },
+                .{ "activity_changes_count", .{ .u = callback.activity.activity_changes_count } },
+                .{ "activity_active_run_samples_count_max", .{ .u = callback.activity.active_run_samples_count_max } },
+                .{ "activity_quiet_run_samples_count_max", .{ .u = callback.activity.quiet_run_samples_count_max } },
+                .{ "activity_noise_floor_rms", .{ .f32 = .{ .value = callback.activity.noise_floor_rms, .digits = 6 } } },
+                .{ "activity_quiet_threshold_rms", .{ .f32 = .{ .value = callback.activity.quiet_threshold_rms, .digits = 6 } } },
+                .{ "activity_active_threshold_rms", .{ .f32 = .{ .value = callback.activity.active_threshold_rms, .digits = 6 } } },
+            });
+            if (callback.samples_range) |range| fields.appendSliceAssumeCapacity(&.{
+                .{ "callback_samples_count_min", .{ .u = range.minimum } },
+                .{ "callback_samples_count_max", .{ .u = range.maximum } },
+            });
+        }
+        if (failure) |detail| {
+            const cause = captureFailureCause(detail.cause);
+            fields.appendSliceAssumeCapacity(&.{
+                .{ "problem_code", .{ .name = outcome_name } },
+                .{ "stage", .{ .name = @tagName(detail.stage) } },
+                .{ "cause_domain", .{ .name = cause.domain } },
+                .{ "cause_code", .{ .i = cause.code } },
+                .{ "detail", .{ .str = detail.message[0..detail.message_size] } },
+            });
+        }
+        capture_log.kv(report_severity, .{ .recording_id = recording_ordinal }, "capture_finished", fields.items);
     }
 
     // These failures reduce scheduling guarantees, not the validity of already
@@ -1679,14 +2024,14 @@ noinline fn logCaptureReport(recording_ordinal: u64, outcome_name: []const u8, r
     if (report.callback != null and
         (scheduler_priority <= 0 or !capture_module.schedulerPolicyIsRealtime(scheduler_policy)))
     {
-        log.warn(.{ .recording_ordinal = recording_ordinal }, "Capture did not obtain realtime scheduling: recording_ordinal={d}, policy={s}, priority={d}", .{
-            recording_ordinal, capture_module.schedulerPolicyName(scheduler_policy), scheduler_priority,
+        capture_log.warn(.{ .recording_id = recording_ordinal }, .capture_realtime_scheduling_unavailable, "scheduler_policy={s} scheduler_priority={d}", .{
+            capture_module.schedulerPolicyName(scheduler_policy), scheduler_priority,
         });
     }
     if (report.memory_lock == .unavailable) {
         const unavailable = report.memory_lock.unavailable;
-        log.warn(.{ .recording_ordinal = recording_ordinal }, "Capture memory was not locked: recording_ordinal={d}, errno={d}, memory_lock_size_max={d}", .{
-            recording_ordinal, unavailable.error_code, unavailable.limit_bytes,
+        capture_log.warn(.{ .recording_id = recording_ordinal }, .capture_memory_lock_unavailable, "system_error={f} memory_lock_size_max={d}", .{
+            logging.fmtErrno(unavailable.errno), unavailable.limit_bytes,
         });
     }
 }
@@ -1724,7 +2069,7 @@ fn register(
         &event,
     );
     if (linux.errno(result) != .SUCCESS) {
-        log.err(.{}, "Event registration failed: operation=epoll_ctl_add, fd={d}, source={t}, errno={f}", .{ descriptor, source, logging.fmtErrno(linux.errno(result)) });
+        log.err(.{}, .event_registration_failed, "operation=epoll_ctl_add descriptor={d} source={t} system_error={f}", .{ descriptor, source, logging.fmtErrno(linux.errno(result)) });
         return error.SupervisorEpollRegisterFailed;
     }
 }
@@ -1830,7 +2175,7 @@ fn descriptorFromResult(operation: []const u8, result: usize) !std.posix.fd_t {
 fn checkSyscall(operation: []const u8, result: usize) !void {
     const errno = linux.errno(result);
     if (errno == .SUCCESS) return;
-    log.err(.{}, "Supervisor system call failed: operation={s}, errno={f}", .{ operation, logging.fmtErrno(errno) });
+    log.err(.{}, .supervisor_system_call_failed, "operation={s} system_error={f}", .{ operation, logging.fmtErrno(errno) });
     return error.SupervisorSystemCallFailed;
 }
 
@@ -1839,7 +2184,7 @@ fn checkSyscall(operation: []const u8, result: usize) !void {
 // Linux releases the descriptor even when close reports a late I/O error.
 fn logCleanupSyscall(operation: []const u8, result: usize) void {
     const errno = linux.errno(result);
-    if (errno != .SUCCESS) log.err(.{}, "Supervisor cleanup failed: operation={s}, errno={f}", .{ operation, logging.fmtErrno(errno) });
+    if (errno != .SUCCESS) log.err(.{}, .supervisor_cleanup_failed, "operation={s} system_error={f}", .{ operation, logging.fmtErrno(errno) });
 }
 
 fn closeDescriptor(descriptor: std.posix.fd_t) void {

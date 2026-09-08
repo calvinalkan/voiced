@@ -150,7 +150,7 @@ pub const Worker = struct {
                     // resident returns only after joining compute workers and
                     // releasing their arena, vocabulary, and mapped weights.
                     if (resident(self, options)) |err| {
-                        logError(options.recording_ordinal, options.model.model, err);
+                        logError(options.recording_ordinal, options.model.model, err, .err);
                         self.mailbox.complete(.{ .err = err });
                     } else self.mailbox.complete(.{ .ok = .stopped });
                 },
@@ -172,14 +172,14 @@ fn resident(self: *Worker, prepare: @FieldType(Job, "prepare")) ?Error {
     };
     defer loaded.deinit();
     if (self.cancel.load(.acquire)) return null;
-    log.debug(.{ .recording_ordinal = prepare.recording_ordinal }, "Model weights loaded: recording_ordinal={d}, model_weights_load_duration_ms={f}", .{ prepare.recording_ordinal, decimal.fmt(@as(f64, @floatFromInt(monotonicNanoseconds() - model_load_started_ns)) / std.time.ns_per_ms, 3) });
+    log.debug(.{ .recording_id = prepare.recording_ordinal }, .model_weights_loaded, "model_weights_load_duration_ms={f}", .{decimal.fmt(@as(f64, @floatFromInt(monotonicNanoseconds() - model_load_started_ns)) / std.time.ns_per_ms, 3)});
     const vocabulary_started_ns = monotonicNanoseconds();
     const vocabulary = model_cache.loadVocabulary(context, launch.model) catch |err| {
         return diagnostic(.model_load, @errorName(err), .{});
     };
     defer allocator.free(vocabulary);
     if (self.cancel.load(.acquire)) return null;
-    log.debug(.{ .recording_ordinal = prepare.recording_ordinal }, "Model vocabulary loaded: recording_ordinal={d}, model_vocabulary_load_duration_ms={f}", .{ prepare.recording_ordinal, decimal.fmt(@as(f64, @floatFromInt(monotonicNanoseconds() - vocabulary_started_ns)) / std.time.ns_per_ms, 3) });
+    log.debug(.{ .recording_id = prepare.recording_ordinal }, .model_vocabulary_loaded, "model_vocabulary_load_duration_ms={f}", .{decimal.fmt(@as(f64, @floatFromInt(monotonicNanoseconds() - vocabulary_started_ns)) / std.time.ns_per_ms, 3)});
     const runtime_started_ns = monotonicNanoseconds();
     const policy: inference.Policy = .{
         .samples_count_max = audio_exchange.slot_samples_capacity,
@@ -198,7 +198,7 @@ fn resident(self: *Worker, prepare: @FieldType(Job, "prepare")) ?Error {
     };
     defer runtime.deinit();
     if (self.cancel.load(.acquire)) return null;
-    log.debug(.{ .recording_ordinal = prepare.recording_ordinal }, "Model runtime initialized: recording_ordinal={d}, model_runtime_init_duration_ms={f}, model_runtime_size={d}", .{ prepare.recording_ordinal, decimal.fmt(@as(f64, @floatFromInt(monotonicNanoseconds() - runtime_started_ns)) / std.time.ns_per_ms, 3), memory_size });
+    log.debug(.{ .recording_id = prepare.recording_ordinal }, .model_runtime_initialized, "model_runtime_init_duration_ms={f} model_runtime_size={d}", .{ decimal.fmt(@as(f64, @floatFromInt(monotonicNanoseconds() - runtime_started_ns)) / std.time.ns_per_ms, 3), memory_size });
     const model_prepare_duration_ns = monotonicNanoseconds() - model_load_started_ns;
 
     self.mailbox.complete(.{ .ok = .{ .ready = .{
@@ -266,7 +266,7 @@ fn transcribe(self: *Worker, launch: ModelOptions, loaded: *const model_cache.Lo
         problem = diagnostic(stage, message, evidence);
         // Journal the original diagnostic before filesystem work: a stuck save
         // may force a daemon restart before the typed completion reaches main.
-        logError(work.recording_ordinal, launch.model, problem.?);
+        logError(work.recording_ordinal, launch.model, problem.?, if (limit == .none) .err else .warn);
         if (self.capture_directory) |path| {
             var timestamp: linux.timespec = undefined;
             const time_result = linux.clock_gettime(.REALTIME, &timestamp);
@@ -289,8 +289,8 @@ fn transcribe(self: *Worker, launch: ModelOptions, loaded: *const model_cache.Lo
                 .end = if (decoded) |value| @tagName(value.end) else null,
             };
             switch (transcription_debug.save(self.context.io, path, samples, if (decoded) |value| value.text else "", runtime.generated_tokens[0..evidence.tokens], metadata)) {
-                .ok => log.info(.{ .recording_ordinal = work.recording_ordinal }, "Failed transcription saved: recording_ordinal={d}, chunk_ordinal={d}, path=\"{f}/last-failed\"", .{ work.recording_ordinal, evidence.chunk, std.zig.fmtString(path) }),
-                .err => |err| transcription_debug.logError(.{ .recording_ordinal = work.recording_ordinal }, err, path),
+                .ok => log.debug(.{ .recording_id = work.recording_ordinal }, .transcription_capture_saved, "chunk_id={d} path=\"{f}/last-failed\"", .{ evidence.chunk, std.zig.fmtString(path) }),
+                .err => |err| transcription_debug.logError(.{ .recording_id = work.recording_ordinal }, err, path),
             }
         }
         if (limit == .none) return .{ .err = problem.? };
@@ -313,39 +313,37 @@ fn transcribe(self: *Worker, launch: ModelOptions, loaded: *const model_cache.Lo
     } } };
 }
 
-noinline fn logError(recording_ordinal: u64, selected_model: models.Model, err: Error) void {
-    if (logging.enabled(.err)) switch (err) {
+noinline fn logError(recording_ordinal: u64, selected_model: models.Model, err: Error, severity: logging.Level) void {
+    if (logging.enabled(severity)) switch (err) {
         .model_load, .feature_extraction, .inference, .text_decode => |detail| {
-            const context: logging.Context = .{ .recording_ordinal = recording_ordinal };
-            log.kv(.err, context, "Transcription error", &.{
-                .{ "recording_ordinal", .{ .u = recording_ordinal } },
+            const context: logging.Context = .{ .recording_id = recording_ordinal };
+            var storage: [15]logging.Entry = undefined;
+            var fields: std.ArrayList(logging.Entry) = .initBuffer(&storage);
+            fields.appendSliceAssumeCapacity(&.{
                 .{ "model", .{ .str = selected_model.name() } },
-                .{ "stage", .{ .str = @tagName(err) } },
+                .{ "problem_code", .{ .name = @tagName(err) } },
                 .{ "detail", .{ .str = detail.messageBytes() } },
             });
             const evidence = detail.evidence;
             if (evidence.chunk_available) {
-                log.kv(.err, context, "Transcription error evidence", &.{
-                    .{ "recording_ordinal", .{ .u = recording_ordinal } },
-                    .{ "chunk_ordinal", .{ .u = evidence.chunk } },
+                fields.appendSliceAssumeCapacity(&.{
+                    .{ "chunk_id", .{ .u = evidence.chunk } },
                     .{ "audio_samples_count", .{ .u = evidence.samples } },
                     .{ "audio_duration_seconds", .{ .f = .{ .value = @as(f64, @floatFromInt(evidence.samples)) / 16000, .digits = 3 } } },
-                    .{ "tokens_count_max", .{ .u = evidence.token_limit } },
+                    .{ "transcription_tokens_count_max", .{ .u = evidence.token_limit } },
                     .{ "features_duration_ms", .{ .f = .{ .value = @as(f64, @floatFromInt(evidence.log_mel_ns)) / std.time.ns_per_ms, .digits = 3 } } },
                     .{ "encoder_duration_ms", .{ .f = .{ .value = @as(f64, @floatFromInt(evidence.encoder_ns)) / std.time.ns_per_ms, .digits = 3 } } },
                     .{ "cross_key_values_duration_ms", .{ .f = .{ .value = @as(f64, @floatFromInt(evidence.cross_key_values_ns)) / std.time.ns_per_ms, .digits = 3 } } },
                     .{ "decoder_duration_ms", .{ .f = .{ .value = @as(f64, @floatFromInt(evidence.decoder_ns)) / std.time.ns_per_ms, .digits = 3 } } },
                 });
-                if (evidence.decoding_available) log.kv(.err, context, "Decoder error evidence", &.{
-                    .{ "recording_ordinal", .{ .u = recording_ordinal } },
-                    .{ "chunk_ordinal", .{ .u = evidence.chunk } },
-                    .{ "tokens_count", .{ .u = evidence.tokens } },
-                    .{ "tokens_count_max", .{ .u = evidence.token_limit } },
+                if (evidence.decoding_available) fields.appendSliceAssumeCapacity(&.{
+                    .{ "transcription_tokens_count", .{ .u = evidence.tokens } },
                     .{ "encoder_positions_count", .{ .u = evidence.encoder_positions } },
                     .{ "no_speech_probability", .{ .f32 = .{ .value = evidence.no_speech_probability, .digits = 6 } } },
                     .{ "average_log_probability", .{ .f32 = .{ .value = evidence.average_log_probability, .digits = 6 } } },
                 });
             }
+            log.kv(severity, context, if (severity == .err) "transcription_failed" else "transcription_limited", fields.items);
         },
     };
 }

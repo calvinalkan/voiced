@@ -21,10 +21,12 @@ pub const schedulerPolicyIsRealtime = pipewire.schedulerPolicyIsRealtime;
 pub const CaptureReport = pipewire.Report;
 pub const RuntimeFailure = pipewire.RuntimeFailure;
 pub const FailureCause = pipewire.FailureCause;
+pub const SourceIdentity = pipewire.SourceIdentity;
 pub const Error = pipewire.Error;
 const Result = pipewire.Result;
 
 pub const Job = struct {
+    recording_id: u64,
     source: Source,
     recording_samples_target: u32,
 };
@@ -53,6 +55,7 @@ pub const Worker = struct {
         defer self.mailbox.finish();
         while (self.mailbox.next()) |job| {
             const result = pipewire.run(.{
+                .recording_id = job.recording_id,
                 .exchange = self.exchange,
                 .publication_event_fd = self.mailbox.notification_fd,
                 .control_event_fd = self.mailbox.wake_fd,
