@@ -138,6 +138,60 @@ pub const Field = union(enum) {
 };
 pub const Entry = struct { []const u8, Field };
 
+/// Builds a bounded field list whose storage and names come from a dense,
+/// zero-based enum. Each name has one slot; duplicate additions assert in safe
+/// builds and overwrite that slot otherwise. `items()` compacts populated slots
+/// into enum declaration order.
+pub fn EnumFieldSet(comptime Name: type) type {
+    const names = std.meta.fields(Name);
+    comptime {
+        // Large schemas validate every identifier byte and can exceed Zig's
+        // default compile-time branch quota.
+        @setEvalBranchQuota(10_000);
+        if (@typeInfo(Name) != .@"enum") @compileError("logging field names must be an enum");
+        if (names.len > @bitSizeOf(u64)) @compileError("logging field enum exceeds the presence mask");
+        for (names, 0..) |name, index| {
+            if (name.value != index) @compileError("logging field enum must be dense and zero-based");
+            assertIdentifier(name.name);
+        }
+    }
+
+    return struct {
+        const Self = @This();
+        pub const Value = struct { Name, Field };
+
+        storage: [names.len]Entry = undefined,
+        present_mask: u64 = 0,
+
+        pub fn init(fields: *Self) void {
+            fields.present_mask = 0;
+        }
+
+        pub fn addAll(fields: *Self, values: []const Value) void {
+            for (values) |value| fields.add(value[0], value[1]);
+        }
+
+        pub fn add(fields: *Self, name: Name, value: Field) void {
+            const index = @intFromEnum(name);
+            const mask = @as(u64, 1) << @intCast(index);
+            std.debug.assert(fields.present_mask & mask == 0);
+            fields.storage[index] = .{ @tagName(name), value };
+            fields.present_mask |= mask;
+        }
+
+        pub fn items(fields: *Self) []const Entry {
+            var count: usize = 0;
+            for (std.meta.tags(Name)) |name| {
+                const index = @intFromEnum(name);
+                if (fields.present_mask & (@as(u64, 1) << @intCast(index)) == 0) continue;
+                fields.storage[count] = fields.storage[index];
+                count += 1;
+            }
+            return fields.storage[0..count];
+        }
+    };
+}
+
 pub fn scoped(comptime component: @EnumLiteral()) type {
     return struct {
         /// Appends ordered `key=value` fields to one event. Event names, keys,

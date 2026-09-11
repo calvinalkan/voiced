@@ -718,6 +718,7 @@ noinline fn dispatchControl(supervisor: *Supervisor, client_index: usize, reques
         .whisper_base_en => .whisper_base_en,
         .whisper_small_en => .whisper_small_en,
         .whisper_medium_en => .whisper_medium_en,
+        .whisper_tiny_en => .whisper_tiny_en,
     };
     const recording_started_ns = if (phase == .capturing)
         service.pending_recording orelse supervisor.recording_requested_monotonic_ns
@@ -1626,20 +1627,28 @@ fn openClipboard(supervisor: *Supervisor) void {
 }
 
 fn logClipboardReady(supervisor: *const Supervisor) void {
-    clipboard_log.event(.debug, deliveryContext(supervisor), "clipboard_ready", &.{
-        .{ "clipboard_backend_policy", .{ .name = @tagName(supervisor.options.clipboard_backend) } },
-        .{ "clipboard_backend", .{ .name = supervisor.clipboard.connected.backendName() } },
-        .{ "clipboard_mode", .{ .name = @tagName(supervisor.clipboard.connected.mode) } },
+    var fields: ClipboardDiagnosticFields = undefined;
+    fields.init();
+    fields.addAll(&.{
+        .{ .clipboard_backend_policy, .{ .name = @tagName(supervisor.options.clipboard_backend) } },
+        .{ .clipboard_backend, .{ .name = supervisor.clipboard.connected.backendName() } },
+        .{ .clipboard_mode, .{ .name = @tagName(supervisor.clipboard.connected.mode) } },
     });
+    clipboard_log.event(.debug, deliveryContext(supervisor), "clipboard_ready", fields.items());
 }
 
 fn logClipboardCandidateNotice(supervisor: *const Supervisor, notice: Clipboard.CandidateNotice) void {
     switch (notice) {
-        .skipped => |skip| clipboard_log.event(.debug, deliveryContext(supervisor), "clipboard_candidate_skipped", &.{
-            .{ "candidate", .{ .name = @tagName(skip.candidate) } },
-            .{ "reason", .{ .name = "protocol_not_advertised" } },
-            .{ "fallback", .{ .name = @tagName(skip.fallback) } },
-        }),
+        .skipped => |skip| {
+            var fields: ClipboardDiagnosticFields = undefined;
+            fields.init();
+            fields.addAll(&.{
+                .{ .clipboard_candidate, .{ .name = @tagName(skip.candidate) } },
+                .{ .clipboard_skip_reason, .{ .name = "protocol_not_advertised" } },
+                .{ .clipboard_fallback, .{ .name = @tagName(skip.fallback) } },
+            });
+            clipboard_log.event(.debug, deliveryContext(supervisor), "clipboard_candidate_skipped", fields.items());
+        },
         .failed => |failure| logClipboardCandidateFailure(supervisor, failure.candidate, failure.fallback, failure.error_detail),
     }
 }
@@ -1972,14 +1981,14 @@ fn closeClipboard(supervisor: *Supervisor) void {
 
 fn refuseClipboardStartup(supervisor: *Supervisor, err: Clipboard.Error) error{ClipboardBackendUnavailable} {
     if (logging.enabled(.err)) {
-        var storage: [12]logging.Entry = undefined;
-        var fields: std.ArrayList(logging.Entry) = .initBuffer(&storage);
-        fields.appendSliceAssumeCapacity(&.{
-            .{ "error", .{ .verbatim = "ClipboardBackendUnavailable" } },
-            .{ "clipboard_backend_policy", .{ .name = @tagName(supervisor.options.clipboard_backend) } },
+        var fields: ClipboardDiagnosticFields = undefined;
+        fields.init();
+        fields.addAll(&.{
+            .{ .@"error", .{ .verbatim = "ClipboardBackendUnavailable" } },
+            .{ .clipboard_backend_policy, .{ .name = @tagName(supervisor.options.clipboard_backend) } },
         });
         _ = appendClipboardErrorFields(&fields, &err);
-        log.event(.err, .{}, "service_startup_refused", fields.items);
+        log.event(.err, .{}, "service_startup_refused", fields.items());
     }
     closeClipboard(supervisor);
     return error.ClipboardBackendUnavailable;
@@ -1987,27 +1996,28 @@ fn refuseClipboardStartup(supervisor: *Supervisor, err: Clipboard.Error) error{C
 
 fn logClipboardCandidateFailure(supervisor: *const Supervisor, candidate: Clipboard.Candidate, fallback: Clipboard.Candidate, err: Clipboard.Error) void {
     if (!logging.enabled(.warn)) return;
-    var storage: [12]logging.Entry = undefined;
-    var fields: std.ArrayList(logging.Entry) = .initBuffer(&storage);
-    fields.appendSliceAssumeCapacity(&.{
-        .{ "candidate", .{ .name = @tagName(candidate) } },
-        .{ "fallback", .{ .name = @tagName(fallback) } },
+    var fields: ClipboardDiagnosticFields = undefined;
+    fields.init();
+    fields.addAll(&.{
+        .{ .clipboard_candidate, .{ .name = @tagName(candidate) } },
+        .{ .clipboard_fallback, .{ .name = @tagName(fallback) } },
     });
     _ = appendClipboardErrorFields(&fields, &err);
-    clipboard_log.event(.warn, deliveryContext(supervisor), "clipboard_candidate_failed", fields.items);
+    clipboard_log.event(.warn, deliveryContext(supervisor), "clipboard_candidate_failed", fields.items());
 }
 
 fn clipboardError(supervisor: *Supervisor, err: Clipboard.Error) void {
     const delivery_failed = supervisor.phase == .delivering;
     const severity: logging.Level = if (delivery_failed) .err else .warn;
     if (logging.enabled(severity)) {
-        var storage: [12]logging.Entry = undefined;
-        var fields: std.ArrayList(logging.Entry) = .initBuffer(&storage);
+        var fields: ClipboardDiagnosticFields = undefined;
+        fields.init();
+        if (clipboardErrorMode(supervisor)) |mode| fields.add(.clipboard_mode, .{ .name = @tagName(mode) });
         const protocol_error = appendClipboardErrorFields(&fields, &err);
-        fields.appendSliceAssumeCapacity(&.{
-            .{ "transfers_completed_count", .{ .u = supervisor.clipboard.connected.transfers_completed } },
-            .{ "transfers_expired_count", .{ .u = supervisor.clipboard.connected.transfers_expired } },
-            .{ "transfers_rejected_count", .{ .u = supervisor.clipboard.connected.transfers_rejected } },
+        fields.addAll(&.{
+            .{ .clipboard_transfers_completed_count, .{ .u = supervisor.clipboard.connected.transfers_completed } },
+            .{ .clipboard_transfers_expired_count, .{ .u = supervisor.clipboard.connected.transfers_expired } },
+            .{ .clipboard_transfers_rejected_count, .{ .u = supervisor.clipboard.connected.transfers_rejected } },
         });
         const event = if (!delivery_failed)
             "clipboard_connection_lost"
@@ -2015,78 +2025,117 @@ fn clipboardError(supervisor: *Supervisor, err: Clipboard.Error) void {
             "clipboard_protocol_failed"
         else
             "clipboard_failed";
-        clipboard_log.event(severity, deliveryContext(supervisor), event, fields.items);
+        clipboard_log.event(severity, deliveryContext(supervisor), event, fields.items());
     }
     closeClipboard(supervisor);
     if (delivery_failed) cancelDelivery(supervisor, .{ .clipboard = clipboardProblem(err) });
 }
 
-fn appendClipboardErrorFields(fields: *std.ArrayList(logging.Entry), err: *const Clipboard.Error) bool {
+fn clipboardErrorMode(supervisor: *const Supervisor) ?Clipboard.Mode {
+    if (supervisor.phase == .delivering) if (supervisor.phase.delivering.metrics.clipboard_mode) |mode| return mode;
+    return if (supervisor.clipboard.connected.ready()) supervisor.clipboard.connected.mode else null;
+}
+
+const ClipboardDiagnosticField = enum {
+    @"error",
+    clipboard_backend_policy,
+    clipboard_candidate,
+    clipboard_skip_reason,
+    clipboard_fallback,
+    clipboard_backend,
+    clipboard_mode,
+    clipboard_error_kind,
+    clipboard_error,
+    system_error,
+    clipboard_feature,
+    clipboard_phase,
+    wayland_object,
+    wayland_opcode,
+    wayland_server_error_code,
+    wayland_server_error_message,
+    wayland_server_error_message_truncated,
+    x11_response_type,
+    x11_sequence,
+    x11_setup_status,
+    x11_setup_message,
+    x11_setup_message_truncated,
+    x11_server_error_code,
+    x11_major_opcode,
+    x11_minor_opcode,
+    x11_bad_value,
+    clipboard_transfers_completed_count,
+    clipboard_transfers_expired_count,
+    clipboard_transfers_rejected_count,
+};
+
+const ClipboardDiagnosticFields = logging.EnumFieldSet(ClipboardDiagnosticField);
+
+fn appendClipboardErrorFields(fields: *ClipboardDiagnosticFields, err: *const Clipboard.Error) bool {
     var protocol_error = false;
     switch (err.*) {
         .wayland => |*detail| {
-            fields.appendSliceAssumeCapacity(&.{
-                .{ "backend", .{ .str = "wayland" } },
-                .{ "kind", .{ .str = @tagName(detail.*) } },
+            fields.addAll(&.{
+                .{ .clipboard_backend, .{ .name = "wayland" } },
+                .{ .clipboard_error_kind, .{ .name = @tagName(detail.*) } },
             });
             switch (detail.*) {
-                .transport => |failure| fields.appendSliceAssumeCapacity(&.{
-                    .{ "error", .{ .str = @errorName(failure.cause) } },
-                    .{ "system_error", .{ .errno = failure.errno } },
-                    .{ "object", .{ .u = failure.object } },
-                    .{ "opcode", .{ .u = failure.opcode } },
+                .transport => |failure| fields.addAll(&.{
+                    .{ .clipboard_error, .{ .str = @errorName(failure.cause) } },
+                    .{ .system_error, .{ .errno = failure.errno } },
+                    .{ .wayland_object, .{ .u = failure.object } },
+                    .{ .wayland_opcode, .{ .u = failure.opcode } },
                 }),
                 .server => |*failure| {
                     protocol_error = true;
-                    fields.appendSliceAssumeCapacity(&.{
-                        .{ "object", .{ .u = failure.object } },
-                        .{ "code", .{ .u = failure.code } },
-                        .{ "message", .{ .str = failure.message[0..failure.message_size] } },
-                        .{ "truncated", .{ .b = failure.truncated } },
+                    fields.addAll(&.{
+                        .{ .wayland_object, .{ .u = failure.object } },
+                        .{ .wayland_server_error_code, .{ .u = failure.code } },
+                        .{ .wayland_server_error_message, .{ .str = failure.message[0..failure.message_size] } },
+                        .{ .wayland_server_error_message_truncated, .{ .b = failure.truncated } },
                     });
                 },
-                .unsupported => |feature| fields.appendAssumeCapacity(.{ "feature", .{ .str = @tagName(feature) } }),
-                .timed_out => |phase| fields.appendAssumeCapacity(.{ "phase", .{ .str = @tagName(phase) } }),
+                .unsupported => |feature| fields.add(.clipboard_feature, .{ .name = @tagName(feature) }),
+                .timed_out => |phase| fields.add(.clipboard_phase, .{ .name = @tagName(phase) }),
                 .selection_lost, .busy, .invalid_text => {},
             }
         },
         .x11 => |*detail| {
-            fields.appendSliceAssumeCapacity(&.{
-                .{ "backend", .{ .str = "x11" } },
-                .{ "kind", .{ .str = @tagName(detail.*) } },
+            fields.addAll(&.{
+                .{ .clipboard_backend, .{ .name = "x11" } },
+                .{ .clipboard_error_kind, .{ .name = @tagName(detail.*) } },
             });
             switch (detail.*) {
-                .transport => |failure| fields.appendSliceAssumeCapacity(&.{
-                    .{ "error", .{ .str = @errorName(failure.cause) } },
-                    .{ "system_error", .{ .errno = failure.errno } },
-                    .{ "response_type", .{ .u = failure.response_type } },
-                    .{ "sequence", .{ .u = failure.sequence } },
+                .transport => |failure| fields.addAll(&.{
+                    .{ .clipboard_error, .{ .str = @errorName(failure.cause) } },
+                    .{ .system_error, .{ .errno = failure.errno } },
+                    .{ .x11_response_type, .{ .u = failure.response_type } },
+                    .{ .x11_sequence, .{ .u = failure.sequence } },
                 }),
-                .setup => |*failure| fields.appendSliceAssumeCapacity(&.{
-                    .{ "status", .{ .u = failure.status } },
-                    .{ "message", .{ .str = failure.reason[0..failure.reason_size] } },
-                    .{ "truncated", .{ .b = failure.truncated } },
+                .setup => |*failure| fields.addAll(&.{
+                    .{ .x11_setup_status, .{ .u = failure.status } },
+                    .{ .x11_setup_message, .{ .str = failure.reason[0..failure.reason_size] } },
+                    .{ .x11_setup_message_truncated, .{ .b = failure.truncated } },
                 }),
                 .server => |failure| {
                     protocol_error = true;
-                    fields.appendSliceAssumeCapacity(&.{
-                        .{ "code", .{ .u = failure.code } },
-                        .{ "sequence", .{ .u = failure.sequence } },
-                        .{ "major_opcode", .{ .u = failure.major_opcode } },
-                        .{ "minor_opcode", .{ .u = failure.minor_opcode } },
-                        .{ "bad_value", .{ .u = failure.bad_value } },
+                    fields.addAll(&.{
+                        .{ .x11_server_error_code, .{ .u = failure.code } },
+                        .{ .x11_sequence, .{ .u = failure.sequence } },
+                        .{ .x11_major_opcode, .{ .u = failure.major_opcode } },
+                        .{ .x11_minor_opcode, .{ .u = failure.minor_opcode } },
+                        .{ .x11_bad_value, .{ .u = failure.bad_value } },
                     });
                 },
-                .authority => |failure| fields.appendSliceAssumeCapacity(&.{
-                    .{ "error", .{ .str = @errorName(failure.cause) } },
-                    .{ "system_error", .{ .errno = failure.errno } },
+                .authority => |failure| fields.addAll(&.{
+                    .{ .clipboard_error, .{ .str = @errorName(failure.cause) } },
+                    .{ .system_error, .{ .errno = failure.errno } },
                 }),
-                .unsupported => |feature| fields.appendAssumeCapacity(.{ "feature", .{ .str = @tagName(feature) } }),
-                .timed_out => |phase| fields.appendAssumeCapacity(.{ "phase", .{ .str = @tagName(phase) } }),
+                .unsupported => |feature| fields.add(.clipboard_feature, .{ .name = @tagName(feature) }),
+                .timed_out => |phase| fields.add(.clipboard_phase, .{ .name = @tagName(phase) }),
                 .selection_lost, .busy, .invalid_text => {},
             }
         },
-        .unavailable, .busy, .invalid_text => fields.appendAssumeCapacity(.{ "kind", .{ .str = @tagName(err.*) } }),
+        .unavailable, .busy, .invalid_text => fields.add(.clipboard_error_kind, .{ .name = @tagName(err.*) }),
     }
     return protocol_error;
 }
@@ -2280,90 +2329,90 @@ noinline fn logCaptureReport(recording_ordinal: u64, outcome_name: []const u8, r
         -1;
 
     if (logging.enabled(report_severity)) {
-        var storage: [51]logging.Entry = undefined;
-        var fields: std.ArrayList(logging.Entry) = .initBuffer(&storage);
-        fields.appendSliceAssumeCapacity(&.{
-            .{ "outcome", .{ .name = outcome } },
-            .{ "audio_duration_seconds", .{ .f = .{ .value = @as(f64, @floatFromInt(report.samples_count)) / Capture.sample_rate_hz, .digits = 3 } } },
-            .{ "audio_samples_published_count", .{ .u = report.published_samples_count } },
-            .{ "audio_samples_captured_count", .{ .u = report.samples_count } },
-            .{ "audio_slots_published_count", .{ .u = report.slot_publications_count } },
-            .{ "microphone_description", .{ .str = source_description } },
-            .{ "pipewire_server_version", .{ .str = report.pipewire_server_version[0..report.pipewire_server_version_size] } },
-            .{ "pipewire_client_node_version_advertised", .{ .u = report.client_node_version_advertised } },
-            .{ "pipewire_client_node_version_selected", .{ .u = report.client_node_version_selected } },
-            .{ "capture_thread_id", .{ .i = report.main_loop_thread_id } },
+        var fields: CaptureReportFields = undefined;
+        fields.init();
+        fields.addAll(&.{
+            .{ .outcome, .{ .name = outcome } },
+            .{ .audio_duration_seconds, .{ .f = .{ .value = @as(f64, @floatFromInt(report.samples_count)) / Capture.sample_rate_hz, .digits = 3 } } },
+            .{ .audio_samples_published_count, .{ .u = report.published_samples_count } },
+            .{ .audio_samples_captured_count, .{ .u = report.samples_count } },
+            .{ .audio_slots_published_count, .{ .u = report.slot_publications_count } },
+            .{ .microphone_description, .{ .str = source_description } },
+            .{ .pipewire_server_version, .{ .str = report.pipewire_server_version[0..report.pipewire_server_version_size] } },
+            .{ .pipewire_client_node_version_advertised, .{ .u = report.client_node_version_advertised } },
+            .{ .pipewire_client_node_version_selected, .{ .u = report.client_node_version_selected } },
+            .{ .capture_thread_id, .{ .i = report.main_loop_thread_id } },
         });
-        if (report.negotiated_format) |format| fields.appendSliceAssumeCapacity(&.{
-            .{ "graph_rate_hz", .{ .u = format.sample_rate_hz } },
-            .{ "graph_channels_count", .{ .u = format.channels_count } },
+        if (report.negotiated_format) |format| fields.addAll(&.{
+            .{ .graph_rate_hz, .{ .u = format.sample_rate_hz } },
+            .{ .graph_channels_count, .{ .u = format.channels_count } },
         });
         if (report.source_identity) |source| {
-            fields.appendSliceAssumeCapacity(&.{
-                .{ "pipewire_node_id", .{ .u = source.node_id } },
-                .{ "pipewire_node_serial", .{ .u = source.node_object_serial } },
-                .{ "microphone_node_name", .{ .str = source.node_name[0..source.node_name_size] } },
+            fields.addAll(&.{
+                .{ .pipewire_node_id, .{ .u = source.node_id } },
+                .{ .pipewire_node_serial, .{ .u = source.node_object_serial } },
+                .{ .microphone_node_name, .{ .str = source.node_name[0..source.node_name_size] } },
             });
-            if (source.device_id != std.math.maxInt(u32)) fields.appendSliceAssumeCapacity(&.{
-                .{ "pipewire_device_id", .{ .u = source.device_id } },
-                .{ "pipewire_device_serial", .{ .u = source.device_object_serial } },
-                .{ "microphone_serial", .{ .str = source.device_serial[0..source.device_serial_size] } },
-                .{ "microphone_device_description", .{ .str = source.device_description[0..source.device_description_size] } },
+            if (source.device_id != std.math.maxInt(u32)) fields.addAll(&.{
+                .{ .pipewire_device_id, .{ .u = source.device_id } },
+                .{ .pipewire_device_serial, .{ .u = source.device_object_serial } },
+                .{ .microphone_serial, .{ .str = source.device_serial[0..source.device_serial_size] } },
+                .{ .microphone_device_description, .{ .str = source.device_description[0..source.device_description_size] } },
             });
         }
         switch (report.memory_lock) {
-            .locked => |size| fields.appendSliceAssumeCapacity(&.{
-                .{ "memory_lock_outcome", .{ .name = "succeeded" } },
-                .{ "memory_lock_size_max", .{ .u = size } },
+            .locked => |size| fields.addAll(&.{
+                .{ .memory_lock_outcome, .{ .name = "succeeded" } },
+                .{ .memory_lock_size_max, .{ .u = size } },
             }),
-            .unavailable => |detail| fields.appendSliceAssumeCapacity(&.{
-                .{ "memory_lock_outcome", .{ .name = "failed" } },
-                .{ "memory_lock_system_error", .{ .errno = detail.errno } },
-                .{ "memory_lock_size_max", .{ .u = detail.limit_bytes } },
+            .unavailable => |detail| fields.addAll(&.{
+                .{ .memory_lock_outcome, .{ .name = "failed" } },
+                .{ .memory_lock_system_error, .{ .errno = detail.errno } },
+                .{ .memory_lock_size_max, .{ .u = detail.limit_bytes } },
             }),
         }
         if (report.callback) |callback| {
-            fields.appendSliceAssumeCapacity(&.{
-                .{ "callback_thread_id", .{ .i = callback.thread_id } },
-                .{ "callback_scheduler_policy", .{ .name = Capture.schedulerPolicyName(callback.scheduler_policy orelse -1) } },
-                .{ "callback_scheduler_priority", .{ .i = callback.scheduler_priority orelse -1 } },
-                .{ "callbacks_count", .{ .u = callback.callbacks_count } },
-                .{ "callback_missing_buffers_count", .{ .u = callback.missing_buffers_count } },
-                .{ "callback_clipped_samples_count", .{ .u = callback.clipped_samples_count } },
-                .{ "callback_header_metadata_buffers_count", .{ .u = callback.header_metadata_buffers_count } },
-                .{ "callback_header_gap_buffers_count", .{ .u = callback.header_gap_buffers_count } },
-                .{ "callback_header_gap_samples_count", .{ .u = callback.header_gap_samples_count } },
-                .{ "callback_duration_ms_max", .{ .f = .{ .value = @as(f64, @floatFromInt(callback.duration_ns_max)) / std.time.ns_per_ms, .digits = 3 } } },
-                .{ "callback_gap_ms_max", .{ .f = .{ .value = @as(f64, @floatFromInt(callback.gap_ns_max)) / std.time.ns_per_ms, .digits = 3 } } },
-                .{ "activity", .{ .name = @tagName(callback.activity.activity) } },
-                .{ "activity_samples_count", .{ .u = callback.activity.activity_samples_count } },
-                .{ "activity_observed_samples_count", .{ .u = callback.activity.observed_samples_count } },
-                .{ "activity_unknown_samples_count", .{ .u = callback.activity.unknown_samples_count } },
-                .{ "activity_quiet_samples_count", .{ .u = callback.activity.quiet_samples_count } },
-                .{ "activity_active_samples_count", .{ .u = callback.activity.active_samples_count } },
-                .{ "activity_changes_count", .{ .u = callback.activity.activity_changes_count } },
-                .{ "activity_active_run_samples_count_max", .{ .u = callback.activity.active_run_samples_count_max } },
-                .{ "activity_quiet_run_samples_count_max", .{ .u = callback.activity.quiet_run_samples_count_max } },
-                .{ "activity_noise_floor_rms", .{ .f32 = .{ .value = callback.activity.noise_floor_rms, .digits = 6 } } },
-                .{ "activity_quiet_threshold_rms", .{ .f32 = .{ .value = callback.activity.quiet_threshold_rms, .digits = 6 } } },
-                .{ "activity_active_threshold_rms", .{ .f32 = .{ .value = callback.activity.active_threshold_rms, .digits = 6 } } },
+            fields.addAll(&.{
+                .{ .callback_thread_id, .{ .i = callback.thread_id } },
+                .{ .callback_scheduler_policy, .{ .name = Capture.schedulerPolicyName(callback.scheduler_policy orelse -1) } },
+                .{ .callback_scheduler_priority, .{ .i = callback.scheduler_priority orelse -1 } },
+                .{ .callbacks_count, .{ .u = callback.callbacks_count } },
+                .{ .callback_missing_buffers_count, .{ .u = callback.missing_buffers_count } },
+                .{ .callback_clipped_samples_count, .{ .u = callback.clipped_samples_count } },
+                .{ .callback_header_metadata_buffers_count, .{ .u = callback.header_metadata_buffers_count } },
+                .{ .callback_header_gap_buffers_count, .{ .u = callback.header_gap_buffers_count } },
+                .{ .callback_header_gap_samples_count, .{ .u = callback.header_gap_samples_count } },
+                .{ .callback_duration_ms_max, .{ .f = .{ .value = @as(f64, @floatFromInt(callback.duration_ns_max)) / std.time.ns_per_ms, .digits = 3 } } },
+                .{ .callback_gap_ms_max, .{ .f = .{ .value = @as(f64, @floatFromInt(callback.gap_ns_max)) / std.time.ns_per_ms, .digits = 3 } } },
+                .{ .activity, .{ .name = @tagName(callback.activity.activity) } },
+                .{ .activity_samples_count, .{ .u = callback.activity.activity_samples_count } },
+                .{ .activity_observed_samples_count, .{ .u = callback.activity.observed_samples_count } },
+                .{ .activity_unknown_samples_count, .{ .u = callback.activity.unknown_samples_count } },
+                .{ .activity_quiet_samples_count, .{ .u = callback.activity.quiet_samples_count } },
+                .{ .activity_active_samples_count, .{ .u = callback.activity.active_samples_count } },
+                .{ .activity_changes_count, .{ .u = callback.activity.activity_changes_count } },
+                .{ .activity_active_run_samples_count_max, .{ .u = callback.activity.active_run_samples_count_max } },
+                .{ .activity_quiet_run_samples_count_max, .{ .u = callback.activity.quiet_run_samples_count_max } },
+                .{ .activity_noise_floor_rms, .{ .f32 = .{ .value = callback.activity.noise_floor_rms, .digits = 6 } } },
+                .{ .activity_quiet_threshold_rms, .{ .f32 = .{ .value = callback.activity.quiet_threshold_rms, .digits = 6 } } },
+                .{ .activity_active_threshold_rms, .{ .f32 = .{ .value = callback.activity.active_threshold_rms, .digits = 6 } } },
             });
-            if (callback.samples_range) |range| fields.appendSliceAssumeCapacity(&.{
-                .{ "callback_samples_count_min", .{ .u = range.minimum } },
-                .{ "callback_samples_count_max", .{ .u = range.maximum } },
+            if (callback.samples_range) |range| fields.addAll(&.{
+                .{ .callback_samples_count_min, .{ .u = range.minimum } },
+                .{ .callback_samples_count_max, .{ .u = range.maximum } },
             });
         }
         if (failure) |detail| {
             const cause = captureFailureCause(detail.cause);
-            fields.appendSliceAssumeCapacity(&.{
-                .{ "problem_code", .{ .name = outcome_name } },
-                .{ "stage", .{ .name = @tagName(detail.stage) } },
-                .{ "cause_domain", .{ .name = cause.domain } },
-                .{ "cause_code", .{ .i = cause.code } },
-                .{ "detail", .{ .str = detail.message[0..detail.message_size] } },
+            fields.addAll(&.{
+                .{ .problem_code, .{ .name = outcome_name } },
+                .{ .stage, .{ .name = @tagName(detail.stage) } },
+                .{ .cause_domain, .{ .name = cause.domain } },
+                .{ .cause_code, .{ .i = cause.code } },
+                .{ .detail, .{ .str = detail.message[0..detail.message_size] } },
             });
         }
-        capture_log.event(report_severity, .{ .recording_id = recording_ordinal }, "capture_finished", fields.items);
+        capture_log.event(report_severity, .{ .recording_id = recording_ordinal }, "capture_finished", fields.items());
     }
 
     // These failures reduce scheduling guarantees, not the validity of already
@@ -2384,6 +2433,63 @@ noinline fn logCaptureReport(recording_ordinal: u64, outcome_name: []const u8, r
         });
     }
 }
+
+const CaptureReportField = enum {
+    outcome,
+    audio_duration_seconds,
+    audio_samples_published_count,
+    audio_samples_captured_count,
+    audio_slots_published_count,
+    microphone_description,
+    pipewire_server_version,
+    pipewire_client_node_version_advertised,
+    pipewire_client_node_version_selected,
+    capture_thread_id,
+    graph_rate_hz,
+    graph_channels_count,
+    pipewire_node_id,
+    pipewire_node_serial,
+    microphone_node_name,
+    pipewire_device_id,
+    pipewire_device_serial,
+    microphone_serial,
+    microphone_device_description,
+    memory_lock_outcome,
+    memory_lock_size_max,
+    memory_lock_system_error,
+    callback_thread_id,
+    callback_scheduler_policy,
+    callback_scheduler_priority,
+    callbacks_count,
+    callback_missing_buffers_count,
+    callback_clipped_samples_count,
+    callback_header_metadata_buffers_count,
+    callback_header_gap_buffers_count,
+    callback_header_gap_samples_count,
+    callback_duration_ms_max,
+    callback_gap_ms_max,
+    activity,
+    activity_samples_count,
+    activity_observed_samples_count,
+    activity_unknown_samples_count,
+    activity_quiet_samples_count,
+    activity_active_samples_count,
+    activity_changes_count,
+    activity_active_run_samples_count_max,
+    activity_quiet_run_samples_count_max,
+    activity_noise_floor_rms,
+    activity_quiet_threshold_rms,
+    activity_active_threshold_rms,
+    callback_samples_count_min,
+    callback_samples_count_max,
+    problem_code,
+    stage,
+    cause_domain,
+    cause_code,
+    detail,
+};
+
+const CaptureReportFields = logging.EnumFieldSet(CaptureReportField);
 
 fn captureActive(supervisor: *const Supervisor) bool {
     return supervisor.audio.operation != .idle;
