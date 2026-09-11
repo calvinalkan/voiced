@@ -1,0 +1,63 @@
+error[assert_header_snapshot]: assertions must use the file-header `assert` snapshot
+ --> __fixtures__/assert_header_snapshot/assert_header_snapshot.input.zig:5:32
+  |
+5 | const debug_assert = std.debug.assert;
+  |                                ^^^^^^
+  |
+  = help: define `const assert = std.debug.assert;` in the file header and call `assert`
+
+error[assert_header_snapshot]: assertions must use the file-header `assert` snapshot
+  --> __fixtures__/assert_header_snapshot/assert_header_snapshot.input.zig:12:15
+   |
+12 |     std.debug.assert(true);
+   |               ^^^^^^
+   |
+   = help: define `const assert = std.debug.assert;` in the file header and call `assert`
+
+error[assert_header_snapshot]: assertions must use the file-header `assert` snapshot
+  --> __fixtures__/assert_header_snapshot/assert_header_snapshot.input.zig:16:11
+   |
+16 |     debug.assert(true);
+   |           ^^^^^^
+   |
+   = help: define `const assert = std.debug.assert;` in the file header and call `assert`
+
+error[assert_header_snapshot]: assertions must use the file-header `assert` snapshot
+  --> __fixtures__/assert_header_snapshot/assert_header_snapshot.input.zig:20:15
+   |
+20 |     foo.debug.assert(true);
+   |               ^^^^^^
+   |
+   = help: define `const assert = std.debug.assert;` in the file header and call `assert`
+
+error[assert_header_snapshot]: assertions must use the file-header `assert` snapshot
+  --> __fixtures__/assert_header_snapshot/assert_header_snapshot.input.zig:24:26
+   |
+24 |     @import("std").debug.assert(true);
+   |                          ^^^^^^
+   |
+   = help: define `const assert = std.debug.assert;` in the file header and call `assert`
+
+error[assert_header_snapshot]: assertions must use the file-header `assert` snapshot
+  --> __fixtures__/assert_header_snapshot/assert_header_snapshot.input.zig:28:24
+   |
+28 |     comptime std.debug.assert(true);
+   |                        ^^^^^^
+   |
+   = help: define `const assert = std.debug.assert;` in the file header and call `assert`
+
+error[assert_header_snapshot]: assertions must use the file-header `assert` snapshot
+  --> __fixtures__/assert_header_snapshot/assert_header_snapshot.input.zig:41:30
+   |
+41 |     const assert = std.debug.assert;
+   |                              ^^^^^^
+   |
+   = help: define `const assert = std.debug.assert;` in the file header and call `assert`
+
+error[assert_header_snapshot]: assertions must use the file-header `assert` snapshot
+  --> __fixtures__/assert_header_snapshot/assert_header_snapshot.input.zig:44:24
+   |
+44 | const late = std.debug.assert;
+   |                        ^^^^^^
+   |
+   = help: define `const assert = std.debug.assert;` in the file header and call `assert`

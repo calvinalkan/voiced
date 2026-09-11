@@ -1,0 +1,39 @@
+error[top_down_declarations]: owner type `PackedPacket` is declared after its component `PackedHeader`
+  --> __fixtures__/top_down_declarations/top_down_type_owners.input.zig:61:11
+   |
+61 | pub const PackedPacket = struct {
+   |           ^^^^^^^^^^^^
+   |
+   = help: move `PackedPacket` before `PackedHeader`
+
+error[top_down_declarations]: owner type `Packet` is declared after its component `WireHeader`
+  --> __fixtures__/top_down_declarations/top_down_type_owners.input.zig:53:11
+   |
+53 | pub const Packet = struct {
+   |           ^^^^^^
+   |
+   = help: move `Packet` before `WireHeader`
+
+error[top_down_declarations]: owner type `PublicRoot` is declared after its component `PrivateMiddle`
+  --> __fixtures__/top_down_declarations/top_down_type_owners.input.zig:45:11
+   |
+45 | pub const PublicRoot = struct {
+   |           ^^^^^^^^^^
+   |
+   = help: move `PublicRoot` before `PrivateMiddle`
+
+error[top_down_declarations]: owner type `SyntaxTree` is declared after its component `SyntaxNode`
+ --> __fixtures__/top_down_declarations/top_down_type_owners.input.zig:5:11
+  |
+5 | pub const SyntaxTree = struct {
+  |           ^^^^^^^^^^
+  |
+  = help: move `SyntaxTree` before `SyntaxNode`
+
+error[top_down_declarations]: owner type `Table` is declared after its component `Entry`
+  --> __fixtures__/top_down_declarations/top_down_type_owners.input.zig:78:15
+   |
+78 |     pub const Table = struct {
+   |               ^^^^^
+   |
+   = help: move `Table` before `Entry`
