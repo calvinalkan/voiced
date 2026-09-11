@@ -820,7 +820,8 @@ const record_help =
     \\Options:
     \\  -t, --toggle  Toggle recording; takes no value and may appear only once.
     \\
-    \\Toggles during stopping, transcription, or delivery are ignored.
+    \\One recording request during stopping, transcription, or delivery is queued.
+    \\A second toggle cancels it; repeated non-toggle requests are ignored.
     \\The daemon must already be running; start it with 'voiced serve'.
     \\
 ;

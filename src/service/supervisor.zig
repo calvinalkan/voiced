@@ -669,14 +669,14 @@ noinline fn dispatchControl(supervisor: *Supervisor, client_index: usize, reques
     var ignored = false;
     switch (request.cmd) {
         .record => {
-            if (service.shutdown_requested or supervisor.phase == .finishing or supervisor.phase == .delivering or supervisor.phase == .aborting) {
+            if (service.shutdown_requested or supervisor.phase == .aborting) {
                 ignored = true;
             } else if (supervisor.phase == .active) {
                 if (request.toggle) try requestAudioFinish(supervisor, request_received_monotonic_ns) else ignored = true;
             } else if (service.pending_recording != null) {
                 if (request.toggle) service.pending_recording = null else ignored = true;
             } else {
-                assert(supervisor.phase == .idle);
+                assert(supervisor.phase == .idle or supervisor.phase == .finishing or supervisor.phase == .delivering);
                 service.pending_recording = request_received_monotonic_ns;
             }
         },

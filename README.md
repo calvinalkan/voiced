@@ -401,11 +401,14 @@ the model idle countdown is available only while an idle loaded model awaits its
 unload deadline. `daemon_uptime_seconds` confirms whether the service restarted.
 Run `voiced status --help` for every field and enum value.
 
-Toggles during stopping, transcription, or delivery are ignored and still exit
-successfully. Errors go to stderr with a nonzero exit code. An acknowledgement
-means the supervisor handled the command, not that recording, transcription,
-or shutdown has finished. After a timeout or lost reply the outcome is unknown;
-the CLI never automatically retries, particularly not a toggle.
+One recording request received during stopping, transcription, or delivery is
+queued and starts after the prior recording finishes and a transcript buffer is
+available. A second toggle cancels that queued request; repeated non-toggle
+requests are ignored. Errors go to stderr with a nonzero exit code. An
+acknowledgement means the supervisor handled the command, not that recording,
+transcription, or shutdown has finished. After a timeout or lost reply the
+outcome is unknown; the CLI never automatically retries, particularly not a
+toggle.
 
 ### Control wire ABI, version 1
 
@@ -505,8 +508,9 @@ unusually slow reader can produce that warning after a successful paste, so it
 neither changes the recording outcome nor triggers a notification or retry.
 Transcript saving waits until the transfer completes or this observation window
 expires, allowing the event loop to serve the paste reader before synchronous
-storage. The service remains in its delivering phase during the window, so it
-ignores new recording commands for at most that additional interval. Setting
+storage. The service remains in its delivering phase during the window. One
+next recording can be queued and starts after delivery finishes and a transcript
+buffer is available; a second toggle cancels it. Setting
 `paste_observation_ms=0` records `paste_observation=disabled`, suppresses the
 unconfirmed warning, and saves as soon as the shortcut has been sent.
 
