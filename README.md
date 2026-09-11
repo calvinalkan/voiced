@@ -16,6 +16,7 @@ src/main.zig
 │            │   └── inference/root.zig    Whisper runtime and shared worker pool
 │            ├── worker.zig                typed job/result mailboxes and wakeups
 │            ├── clipboard.zig             Wayland/X11 clipboard selection
+│            │   ├── clipboard/types.zig   publication and transfer identities
 │            │   ├── clipboard/wayland.zig native Wayland ownership and transfers
 │            │   └── clipboard/x11.zig     native X11 ownership and transfers
 │            └── paste.zig                 native uinput keyboard
@@ -517,6 +518,8 @@ unconfirmed warning, and saves as soon as the shortcut has been sent.
 The clipboard owner survives later recordings and model expiry. Two transcript
 buffers are reserved at startup. A buffer remains immutable while offered or
 borrowed by a paste transfer; availability is derived from those references.
+Each publication carries its transcript-buffer index and recording ID, so a
+transfer that outlives selection replacement keeps its originating log context.
 Eight transfers may coexist, each with a two-second deadline. When both buffers
 are borrowed, the next recording waits for one to become reusable. Selection
 loss retires ownership without copying again. Cancellation during delivery stops

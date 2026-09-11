@@ -5,6 +5,7 @@ const X11Clipboard = @This();
 
 const std = @import("std");
 const linux = std.os.linux;
+const types = @import("types.zig");
 const wire = @import("x11_wire.zig");
 const endian = @import("builtin").cpu.arch.endian();
 
@@ -55,16 +56,13 @@ pub fn Result(comptime T: type) type {
 
 pub const Phase = enum { setup, interning, ready, timestamp, acquiring };
 pub const TimeoutPhase = enum { setup, interning, timestamp, acquiring, transfer };
-pub const TextTransfer = struct {
-    id: u64,
-    text_size: usize,
-    started_monotonic_ns: u64,
-    completed_monotonic_ns: u64,
-};
-pub const Event = union(enum) { none, ready, acquired: u64, text_transferred: TextTransfer };
+pub const PublicationId = types.PublicationId;
+pub const StorageIndex = types.StorageIndex;
+pub const TextTransfer = types.TextTransfer;
+pub const Event = union(enum) { none, ready, acquired: PublicationId, text_transferred: TextTransfer };
 pub const Environment = struct { display: ?[]const u8, authority: ?[]const u8, home: ?[]const u8 };
 
-const Text = struct { bytes: []const u8, id: u64 };
+const Text = struct { bytes: []const u8, publication: PublicationId };
 const Source = union(enum) {
     empty,
     pending: Text,
@@ -118,7 +116,7 @@ const Transfer = struct {
     barrier_sequence: u16,
     phase: TransferPhase,
     source: ?u1 = null,
-    text_id: ?u64 = null,
+    publication: ?PublicationId = null,
     text_size: usize = 0,
     started_monotonic_ns: u64,
     failed: bool = false,
@@ -167,14 +165,14 @@ pub fn deinit(self: *X11Clipboard) void {
 
 /// Busy and invalid_text leave the current clipboard untouched. Other
 /// errors terminate the connection: the caller must deinit before reuse.
-pub fn publish(self: *X11Clipboard, id: u64, text: []const u8, now_ns: u64) Result(void) {
-    if (self.phase != .ready or self.isBorrowed(id)) return .{ .err = .busy };
+pub fn publish(self: *X11Clipboard, publication: PublicationId, text: []const u8, now_ns: u64) Result(void) {
+    if (self.phase != .ready or self.isBorrowed(publication.storage_index)) return .{ .err = .busy };
     if (text.len == 0 or !std.unicode.utf8ValidateSlice(text)) return .{ .err = .invalid_text };
     if (text.len > std.math.maxInt(u32)) return .{ .err = .invalid_text };
     const slot: u1 = for (self.sources, 0..) |source, index| {
         if (source == .empty) break @intCast(index);
     } else return .{ .err = .busy };
-    self.sources[slot] = .{ .pending = .{ .bytes = text, .id = id } };
+    self.sources[slot] = .{ .pending = .{ .bytes = text, .publication = publication } };
     const pending: Pending = .{ .slot = slot, .deadline_ns = now_ns + timeout_ns };
     const sequence = self.changeProperty(self.owner_window, self.atom(.voiced_timestamp), 31, 8, "") catch |err| return .{ .err = self.failure(err) };
     self.phase = .{ .timestamp = .{ .pending = pending, .sequence = sequence } };
@@ -187,13 +185,13 @@ pub fn advance(self: *X11Clipboard, now_ns: u64) Result(Event) {
     return .{ .ok = event };
 }
 
-pub fn isBorrowed(self: *const X11Clipboard, id: u64) bool {
-    for (self.sources) |source| if (source.text()) |text| if (text.id == id) return true;
+pub fn isBorrowed(self: *const X11Clipboard, storage_index: StorageIndex) bool {
+    for (self.sources) |source| if (source.text()) |text| if (text.publication.storage_index == storage_index) return true;
     return false;
 }
 
-pub fn owns(self: *const X11Clipboard, id: u64) bool {
-    for (self.sources) |source| if (source == .offered and source.offered.text.id == id) return true;
+pub fn owns(self: *const X11Clipboard, publication: PublicationId) bool {
+    for (self.sources) |source| if (source == .offered and source.offered.text.publication.eql(publication)) return true;
     return false;
 }
 
@@ -345,9 +343,9 @@ fn handleReply(self: *X11Clipboard, message: wire.Message, now_ns: u64, event: *
         }
         const slot = self.phase.acquiring.pending.slot;
         if (self.sources[slot] != .offered) return error.InvalidMessage;
-        const id = self.sources[slot].offered.text.id;
+        const publication = self.sources[slot].offered.text.publication;
         self.phase = .ready;
-        event.* = .{ .acquired = id };
+        event.* = .{ .acquired = publication };
         return;
     }
     for (&self.transfers, 0..) |*entry, index| if (entry.*) |*transfer| {
@@ -503,14 +501,14 @@ fn respondText(self: *X11Clipboard, request: SelectionRequest, property: u32, so
         .barrier_sequence = barrier_sequence,
         .phase = .incr_announce,
         .source = source,
-        .text_id = self.sources[source].text().?.id,
+        .publication = self.sources[source].text().?.publication,
         .text_size = text.len,
         .started_monotonic_ns = now_ns,
     };
 }
 
 fn respondDirect(self: *X11Clipboard, request: SelectionRequest, property: u32, property_type: u32, format: u8, bytes: []const u8, source: ?u1, now_ns: u64) !void {
-    const text_id = if (source) |index| (self.sources[index].text() orelse return error.InvalidMessage).id else null;
+    const publication = if (source) |index| (self.sources[index].text() orelse return error.InvalidMessage).publication else null;
     const index = self.allocateTransfer() orelse return self.refuse(request);
     errdefer self.transfers[index] = null;
     const sequence_start = try self.changeProperty(request.requestor, property, property_type, format, bytes);
@@ -525,7 +523,7 @@ fn respondDirect(self: *X11Clipboard, request: SelectionRequest, property: u32, 
         .barrier_sequence = barrier_sequence,
         .phase = .direct_property,
         .source = source,
-        .text_id = text_id,
+        .publication = publication,
         .text_size = if (source != null) bytes.len else 0,
         .started_monotonic_ns = now_ns,
     };
@@ -568,7 +566,7 @@ fn finishTransferBarrier(self: *X11Clipboard, index: usize, now_ns: u64, event: 
 
 fn completedTextTransfer(_: *const X11Clipboard, transfer: Transfer, now_ns: u64) ?TextTransfer {
     return .{
-        .id = transfer.text_id orelse return null,
+        .publication = transfer.publication orelse return null,
         .text_size = transfer.text_size,
         .started_monotonic_ns = transfer.started_monotonic_ns,
         .completed_monotonic_ns = now_ns,

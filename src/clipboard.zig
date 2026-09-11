@@ -6,21 +6,19 @@ const Clipboard = @This();
 
 const std = @import("std");
 const linux = std.os.linux;
+const types = @import("clipboard/types.zig");
 const WaylandClipboard = @import("clipboard/wayland.zig");
 const X11Clipboard = @import("clipboard/x11.zig");
 
 pub const BackendSelection = enum { auto, wayland, x11 };
 pub const Mode = enum { core, wlr, ext, x11 };
+pub const StorageIndex = types.StorageIndex;
+pub const PublicationId = types.PublicationId;
+pub const TextTransfer = types.TextTransfer;
 pub const Candidate = enum { wayland_data_control, x11, wayland_core };
 pub const CandidateNotice = union(enum) {
     skipped: struct { candidate: Candidate, fallback: Candidate },
     failed: struct { candidate: Candidate, fallback: Candidate, error_detail: Error },
-};
-pub const TextTransfer = struct {
-    id: u64,
-    text_size: usize,
-    started_monotonic_ns: u64,
-    completed_monotonic_ns: u64,
 };
 pub const Error = union(enum) {
     wayland: WaylandClipboard.Error,
@@ -32,7 +30,7 @@ pub const Error = union(enum) {
 /// `text_transferred` means the owner finished serving one text request. It is
 /// evidence of a clipboard read, not confirmation that an application inserted
 /// the text.
-pub const Event = union(enum) { none, ready, candidate_notice: CandidateNotice, acquired: u64, text_transferred: TextTransfer };
+pub const Event = union(enum) { none, ready, candidate_notice: CandidateNotice, acquired: PublicationId, text_transferred: TextTransfer };
 pub const Environment = struct {
     runtime_directory: ?[]const u8,
     wayland_display: ?[]const u8,
@@ -113,14 +111,14 @@ pub fn deinit(self: *Clipboard) void {
     self.auto_fallback = null;
 }
 
-pub fn publish(self: *Clipboard, id: u64, text: []const u8, now_ns: u64) Result(void) {
+pub fn publish(self: *Clipboard, publication: PublicationId, text: []const u8, now_ns: u64) Result(void) {
     const result: Result(void) = switch (self.backend) {
         .none => .{ .err = .unavailable },
-        .wayland => |*client| switch (client.publish(id, text, now_ns)) {
+        .wayland => |*client| switch (client.publish(publication, text, now_ns)) {
             .ok => .{ .ok = {} },
             .err => |err| .{ .err = mapWaylandError(err) },
         },
-        .x11 => |*client| switch (client.publish(id, text, now_ns)) {
+        .x11 => |*client| switch (client.publish(publication, text, now_ns)) {
             .ok => .{ .ok = {} },
             .err => |err| .{ .err = mapX11Error(err) },
         },
@@ -174,19 +172,19 @@ pub fn advance(self: *Clipboard, now_ns: u64) Result(Event) {
     }
 }
 
-pub fn isBorrowed(self: *const Clipboard, id: u64) bool {
+pub fn isBorrowed(self: *const Clipboard, storage_index: StorageIndex) bool {
     return switch (self.backend) {
         .none => false,
-        .wayland => |*client| client.isBorrowed(id),
-        .x11 => |*client| client.isBorrowed(id),
+        .wayland => |*client| client.isBorrowed(storage_index),
+        .x11 => |*client| client.isBorrowed(storage_index),
     };
 }
 
-pub fn owns(self: *const Clipboard, id: u64) bool {
+pub fn owns(self: *const Clipboard, publication: PublicationId) bool {
     return switch (self.backend) {
         .none => false,
-        .wayland => |*client| client.owns(id),
-        .x11 => |*client| client.owns(id),
+        .wayland => |*client| client.owns(publication),
+        .x11 => |*client| client.owns(publication),
     };
 }
 
@@ -315,9 +313,9 @@ fn mapEvent(event: anytype) Event {
     return switch (event) {
         .none => .none,
         .ready => .ready,
-        .acquired => |id| .{ .acquired = id },
+        .acquired => |publication| .{ .acquired = publication },
         .text_transferred => |transfer| .{ .text_transferred = .{
-            .id = transfer.id,
+            .publication = transfer.publication,
             .text_size = transfer.text_size,
             .started_monotonic_ns = transfer.started_monotonic_ns,
             .completed_monotonic_ns = transfer.completed_monotonic_ns,

@@ -1662,9 +1662,9 @@ fn advanceOutput(supervisor: *Supervisor) !void {
             .none => {},
             .ready => logClipboardReady(supervisor),
             .candidate_notice => |notice| logClipboardCandidateNotice(supervisor, notice),
-            .acquired => |id| if (supervisor.phase == .delivering) {
+            .acquired => |publication| if (supervisor.phase == .delivering) {
                 const delivery = &supervisor.phase.delivering;
-                assert(id == transcriptId(supervisor));
+                assert(publication.eql(transcriptPublication(supervisor)));
                 const acquire_duration_ns = now_ns - delivery.boundary_monotonic_ns;
                 clipboard_log.event(.debug, .{ .recording_id = supervisor.recording_ordinal }, "clipboard_acquired", &.{
                     .{ "transcript_size", .{ .u = text.len } },
@@ -1690,7 +1690,7 @@ fn advanceOutput(supervisor: *Supervisor) !void {
                     .{ .done = null };
             },
             .text_transferred => |transfer| {
-                clipboard_log.event(.debug, deliveryContext(supervisor), "clipboard_text_transferred", &.{
+                clipboard_log.event(.debug, .{ .recording_id = transfer.publication.recording_id }, "clipboard_text_transferred", &.{
                     .{ "transcript_size", .{ .u = transfer.text_size } },
                     .{ "clipboard_transfer_duration_ms", .{ .f = .{
                         .value = @as(f64, @floatFromInt(transfer.completed_monotonic_ns -| transfer.started_monotonic_ns)) / std.time.ns_per_ms,
@@ -1701,7 +1701,7 @@ fn advanceOutput(supervisor: *Supervisor) !void {
                     const delivery = &supervisor.phase.delivering;
                     const paste_can_be_observed = supervisor.options.paste_observation_ms > 0 and
                         (delivery.paste == .sending or delivery.paste == .observing);
-                    if (paste_can_be_observed and transfer.id == transcriptId(supervisor) and
+                    if (paste_can_be_observed and transfer.publication.eql(transcriptPublication(supervisor)) and
                         transfer.started_monotonic_ns >= delivery.paste_started_monotonic_ns)
                     {
                         delivery.metrics.paste_observation = .clipboard_transfer_completed;
@@ -1715,13 +1715,13 @@ fn advanceOutput(supervisor: *Supervisor) !void {
     if (supervisor.phase != .delivering) return;
     const delivery = &supervisor.phase.delivering;
     if (supervisor.clipboard == .connected and delivery.paste == .waiting and supervisor.clipboard.connected.ready()) {
-        switch (supervisor.clipboard.connected.publish(transcriptId(supervisor), text, now_ns)) {
+        switch (supervisor.clipboard.connected.publish(transcriptPublication(supervisor), text, now_ns)) {
             .ok => delivery.paste = .acquiring,
             .err => |err| clipboardError(supervisor, err),
         }
     }
     if (delivery.paste == .settling or delivery.paste == .sending) {
-        if (supervisor.clipboard != .connected or !supervisor.clipboard.connected.owns(transcriptId(supervisor))) {
+        if (supervisor.clipboard != .connected or !supervisor.clipboard.connected.owns(transcriptPublication(supervisor))) {
             clipboard_log.event(.err, .{ .recording_id = supervisor.recording_ordinal }, "clipboard_failed", &.{
                 .{ "problem_code", .{ .name = "selection_lost" } },
             });
@@ -1944,8 +1944,8 @@ fn cancelDelivery(supervisor: *Supervisor, problem: ?DeliveryProblem) void {
     delivery.paste = .{ .done = problem };
 }
 
-fn transcriptId(supervisor: *const Supervisor) u64 {
-    return @as(u64, supervisor.transcript.storage_index) + 1;
+fn transcriptPublication(supervisor: *const Supervisor) Clipboard.PublicationId {
+    return .{ .storage_index = supervisor.transcript.storage_index, .recording_id = supervisor.recording_ordinal };
 }
 
 fn transcriptBytes(supervisor: *const Supervisor) []u8 {
@@ -1956,7 +1956,7 @@ fn transcriptBytes(supervisor: *const Supervisor) []u8 {
 
 fn availableTranscript(supervisor: *const Supervisor) ?u1 {
     for (0..transcriptStorageCount(supervisor)) |index| {
-        if (supervisor.clipboard != .connected or !supervisor.clipboard.connected.isBorrowed(index + 1)) return @intCast(index);
+        if (supervisor.clipboard != .connected or !supervisor.clipboard.connected.isBorrowed(@intCast(index))) return @intCast(index);
     }
     return null;
 }

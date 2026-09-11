@@ -1,5 +1,6 @@
-//! Native Wayland clipboard for an epoll owner. Text is borrowed until
-//! isBorrowed(id) becomes false, including transfers surviving replacement.
+//! Native Wayland clipboard for an epoll owner. Text storage is borrowed until
+//! `isBorrowed(storage_index)` becomes false, including transfers surviving
+//! replacement.
 //! Two text generations and eight transfers bound retention. The GNOME fallback
 //! temporarily maps a surface; acquisition includes destroying that surface,
 //! but cannot certify which other application ultimately receives focus.
@@ -7,6 +8,7 @@ const WaylandClipboard = @This();
 
 const std = @import("std");
 const linux = std.os.linux;
+const types = @import("types.zig");
 const wire = @import("wayland_wire.zig");
 const timeout_ns = 2 * std.time.ns_per_s;
 const mime_types = [_][]const u8{ "text/plain;charset=utf-8", "text/plain", "UTF8_STRING" };
@@ -23,22 +25,19 @@ pub fn Result(comptime T: type) type {
     return union(enum) { ok: T, err: Error };
 }
 pub const Mode = enum { core, wlr, ext };
+pub const PublicationId = types.PublicationId;
+pub const StorageIndex = types.StorageIndex;
+pub const TextTransfer = types.TextTransfer;
 /// Selects the strongest protocol, requires background-safe data control, or
 /// requires the serial-acquiring core protocol respectively.
 pub const ProtocolPolicy = enum { best, data_control_only, core_only };
 pub const Phase = enum { discovering, binding, ready, focus, selection, restoring };
-pub const TextTransfer = struct {
-    id: u64,
-    text_size: usize,
-    started_monotonic_ns: u64,
-    completed_monotonic_ns: u64,
-};
-pub const Event = union(enum) { none, ready, acquired: u64, text_transferred: TextTransfer };
+pub const Event = union(enum) { none, ready, acquired: PublicationId, text_transferred: TextTransfer };
 pub const Environment = struct { runtime_directory: ?[]const u8, display: []const u8 };
 const Kind = enum { display, registry, discovery, binding, selection, restoring, compositor, shm, seat, keyboard, manager, device, source, surface, pool, buffer, shell, xdg_surface, toplevel, gtk_shell, gtk_surface };
 const Object = struct { kind: Kind, destroyed: bool = false };
 const Global = struct { name: u32 = 0, version: u32 = 0, object: u32 = 0 };
-const Text = struct { bytes: []const u8, id: u64 };
+const Text = struct { bytes: []const u8, publication: PublicationId };
 const Source = union(enum) {
     empty,
     offered: struct { object: u32, text: Text },
@@ -122,25 +121,25 @@ pub fn deinit(self: *WaylandClipboard) void {
 }
 /// Busy and invalid_text leave the current clipboard untouched. Other errors
 /// terminate the connection: the caller must deinit before reconnecting.
-pub fn publish(self: *WaylandClipboard, id: u64, text: []const u8, now_ns: u64) Result(void) {
-    if (self.phase != .ready or self.isBorrowed(id)) return .{ .err = .busy };
+pub fn publish(self: *WaylandClipboard, publication: PublicationId, text: []const u8, now_ns: u64) Result(void) {
+    if (self.phase != .ready or self.isBorrowed(publication.storage_index)) return .{ .err = .busy };
     if (text.len == 0 or !std.unicode.utf8ValidateSlice(text)) return .{ .err = .invalid_text };
     const slot: u1 = for (self.sources, 0..) |source, index| {
         if (source == .empty) break @intCast(index);
     } else return .{ .err = .busy };
-    self.publishInternal(slot, id, text, now_ns) catch |err| return .{ .err = self.failure(err) };
+    self.publishInternal(slot, publication, text, now_ns) catch |err| return .{ .err = self.failure(err) };
     return .{ .ok = {} };
 }
 pub fn advance(self: *WaylandClipboard, now_ns: u64) Result(Event) {
     const event = self.advanceInternal(now_ns) catch |err| return .{ .err = self.failure(err) };
     return .{ .ok = event };
 }
-pub fn isBorrowed(self: *const WaylandClipboard, id: u64) bool {
-    for (self.sources) |source| if (source.text()) |text| if (text.id == id) return true;
+pub fn isBorrowed(self: *const WaylandClipboard, storage_index: StorageIndex) bool {
+    for (self.sources) |source| if (source.text()) |text| if (text.publication.storage_index == storage_index) return true;
     return false;
 }
-pub fn owns(self: *const WaylandClipboard, id: u64) bool {
-    for (self.sources) |source| if (source == .offered and source.offered.text.id == id) return true;
+pub fn owns(self: *const WaylandClipboard, publication: PublicationId) bool {
+    for (self.sources) |source| if (source == .offered and source.offered.text.publication.eql(publication)) return true;
     return false;
 }
 pub fn deadline(self: *const WaylandClipboard) u64 {
@@ -166,9 +165,9 @@ fn start(self: *WaylandClipboard, environment: Environment) !void {
     try self.words(1, 1, &.{registry});
     try self.sync(.discovery);
 }
-fn publishInternal(self: *WaylandClipboard, slot: u1, id: u64, text: []const u8, now_ns: u64) !void {
+fn publishInternal(self: *WaylandClipboard, slot: u1, publication: PublicationId, text: []const u8, now_ns: u64) !void {
     const object = try self.allocate(.source);
-    self.sources[slot] = .{ .offered = .{ .object = object, .text = .{ .bytes = text, .id = id } } };
+    self.sources[slot] = .{ .offered = .{ .object = object, .text = .{ .bytes = text, .publication = publication } } };
     const pending: Pending = .{ .slot = slot, .deadline = now_ns + timeout_ns };
     try self.words(self.manager().object, 0, &.{object});
     for (mime_types) |mime| {
@@ -229,7 +228,7 @@ fn advanceInternal(self: *WaylandClipboard, now_ns: u64) !Event {
                 transfer.offset += written;
                 if (transfer.offset == text.bytes.len) {
                     event = .{ .text_transferred = .{
-                        .id = text.id,
+                        .publication = text.publication,
                         .text_size = text.bytes.len,
                         .started_monotonic_ns = transfer.started_monotonic_ns,
                         .completed_monotonic_ns = now_ns,
@@ -570,7 +569,7 @@ fn acquired(self: *WaylandClipboard, event: *Event) !void {
         return error.SelectionLost;
     }
     self.phase = .ready;
-    event.* = .{ .acquired = self.sources[slot].offered.text.id };
+    event.* = .{ .acquired = self.sources[slot].offered.text.publication };
 }
 fn operationDeadline(self: *const WaylandClipboard) u64 {
     return switch (self.phase) {
