@@ -52,6 +52,7 @@ pub fn requestStop(self: *Capture, command: ControlCommand) void {
 pub fn run(self: *Capture) void {
     worker.name("voiced-capture");
     defer self.mailbox.finish();
+
     while (self.mailbox.next()) |job| {
         const result = pipewire.run(.{
             .recording_id = job.recording_id,
@@ -63,6 +64,7 @@ pub fn run(self: *Capture) void {
             .recording_samples_target = job.recording_samples_target,
             .environment = self.environment,
         });
+
         self.mailbox.complete(result);
     }
 }

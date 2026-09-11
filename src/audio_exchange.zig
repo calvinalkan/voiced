@@ -79,7 +79,10 @@ comptime {
 /// every prefix before publishing its count.
 pub fn initialize(exchange: *AudioExchange) void {
     exchange.audio_callbacks_count = .init(0);
-    for (&exchange.slots) |*slot| slot.published_samples_count = .init(0);
+
+    for (&exchange.slots) |*slot| {
+        slot.published_samples_count = .init(0);
+    }
 }
 
 /// Publish callback progress separately from slot boundaries. The count is
@@ -97,7 +100,10 @@ pub fn acquireAudioCallbacksCount(exchange: *const AudioExchange) u64 {
 /// Claim an empty slot. Only the capture thread calls this; the acquire pairs
 /// with the supervisor's release after the previous transcription completes.
 pub fn tryAcquireWriter(slot: *AudioSlot) ?SlotWriter {
-    if (slot.published_samples_count.load(.acquire) != 0) return null;
+    if (slot.published_samples_count.load(.acquire) != 0) {
+        return null;
+    }
+
     return .{ .slot = slot };
 }
 
@@ -107,7 +113,9 @@ pub fn publishWrittenSlot(writer: SlotWriter, publication: SlotPublication) void
     assert(publication.samples_count > 0);
     assert(publication.samples_count <= slot_samples_capacity);
     assert(writer.slot.published_samples_count.load(.monotonic) == 0);
+
     writer.slot.contains_activity = publication.contains_activity;
+
     writer.slot.published_samples_count.store(publication.samples_count, .release);
 }
 
@@ -115,8 +123,12 @@ pub fn publishWrittenSlot(writer: SlotWriter, publication: SlotPublication) void
 /// prefix borrowed until the supervisor calls `releaseConsumedSlot`.
 pub fn acquireSlot(slot: *const AudioSlot) ?PublishedSlot {
     const samples_count = slot.published_samples_count.load(.acquire);
-    if (samples_count == 0) return null;
+    if (samples_count == 0) {
+        return null;
+    }
+
     assert(samples_count <= slot_samples_capacity);
+
     return .{
         .samples_count = samples_count,
         .contains_activity = slot.contains_activity,
@@ -128,6 +140,7 @@ pub fn acquireSlot(slot: *const AudioSlot) ?PublishedSlot {
 pub fn releaseConsumedSlot(slot: *AudioSlot) void {
     const samples_count = slot.published_samples_count.load(.monotonic);
     assert(samples_count > 0);
+
     assert(samples_count <= slot_samples_capacity);
     slot.published_samples_count.store(0, .release);
 }
@@ -142,9 +155,11 @@ test "slot publication exposes metadata until release" {
     defer std.testing.allocator.destroy(slot);
 
     slot.published_samples_count = .init(0);
+
     try std.testing.expectEqual(null, acquireSlot(slot));
 
     const writer = tryAcquireWriter(slot).?;
+
     publishWrittenSlot(writer, .{ .samples_count = 1, .contains_activity = true });
 
     const publication = acquireSlot(slot).?;

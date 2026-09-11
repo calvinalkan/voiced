@@ -5,6 +5,10 @@ const setup = @import("setup.zig");
 const voiced = @import("voiced.zig");
 const logging = voiced.logging;
 const log = logging.scoped(.service);
+const ServiceErrorFields = logging.FieldSet(.{.@"error"});
+const ServiceStartupRefused = log.Event(.service_startup_refused, ServiceErrorFields);
+const ServiceFailed = log.Event(.service_failed, ServiceErrorFields);
+const ServiceStopped = log.Event(.service_stopped, logging.NoFields);
 const service = voiced.service;
 const stderr = std.debug.print;
 
@@ -37,10 +41,14 @@ pub const std_options: std.Options = options: {
         // executable provides `voiced setup` through std.http.
         .networking = true,
     };
+
     // Thread entry allocates an alternate signal stack independently of the
     // segfault-handler setting. Keep the standard size only when that handler
     // is enabled by the developer profile.
-    if (!developer) configured.signal_stack_size = null;
+    if (!developer) {
+        configured.signal_stack_size = null;
+    }
+
     break :options configured;
 };
 
@@ -56,13 +64,17 @@ pub const panic = std.debug.FullPanic(if (developer) std.debug.defaultPanic else
 
 fn panicWithoutTrace(message: []const u8, first_trace_addr: ?usize) noreturn {
     @branchHint(.cold);
+
     _ = first_trace_addr;
+
     const linux = std.os.linux;
 
     // A closed stderr pipe must not terminate us with SIGPIPE before abort can
     // request a core. No restoration is needed: this thread never resumes.
     var blocked = linux.sigemptyset();
+
     linux.sigaddset(&blocked, .PIPE);
+
     _ = linux.sigprocmask(linux.SIG.BLOCK, &blocked, null);
 
     // Best-effort raw writes avoid allocation, logging locks, and recursive
@@ -70,11 +82,16 @@ fn panicWithoutTrace(message: []const u8, first_trace_addr: ?usize) noreturn {
     print: {
         for ([_][]const u8{ "voiced: panic: ", message, "\n" }) |part| {
             var remaining = part;
+
             while (remaining.len != 0) {
                 const result = linux.write(2, remaining.ptr, remaining.len);
+
                 switch (linux.errno(result)) {
                     .SUCCESS => {
-                        if (result == 0) break :print;
+                        if (result == 0) {
+                            break :print;
+                        }
+
                         remaining = remaining[result..];
                     },
                     .INTR => continue,
@@ -83,6 +100,7 @@ fn panicWithoutTrace(message: []const u8, first_trace_addr: ?usize) noreturn {
             }
         }
     }
+
     // Normal exit cannot produce a core; the host's collector and policy decide
     // whether this SIGABRT actually saves one. Keep the matching debug binary.
     std.process.abort();
@@ -117,6 +135,7 @@ pub fn main(minimal: std.process.Init.Minimal) u8 {
 
     var environ_map = std.process.Environ.createMap(minimal.environ, gpa) catch |err| {
         stderr("voiced: could not read environment ({s}).\n", .{@errorName(err)});
+
         return 1;
     };
     defer environ_map.deinit();
@@ -147,8 +166,12 @@ fn runCommandLine(init: std.process.Init) u8 {
     };
 
     var diagnostic: ArgumentDiagnostic = .{};
+
     const invocation = parseCommand(init, arguments[1..], &diagnostic) catch |err| {
-        if (diagnostic.path.len > 0) stderr("{s}:{d}: ", .{ diagnostic.path, diagnostic.line });
+        if (diagnostic.path.len > 0) {
+            stderr("{s}:{d}: ", .{ diagnostic.path, diagnostic.line });
+        }
+
         switch (err) {
             error.UnknownCommand => stderr("voiced: unknown command '{s}'.\n", .{diagnostic.argument}),
             error.UnknownOption => stderr("voiced: unknown option '{s}'.\n", .{diagnostic.argument}),
@@ -207,7 +230,9 @@ fn runCommandLine(init: std.process.Init) u8 {
                     defaults.paste_key_gap_ms,
                     defaults.paste_observation_ms,
                     @tagName(defaults.log_target),
-                }) catch unreachable;
+                }) catch {
+                    unreachable;
+                };
             }
 
             if (std.mem.eql(u8, command, "record")) {
@@ -237,7 +262,9 @@ fn runCommandLine(init: std.process.Init) u8 {
                 "{s}\n\nUsage:\n  voiced {s}\n\n" ++
                     "The daemon must already be running; start it with 'voiced serve'.\n",
                 .{ description, command },
-            ) catch unreachable;
+            ) catch {
+                unreachable;
+            };
         };
 
         std.Io.File.stdout().writeStreamingAll(init.io, text) catch |err| {
@@ -255,6 +282,7 @@ fn runCommandLine(init: std.process.Init) u8 {
         const errno = logging.init(init.io, invocation.serve.log_target, invocation.serve.log_level);
         if (errno != .SUCCESS) {
             stderr("voiced: could not initialize logging (errno={f}).\n", .{logging.fmtErrno(errno)});
+
             return 1;
         }
     }
@@ -271,18 +299,22 @@ fn runCommandLine(init: std.process.Init) u8 {
         if (invocation == .serve) {
             switch (err) {
                 error.ClipboardBackendUnavailable => {}, // The supervisor logged the typed clipboard failure.
-                error.DaemonAlreadyRunning, error.RuntimeDirectoryNotSet, error.RuntimeDirectoryNotAbsolute, error.UnsafeRuntimeDirectory, error.UnsafeControlSocket, error.SocketPathTooLong => log.event(.err, .{}, "service_startup_refused", &.{.{ "error", .{ .verbatim = @errorName(err) } }}),
-                else => log.event(.critical, .{}, "service_failed", &.{.{ "error", .{ .verbatim = @errorName(err) } }}),
+                error.DaemonAlreadyRunning, error.RuntimeDirectoryNotSet, error.RuntimeDirectoryNotAbsolute, error.UnsafeRuntimeDirectory, error.UnsafeControlSocket, error.SocketPathTooLong => ServiceStartupRefused.emit(.err, .{}, .{ .@"error" = @errorName(err) }),
+                else => ServiceFailed.emit(.critical, .{}, .{ .@"error" = @errorName(err) }),
             }
+
             return 1;
         }
+
         if (invocation == .setup) {
             switch (err) {
                 error.UnexpectedHttpStatus, error.DownloadSizeMismatch, error.DownloadHashMismatch => {},
                 else => stderr("voiced: could not install models ({s}).\n", .{@errorName(err)}),
             }
+
             return 1;
         }
+
         switch (err) {
             error.DaemonNotRunning => stderr("voiced: cannot connect to the daemon. Start 'voiced serve'.\n", .{}),
             error.DaemonAlreadyRunning => stderr("voiced: the daemon is already running. Use 'voiced status'.\n", .{}),
@@ -298,7 +330,10 @@ fn runCommandLine(init: std.process.Init) u8 {
         return 1;
     };
 
-    if (invocation == .serve) log.event(.info, .{}, "service_stopped", &.{});
+    if (invocation == .serve) {
+        ServiceStopped.emit(.info, .{}, .{});
+    }
+
     return 0;
 }
 
@@ -325,6 +360,7 @@ fn parseCommand(init: std.process.Init, arguments: []const [:0]const u8, diagnos
         if (std.mem.eql(u8, argument, "--")) {
             break;
         }
+
         if (std.mem.eql(u8, argument, "-h") or std.mem.eql(u8, argument, "--help")) {
             const topic = if (std.mem.eql(u8, command, "setup") or
                 std.mem.eql(u8, command, "serve") or
@@ -332,6 +368,7 @@ fn parseCommand(init: std.process.Init, arguments: []const [:0]const u8, diagnos
                 command
             else
                 "";
+
             return .{ .help = topic };
         }
     }
@@ -342,6 +379,7 @@ fn parseCommand(init: std.process.Init, arguments: []const [:0]const u8, diagnos
         }
 
         const topic = arguments[1];
+
         diagnostic.argument = topic;
 
         if (!std.mem.eql(u8, topic, "setup") and
@@ -353,6 +391,7 @@ fn parseCommand(init: std.process.Init, arguments: []const [:0]const u8, diagnos
 
         if (arguments.len > 2) {
             diagnostic.argument = arguments[2];
+
             return error.UnexpectedArgument;
         }
 
@@ -361,11 +400,13 @@ fn parseCommand(init: std.process.Init, arguments: []const [:0]const u8, diagnos
 
     if (std.mem.eql(u8, command, "serve")) {
         diagnostic.command = command;
+
         return .{ .serve = try service.load(init, arguments[1..], diagnostic) };
     }
 
     if (std.mem.eql(u8, command, "setup")) {
         diagnostic.command = command;
+
         return .{ .setup = try parseSetupArguments(arguments[1..], diagnostic) };
     }
 
@@ -388,32 +429,44 @@ fn parseCommand(init: std.process.Init, arguments: []const [:0]const u8, diagnos
     //   stop -t                → UnknownOption; stop has no toggle mode.
     var request: service.Request = .{ .cmd = client_command };
     var index: usize = 1;
+
     while (index < arguments.len) : (index += 1) {
         const argument = arguments[index];
+
         diagnostic.argument = argument;
 
         if (std.mem.eql(u8, argument, "--")) {
             if (index + 1 < arguments.len) {
                 diagnostic.argument = arguments[index + 1];
+
                 return error.UnexpectedArgument;
             }
+
             break;
         }
 
         if (client_command == .record and
             (std.mem.eql(u8, argument, "-t") or std.mem.eql(u8, argument, "--toggle")))
         {
-            if (request.toggle) return error.DuplicateOption;
+            if (request.toggle) {
+                return error.DuplicateOption;
+            }
+
             request.toggle = true;
+
             continue;
         }
 
         if (client_command == .record and std.mem.startsWith(u8, argument, "--toggle=")) {
             diagnostic.argument = "--toggle";
+
             return error.OptionTakesNoValue;
         }
 
-        if (std.mem.startsWith(u8, argument, "-")) return error.UnknownOption;
+        if (std.mem.startsWith(u8, argument, "-")) {
+            return error.UnknownOption;
+        }
+
         return error.UnexpectedArgument;
     }
 
@@ -463,7 +516,7 @@ fn parseSetupArguments(arguments: []const [:0]const u8, diagnostic: *ArgumentDia
 
         diagnostic.argument = "--model";
         diagnostic.value = value;
-        diagnostic.expected = "'all', 'whisper.base.en', 'whisper.small.en', or 'whisper.medium.en'";
+        diagnostic.expected = "'all', 'whisper.base.en', 'whisper.small.en', 'whisper.medium.en', or 'whisper.tiny.en'";
 
         if (std.mem.eql(u8, value, "all")) {
             if (saw_specific_model) {
@@ -549,9 +602,11 @@ const setup_help =
     \\  whisper.base.en
     \\  whisper.small.en
     \\  whisper.medium.en
+    \\  whisper.tiny.en
     \\
     \\Examples:
     \\  voiced setup
+    \\  voiced setup --model whisper.tiny.en
     \\  voiced setup --model whisper.medium.en
     \\  voiced setup --model whisper.base.en --model whisper.medium.en
     \\  voiced setup --model all
@@ -559,6 +614,7 @@ const setup_help =
     \\Each selected model is built from weights and a vocabulary downloaded from a
     \\pinned Hugging Face revision. Existing valid packed models are reused.
     \\
+    \\Tiny.en downloads about 72 MiB and installs about 39.5 MiB.
     \\The default Small.en download is about 461 MiB and installs about 238 MiB.
     \\All current models download about 2.1 GiB and install about 1.1 GiB.
     \\
@@ -566,11 +622,13 @@ const setup_help =
     \\  $XDG_DATA_HOME/voiced/models/whisper.base.en.voiced
     \\  $XDG_DATA_HOME/voiced/models/whisper.small.en.voiced
     \\  $XDG_DATA_HOME/voiced/models/whisper.medium.en.voiced
+    \\  $XDG_DATA_HOME/voiced/models/whisper.tiny.en.voiced
     \\
     \\  When XDG_DATA_HOME is unset:
     \\  $HOME/.local/share/voiced/models/whisper.base.en.voiced
     \\  $HOME/.local/share/voiced/models/whisper.small.en.voiced
     \\  $HOME/.local/share/voiced/models/whisper.medium.en.voiced
+    \\  $HOME/.local/share/voiced/models/whisper.tiny.en.voiced
     \\
 ;
 
@@ -700,7 +758,7 @@ const serve_help =
     \\  session bus; when unset, Voiced uses $XDG_RUNTIME_DIR/bus.
     \\
     \\Model behavior:
-    \\  Models: whisper.base.en, whisper.small.en, whisper.medium.en.
+    \\  Models: whisper.base.en, whisper.small.en, whisper.medium.en, whisper.tiny.en.
     \\  Model loading begins alongside capture. Encoder and decoder work share one
     \\  worker pool, so decoder threads cannot exceed encoder threads.
     \\  Counts may exceed the CPU count; excessive threads can increase contention
@@ -785,7 +843,7 @@ const status_help =
     \\      Whole seconds since the current recording was requested. Available only
     \\      while phase=capturing.
     \\
-    \\  model=<whisper.base.en|whisper.small.en|whisper.medium.en>
+    \\  model=<whisper.base.en|whisper.small.en|whisper.medium.en|whisper.tiny.en>
     \\      Whisper model this daemon loads. Independent of model_state.
     \\
     \\  model_state=<unloaded|loading|loaded|unloading>

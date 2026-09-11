@@ -1,0 +1,6 @@
+{
+  "filesystem": {
+    // Let agents in this repository atomically update the active Voiced config.
+    "rw": ["~/.config/voiced"]
+  }
+}

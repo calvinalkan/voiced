@@ -27,7 +27,10 @@ pub fn Mailbox(comptime Job: type, comptime Result: type) type {
         // materialize and copy a constant sized for its largest payload.
         pub fn init(self: *Self, notification_fd: std.posix.fd_t) !void {
             const result = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
-            if (linux.errno(result) != .SUCCESS) return error.WorkerEventCreateFailed;
+            if (linux.errno(result) != .SUCCESS) {
+                return error.WorkerEventCreateFailed;
+            }
+
             self.wake_fd = @intCast(result);
             self.notification_fd = notification_fd;
             self.state = .init(.idle);
@@ -40,7 +43,9 @@ pub fn Mailbox(comptime Job: type, comptime Result: type) type {
 
         pub fn submit(self: *Self, job: Job) void {
             assert(self.state.load(.acquire) == .idle);
+
             self.payload = .{ .job = job };
+
             self.state.store(.job, .release);
             wake(self.wake_fd);
         }
@@ -52,15 +57,19 @@ pub fn Mailbox(comptime Job: type, comptime Result: type) type {
                 switch (self.state.load(.acquire)) {
                     .job => {
                         const job = self.payload.job;
+
                         drain(self.wake_fd);
+
                         return job;
                     },
                     .shutdown => return null,
                     .idle, .result => {},
                     .exited => unreachable,
                 }
+
                 var fd = [_]linux.pollfd{.{ .fd = self.wake_fd, .events = linux.POLL.IN, .revents = 0 }};
                 const result = linux.poll(&fd, 1, -1);
+
                 switch (linux.errno(result)) {
                     .INTR => continue,
                     .SUCCESS => drain(self.wake_fd),
@@ -71,17 +80,24 @@ pub fn Mailbox(comptime Job: type, comptime Result: type) type {
 
         pub fn complete(self: *Self, result: Result) void {
             assert(self.state.load(.monotonic) == .job);
+
             // A plain Zig union still tracks its active field in safe builds.
             // Field assignment would access the old variant instead of retagging.
             self.payload = .{ .result = result };
+
             self.state.store(.result, .release);
             wake(self.notification_fd);
         }
 
         pub fn receive(self: *Self) ?Result {
-            if (self.state.load(.acquire) != .result) return null;
+            if (self.state.load(.acquire) != .result) {
+                return null;
+            }
+
             const result = self.payload.result;
+
             self.state.store(.idle, .release);
+
             return result;
         }
 
@@ -107,6 +123,7 @@ pub fn Mailbox(comptime Job: type, comptime Result: type) type {
 
 pub fn wake(fd: std.posix.fd_t) void {
     const one: u64 = 1;
+
     while (true) switch (linux.errno(linux.write(fd, std.mem.asBytes(&one).ptr, @sizeOf(u64)))) {
         .SUCCESS, .AGAIN => return,
         .INTR => continue,
@@ -125,5 +142,6 @@ pub fn drain(fd: std.posix.fd_t) void {
 
 pub fn name(value: [:0]const u8) void {
     assert(value.len <= 15);
+
     _ = linux.prctl(@intFromEnum(linux.PR.SET_NAME), @intFromPtr(value.ptr), 0, 0, 0);
 }

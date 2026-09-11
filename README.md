@@ -56,6 +56,7 @@ Setup installs Small.en by default. Repeat `--model` to select one or more model
 or use `--model all` by itself:
 
 ```bash
+./zig-out/bin/voiced setup --model whisper.tiny.en
 ./zig-out/bin/voiced setup --model whisper.medium.en
 ./zig-out/bin/voiced setup \
   --model whisper.small.en \
@@ -68,36 +69,44 @@ Face, verifies their sizes and BLAKE3-256 pins, and converts them into native
 `.voiced` files. An existing file is reused only when it loads as the requested
 model under the runtime's current packed format; otherwise setup atomically
 replaces it. Unselected installed models remain untouched, and source downloads
-are temporary. Small.en downloads about 461 MiB and installs about 238 MiB; all
-current models download about 2.1 GiB and install about 1.1 GiB under
+are temporary. Tiny.en downloads about 72 MiB and installs about 39.5 MiB;
+Small.en downloads about 461 MiB and installs about 238 MiB. All current models
+download about 2.1 GiB and install about 1.1 GiB under
 `$XDG_DATA_HOME/voiced/models`, or `~/.local/share/voiced/models` when the XDG
 path is unset. `zig build setup` builds Voiced and installs Small.en; pass setup
 arguments after `--`, for example `zig build setup -- --model all`. Ordinary
 builds neither download models nor run inference.
 
-Plain `zig build` creates a developer build and defaults to ReleaseSafe for the
-application, inference runtime, and stdlib. It retains symbols, in-process panic
-and fault stack traces, lifecycle assertions, and Zig runtime safety checks.
-`-Doptimize` selects the application mode. `-Doptimize-inference-runtime` and
-`-Doptimize-stdlib` optionally override the complete inference and Zig standard
-library modules; each otherwise follows the application mode. ReleaseSafe
-inference keeps the projection kernel's entry assertions. Its validated k4
-depth loop uses a proven packed offset instead of repeating per-update layout
-assertions and disables generated bounds and overflow checks. Debug restores
-the generated loop checks. `inference/linear.zig` owns the complete safety and
-performance fence.
+Plain `zig build` creates a developer build with a Debug application and stdlib
+plus a separately compiled ReleaseSafe inference object. Zig selects the
+application backend; inference always uses LLVM. The build retains symbols,
+in-process panic and fault stack traces, lifecycle assertions, and Zig runtime
+safety checks.
 
-Use fully Debug code only when its unoptimized execution is acceptable:
+`-Doptimize` selects the application mode, and stdlib follows it unless
+`-Doptimize-stdlib` overrides it. Inference independently defaults to ReleaseSafe
+and accepts `-Doptimize-inference-runtime`. `-Dllvm=true` forces LLVM for
+application code, while `-Dllvm=false` forces Zig's native backend. Without that
+option, Zig selects the application backend.
+
+ReleaseSafe inference keeps the projection kernel's entry assertions. Its
+validated k4 depth loop uses a proven packed offset instead of repeating
+per-update layout assertions and disables generated bounds and overflow checks.
+Debug restores the generated loop checks. `inference/linear.zig` owns the
+complete safety and performance fence.
+
+Use optimized, checked application code when debugging requires realistic
+runtime performance:
 
 ```bash
-zig build -Doptimize=Debug
+zig build -Doptimize=ReleaseSafe
 ```
 
-For ordinary application debugging without unoptimized inference, retain
-ReleaseSafe inference:
+A fully Debug inference runtime is available for focused investigation, but is
+too slow for ordinary transcription:
 
 ```bash
-zig build -Doptimize=Debug -Doptimize-inference-runtime=ReleaseSafe
+zig build -Doptimize-inference-runtime=Debug
 ```
 
 `-Ddeveloper=false` selects the closed deployment profile. It rejects Debug for
@@ -106,21 +115,25 @@ in-process crash diagnostics and runtime unwind tables, and makes the sub-1-MiB
 size gate part of the ordinary install step. ReleaseFast remains opt-in rather
 than the default production policy.
 
-The compact deployment size-optimizes Voiced and stdlib, while keeping the
-inference runtime speed-optimized:
+The fixed release profile size-optimizes Voiced and stdlib, keeps inference
+speed-optimized, uses LLVM, strips developer diagnostics, and checks the
+installed daemon against the size limit:
 
 ```bash
-zig build -Ddeveloper=false \
-  -Doptimize=ReleaseSmall \
-  -Doptimize-inference-runtime=ReleaseFast
+zig build release
 ```
 
-The deployment build checks its installed daemon automatically. The named step
-also works from a developer build by compiling a deployment-equivalent stripped
-daemon with the selected non-Debug optimization modes:
+The release profile does not accept profile `-D` options or arguments after
+`--`. General Zig runner controls remain available, including
+`zig build release --summary all`. Use the configurable `-Ddeveloper=false`
+profile directly when evaluating other non-Debug optimization combinations.
+
+The named size-test step also works from a developer build by compiling a
+deployment-equivalent stripped daemon with the selected non-Debug optimization
+modes:
 
 ```bash
-zig build size-check \
+zig build test:executable-size \
   -Doptimize=ReleaseSmall \
   -Doptimize-inference-runtime=ReleaseFast \
   -Doptimize-stdlib=ReleaseSmall
@@ -148,13 +161,45 @@ root configuration. Unused `std.Io` networking is disabled in every build mode.
 Raw Unix sockets and PipeWire remain available, and the separate model-setup tool
 keeps networking.
 
+## Tests
+
+The build runs Debug application tests with Zig's selected backend and
+ReleaseSafe inference tests with LLVM. Inference tests link the same separately
+compiled object used by the daemon and exercise its exported ABI. Application
+tests embed ZigLint's public module for the repository lint check. Run every
+repository test with:
+
+```bash
+zig build test
+```
+
+Pass a case-sensitive substring after `--` to select tests by their fully
+qualified names:
+
+```bash
+zig build test -- packed_model.root_test
+zig build test -- inference.root_test
+zig build test -- "repository source passes lint"
+zig build test -Ddeveloper=false -- "object boundary"
+```
+
+Tests do not apply the installed executable's non-Debug deployment restriction,
+so focused checks can select `-Ddeveloper=false` independently.
+
+The repository lint test also rejects source that differs from canonical Zig
+formatting. ZigLint's intentionally invalid fixtures are excluded from the
+repository scan.
+
 ## Zig linter
 
-Build the native linter and pass it one file or directory:
+Build the native linter and inspect one file or directory. Pass `--fix` to
+atomically apply compatible rule fixes and canonical formatting before reporting
+any remaining diagnostics:
 
 ```bash
 zig build zig-lint
 ./zig-out/bin/zig-lint src
+./zig-out/bin/zig-lint --fix src
 ```
 
 For a directory inside a Git repository, `zig-lint` reads each regular,
@@ -204,13 +249,13 @@ language and standard-library contract to target and defaults to the toolchain
 that built the linter. It does not switch the linter's parser or formatter.
 For cached directory scans, changing it establishes a distinct lint-cache
 identity. See the
-[source language contract](docs/plugins.md#source-language-contract) for the
+[source language contract](tools/zig_lint/docs/plugins.md#source-language-contract) for the
 complete rule and plugin semantics.
 
 ### Native lint plugins
 
 Plugins are trusted native code and are loaded only from explicit paths. See
-[`docs/plugins.md`](docs/plugins.md) for registration, lifecycle, ABI
+[`tools/zig_lint/docs/plugins.md`](tools/zig_lint/docs/plugins.md) for registration, lifecycle, ABI
 compatibility, Linux host requirements, and a complete Zig plugin.
 
 ## Run
@@ -234,7 +279,7 @@ defaults. Service options are:
 | --- | --- |
 | `--log-level <critical\|error\|warn\|info\|debug>` | Diagnostic threshold; default `info` |
 | `--log-target <auto\|journal\|stderr>` | Diagnostic destination; default `auto` selects stderr in a terminal and journal otherwise |
-| `--model <name>` | `whisper.base.en`, `whisper.small.en`, or `whisper.medium.en` |
+| `--model <name>` | `whisper.base.en`, `whisper.small.en`, `whisper.medium.en`, or `whisper.tiny.en` |
 | `--model-encoder-threads <count>` | Positive inference pool size; one OS thread per worker |
 | `--model-decoder-threads <count>` | Positive decoder limit within the same pool; omitted uses the whole pool |
 | `--model-encoder-padding-seconds <5\|10\|30>` | Encoder silence appended after each audio chunk; default 10 seconds, with total input capped at 30 seconds |
@@ -440,7 +485,7 @@ before dispatch or display. Each send is one complete record. Receivers use
 | 40 | 8 | Model idle seconds remaining, or `2^64-1` when unavailable |
 | 48 | 1 | Phase: idle=1, capturing=2, stopping=3, transcribing=4, delivering=5 |
 | 49 | 1 | Model state: unloaded=1, loading=2, loaded=3, unloading=4 |
-| 50 | 1 | Model kind: whisper.base.en=1, whisper.small.en=2, whisper.medium.en=3 |
+| 50 | 1 | Model kind: whisper.base.en=1, whisper.small.en=2, whisper.medium.en=3, whisper.tiny.en=4 |
 | 51 | 13 | Reserved: zero |
 
 Requests are exactly 8 bytes and replies are exactly 64 bytes. No other record
@@ -697,8 +742,15 @@ both workers start. Its single canonical record carries
 `clipboard_backend_policy` plus the actual `clipboard_backend` and
 `clipboard_mode` when clipboard output is active. Candidate negotiation remains
 in debug or warning component events rather than adding successful info events.
-Call sites pass the event name separately from ordered typed fields; arbitrary
-text uses escaped string fields rather than interpolated message fragments.
+Call sites bind each canonical event name to a compile-time field schema. A
+process-wide catalog in `src/logging.zig` defines every field key and its one
+representation; event schemas only select catalog keys. Unknown or duplicate
+keys, fields outside an event schema, and values with the wrong representation
+fail to build. Shared concepts therefore retain one key across components, such
+as `problem_code`, `system_error`, `paste_shortcut`, `scheduler_policy`, and
+`save_outcome`; model limits reuse the corresponding configuration names.
+Arbitrary text uses escaped string fields rather than interpolated message
+fragments.
 
 Human-readable messages begin with the lower-case event name and use ordered
 `key=value` fields. Event names, field names, and unquoted enum values are
@@ -859,8 +911,8 @@ Recording computation totals include consumed no-speech chunks. They exclude
 model preparation, queueing, failed attempts, text assembly, and desktop
 delivery; they are not end-to-end latency. Capture-end audio duration covers all
 captured samples, which can exceed the processed prefix after a failure. A speed
-with zero audio or computation duration is `unavailable`. Discarded recordings
-have `transcript_size=0`. Transcript contents are never diagnostics.
+with zero audio or computation duration is omitted. Discarded recordings have
+`transcript_size=0`. Transcript contents are never diagnostics.
 
 Durations measure one named operation; elapsed fields measure from a named
 reference event. There is no duration relative to the previous log line.
@@ -868,7 +920,7 @@ reference event. There is no duration relative to the previous log line.
 | Timing | Start → end |
 |---|---|
 | `capture_start_duration_ms` | Accepted command received → first callback observed by supervisor |
-| `model_file_load_duration_ms` | Packed file open → mapping and complete validation finish |
+| `model_load_duration_ms` | Packed file open → mapping and complete validation finish |
 | `model_prepare_duration_ms` | Worker starts model loading → workspace and runtime ready |
 | `clipboard_acquire_duration_ms` | Desktop delivery begins → supervisor observes clipboard acquisition |
 | `paste_settle_duration_ms` | Clipboard acquisition observed → first shortcut key frame |
@@ -891,8 +943,8 @@ receiving the accepted stop/toggle command. Repeated stops do not reset it.
 With `stop_origin=capture_end`, it is the supervisor observing the
 capture thread's final report; work before that observation is outside the elapsed
 measurement.
-Without either reference, origin and elapsed are `unavailable`. These timings
-exclude keybinding/CLI startup and application rendering after the paste shortcut.
+Without either reference, origin and elapsed are omitted. These timings exclude
+keybinding/CLI startup and application rendering after the paste shortcut.
 Each new recording resets the reference.
 
 Requested cancellation is `info`. Service errors retain their typed diagnostics

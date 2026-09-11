@@ -32,6 +32,7 @@ pub const workspace_values_count: usize = encoder_features_offset + mel_bins_cou
 
 pub fn encoderPositionsCountMax(configured_samples_count_max: usize, trailing_padding_max: EncoderTrailingPadding) usize {
     const content_frames_count_max = configured_samples_count_max / hop_samples_count;
+
     return paddedEncoderFramesCount(content_frames_count_max, trailing_padding_max) / 2;
 }
 
@@ -91,6 +92,7 @@ pub const Extractor = struct {
     pub fn init(extractor: *Extractor, memory: []align(memory_alignment) u8, configured_samples_count_max: usize) error{MemoryTooSmall}!void {
         assert(configured_samples_count_max >= samples_count_min);
         assert(configured_samples_count_max <= samples_count_max);
+
         if (memory.len < memory_size) {
             return error.MemoryTooSmall;
         }
@@ -106,6 +108,7 @@ pub const Extractor = struct {
 
         for (hann_window, 0..) |*coefficient, sample_index| {
             const angle = 2.0 * std.math.pi * @as(f64, @floatFromInt(sample_index)) / fft_samples_count;
+
             coefficient.* = @floatCast(0.5 - 0.5 * @cos(angle));
         }
 
@@ -113,6 +116,7 @@ pub const Extractor = struct {
             for (0..fft_samples_count) |sample_index| {
                 const coefficient_index = fft_bin_index * fft_samples_count + sample_index;
                 const angle = 2.0 * std.math.pi * @as(f64, @floatFromInt(fft_bin_index * sample_index)) / fft_samples_count;
+
                 dft_cosines[coefficient_index] = @floatCast(@cos(angle));
                 dft_sines[coefficient_index] = @floatCast(@sin(angle));
             }
@@ -134,11 +138,14 @@ pub const Extractor = struct {
         if (samples.len < samples_count_min) {
             return error.AudioTooShort;
         }
+
         if (samples.len > extractor.samples_count_max) {
             return error.AudioDurationExceedsLimit;
         }
+
         const content_frames_count = samples.len / hop_samples_count;
         assert(content_frames_count > 0);
+
         assert(content_frames_count <= encoder_frames_count_max);
 
         // ── Stream Spectra Into Final Mel Storage ──
@@ -151,6 +158,7 @@ pub const Extractor = struct {
         if (workspace.len < workspaceValuesCount(encoder_frames_count / 2)) {
             return error.MemoryTooSmall;
         }
+
         const power_spectrum = workspace[0..fft_bins_count];
         const encoder_features = workspace[encoder_features_offset..][0 .. mel_bins_count * encoder_frames_count];
 
@@ -158,12 +166,15 @@ pub const Extractor = struct {
         for (0..content_frames_count) |frame_index| {
             const frame_origin = @as(isize, @intCast(frame_index * hop_samples_count)) - center_padding_samples_count;
             const frame_end = frame_origin + fft_samples_count;
+
             const frame_samples: []const f32 = if (frame_origin >= 0 and frame_end <= samples.len) blk: {
                 const origin: usize = @intCast(frame_origin);
+
                 break :blk samples[origin..][0..fft_samples_count];
             } else blk: {
                 for (&boundary_frame_samples, 0..) |*sample, frame_sample_index| {
                     const sample_index = frame_origin + @as(isize, @intCast(frame_sample_index));
+
                     if (sample_index < 0) {
                         sample.* = samples[@intCast(-sample_index)];
                     } else if (sample_index < samples.len) {
@@ -172,6 +183,7 @@ pub const Extractor = struct {
                         sample.* = 0.0;
                     }
                 }
+
                 break :blk &boundary_frame_samples;
             };
 
@@ -186,8 +198,10 @@ pub const Extractor = struct {
         // participate in content normalization.
 
         var feature_maximum: f32 = -std.math.inf(f32);
+
         for (0..mel_bins_count) |mel_bin_index| {
             const content_row = encoder_features[mel_bin_index * encoder_frames_count ..][0..content_frames_count];
+
             for (content_row) |*feature| {
                 feature.* = @log10(@max(feature.*, 1.0e-10));
                 feature_maximum = @max(feature_maximum, feature.*);
@@ -196,6 +210,7 @@ pub const Extractor = struct {
 
         for (0..mel_bins_count) |mel_bin_index| {
             const row = encoder_features[mel_bin_index * encoder_frames_count ..][0..encoder_frames_count];
+
             normalizeFeatures(row[0..content_frames_count], feature_maximum - 8.0);
             @memset(row[content_frames_count..], 0.0);
         }
@@ -231,16 +246,19 @@ fn calculatePowerSpectrum(power_spectrum: []f32, frame_samples: []const f32, han
         var imaginary_parts: F32x8 = @splat(0.0);
 
         var sample_index: usize = 0;
+
         while (sample_index < fft_samples_count) : (sample_index += simd_lanes_count) {
             const samples_vector: F32x8 = frame_samples[sample_index..][0..simd_lanes_count].*;
             const window_vector: F32x8 = hann_window[sample_index..][0..simd_lanes_count].*;
             const windowed_samples = samples_vector * window_vector;
+
             real_parts += windowed_samples * cosines[sample_index..][0..simd_lanes_count].*;
             imaginary_parts -= windowed_samples * sines[sample_index..][0..simd_lanes_count].*;
         }
 
         const real_part = @reduce(.Add, real_parts);
         const imaginary_part = @reduce(.Add, imaginary_parts);
+
         power_spectrum[fft_bin_index] = real_part * real_part + imaginary_part * imaginary_part;
     }
 }
@@ -255,19 +273,23 @@ fn calculateMelFrame(features: []f32, frames_count: usize, frame_index: usize, p
     // product's SIMD lane and accumulation order. Omitted coefficients are zero;
     // normalized input gives finite, nonnegative power, so those adds are inert.
     var coefficient_offset: usize = 0;
+
     for (mel_filters, 0..) |mel_filter, mel_bin_index| {
         const coefficients_count = mel_filter.fft_bin_end - mel_filter.fft_bin_begin;
         const coefficients = mel_filter_coefficients[coefficient_offset..][0..coefficients_count];
         var sums: F32x8 = @splat(0.0);
 
         var fft_bin_index: usize = mel_filter.fft_bin_begin;
+
         while (fft_bin_index < mel_filter.fft_bin_end) : (fft_bin_index += simd_lanes_count) {
             const spectrum_values: F32x8 = power_spectrum[fft_bin_index..][0..simd_lanes_count].*;
             const filter_values: F32x8 = coefficients[fft_bin_index - mel_filter.fft_bin_begin ..][0..simd_lanes_count].*;
+
             sums += spectrum_values * filter_values;
         }
 
         var sum = @reduce(.Add, sums);
+
         sum += power_spectrum[fft_bins_count - 1] * mel_filter.nyquist_coefficient;
 
         features[mel_bin_index * frames_count + frame_index] = sum;
@@ -286,8 +308,10 @@ fn normalizeFeatures(features: []f32, feature_minimum: f32) void {
 
     while (feature_index + simd_lanes_count <= features.len) : (feature_index += simd_lanes_count) {
         const values: F32x8 = features[feature_index..][0..simd_lanes_count].*;
+
         features[feature_index..][0..simd_lanes_count].* = (@max(values, minimums) + additions) * scales;
     }
+
     while (feature_index < features.len) : (feature_index += 1) {
         features[feature_index] = (@max(features[feature_index], feature_minimum) + 4.0) * 0.25;
     }
@@ -301,9 +325,10 @@ const MelFilter = struct {
 
 fn calculateMelFilters(filters: []MelFilter, coefficients: []f32) void {
     const mel_points_count = mel_bins_count + 2;
-    var frequencies_hz: [mel_points_count]f64 = undefined;
 
+    var frequencies_hz: [mel_points_count]f64 = undefined;
     assert(filters.len == mel_bins_count);
+
     assert(coefficients.len == mel_filter_coefficients_capacity);
     comptime assert(fft_bins_count - 1 <= std.math.maxInt(u8));
 
@@ -311,10 +336,15 @@ fn calculateMelFilters(filters: []MelFilter, coefficients: []f32) void {
         const mel = 45.245640471924965 * @as(f64, @floatFromInt(mel_point_index)) / (mel_points_count - 1);
         const linear_frequency_hz = (200.0 / 3.0) * mel;
         const logarithmic_start = 1000.0 / (200.0 / 3.0);
-        frequency_hz.* = if (mel >= logarithmic_start) 1000.0 * @exp(@log(6.4) / 27.0 * (mel - logarithmic_start)) else linear_frequency_hz;
+
+        frequency_hz.* = if (mel >= logarithmic_start)
+            1000.0 * @exp(@log(6.4) / 27.0 * (mel - logarithmic_start))
+        else
+            linear_frequency_hz;
     }
 
     var coefficient_offset: usize = 0;
+
     for (filters, 0..) |*filter, mel_bin_index| {
         const lower_frequency_hz = frequencies_hz[mel_bin_index];
         const center_frequency_hz = frequencies_hz[mel_bin_index + 1];
@@ -326,6 +356,7 @@ fn calculateMelFilters(filters: []MelFilter, coefficients: []f32) void {
             const frequency_hz = @as(f64, @floatFromInt(fft_bin_index)) * sample_rate_hz / fft_samples_count;
             const lower_weight = (frequency_hz - lower_frequency_hz) / (center_frequency_hz - lower_frequency_hz);
             const upper_weight = (upper_frequency_hz - frequency_hz) / (upper_frequency_hz - center_frequency_hz);
+
             coefficient.* = @floatCast(@max(0.0, @min(lower_weight, upper_weight)) * energy_scale);
         }
 
@@ -333,18 +364,30 @@ fn calculateMelFilters(filters: []MelFilter, coefficients: []f32) void {
         // original scalar term even when its generated coefficient is tiny.
         var fft_bin_begin: usize = fft_bins_count - 1;
         var fft_bin_end: usize = 0;
+
         for (dense_filter[0 .. fft_bins_count - 1], 0..) |coefficient, fft_bin_index| {
-            if (coefficient == 0.0) continue;
+            if (coefficient == 0.0) {
+                continue;
+            }
+
             fft_bin_begin = @min(fft_bin_begin, fft_bin_index);
             fft_bin_end = fft_bin_index + 1;
         }
-        if (fft_bin_end == 0) fft_bin_end = fft_bin_begin;
+
+        if (fft_bin_end == 0) {
+            fft_bin_end = fft_bin_begin;
+        }
+
         fft_bin_begin = std.mem.alignBackward(usize, fft_bin_begin, simd_lanes_count);
         fft_bin_end = std.mem.alignForward(usize, fft_bin_end, simd_lanes_count);
+
         assert(fft_bin_end <= fft_bins_count - 1);
+
         const coefficients_count = fft_bin_end - fft_bin_begin;
         assert(coefficients_count <= coefficients.len - coefficient_offset);
+
         @memcpy(coefficients[coefficient_offset..][0..coefficients_count], dense_filter[fft_bin_begin..fft_bin_end]);
+
         filter.* = .{
             .fft_bin_begin = @intCast(fft_bin_begin),
             .fft_bin_end = @intCast(fft_bin_end),
@@ -367,6 +410,7 @@ const Tables = struct {
 test "compact Mel filters preserve dense SIMD accumulation" {
     var filters: [mel_bins_count]MelFilter = undefined;
     var coefficients: [mel_filter_coefficients_capacity]f32 = @splat(std.math.nan(f32));
+
     calculateMelFilters(&filters, &coefficients);
 
     // Keep the original dense construction and reduction as an independent
@@ -378,30 +422,43 @@ test "compact Mel filters preserve dense SIMD accumulation" {
         const mel = 45.245640471924965 * @as(f64, @floatFromInt(mel_point_index)) / (mel_bins_count + 1);
         const linear_frequency_hz = (200.0 / 3.0) * mel;
         const logarithmic_start = 1000.0 / (200.0 / 3.0);
-        frequency_hz.* = if (mel >= logarithmic_start) 1000.0 * @exp(@log(6.4) / 27.0 * (mel - logarithmic_start)) else linear_frequency_hz;
+
+        frequency_hz.* = if (mel >= logarithmic_start)
+            1000.0 * @exp(@log(6.4) / 27.0 * (mel - logarithmic_start))
+        else
+            linear_frequency_hz;
     }
+
     for (0..mel_bins_count) |mel_bin_index| {
         const lower_frequency_hz = frequencies_hz[mel_bin_index];
         const center_frequency_hz = frequencies_hz[mel_bin_index + 1];
         const upper_frequency_hz = frequencies_hz[mel_bin_index + 2];
         const energy_scale = 2.0 / (upper_frequency_hz - lower_frequency_hz);
+
         for (0..fft_bins_count) |fft_bin_index| {
             const frequency_hz = @as(f64, @floatFromInt(fft_bin_index)) * sample_rate_hz / fft_samples_count;
             const lower_weight = (frequency_hz - lower_frequency_hz) / (center_frequency_hz - lower_frequency_hz);
             const upper_weight = (upper_frequency_hz - frequency_hz) / (upper_frequency_hz - center_frequency_hz);
+
             dense_filters[mel_bin_index * fft_bins_count + fft_bin_index] = @floatCast(@max(0.0, @min(lower_weight, upper_weight)) * energy_scale);
         }
     }
 
     var random = std.Random.DefaultPrng.init(42);
+
     for (0..fft_bins_count + 5) |case_index| {
         var power_spectrum: [fft_bins_count]f32 = @splat(0.0);
+
         if (case_index < fft_bins_count) {
             power_spectrum[case_index] = 1.0;
         } else if (case_index > fft_bins_count) {
-            for (&power_spectrum) |*power| power.* = random.random().float(f32) * 160_000.0;
+            for (&power_spectrum) |*power| {
+                power.* = random.random().float(f32) * 160_000.0;
+            }
         }
+
         var actual: [mel_bins_count]f32 = @splat(std.math.nan(f32));
+
         calculateMelFrame(&actual, 1, 0, &power_spectrum, &filters, &coefficients);
 
         var expected: [mel_bins_count]f32 = undefined;
@@ -409,24 +466,33 @@ test "compact Mel filters preserve dense SIMD accumulation" {
             const filter = dense_filters[mel_bin_index * fft_bins_count ..][0..fft_bins_count];
             var sums: F32x8 = @splat(0.0);
             var fft_bin_index: usize = 0;
+
             while (fft_bin_index < fft_bins_count - 1) : (fft_bin_index += simd_lanes_count) {
                 const spectrum_values: F32x8 = power_spectrum[fft_bin_index..][0..simd_lanes_count].*;
                 const filter_values: F32x8 = filter[fft_bin_index..][0..simd_lanes_count].*;
+
                 sums += spectrum_values * filter_values;
             }
+
             var sum = @reduce(.Add, sums);
+
             sum += power_spectrum[fft_bins_count - 1] * filter[fft_bins_count - 1];
             feature.* = sum;
         }
+
         try std.testing.expectEqualSlices(u8, std.mem.asBytes(&expected), std.mem.asBytes(&actual));
     }
 
     // Keep bin 200 independent of vector support even on toolchains whose
     // generated final coefficient rounds to zero.
     filters[mel_bins_count - 1].nyquist_coefficient = 1.0e-20;
+
     var nyquist_power: [fft_bins_count]f32 = @splat(0.0);
+
     nyquist_power[fft_bins_count - 1] = 1.0;
+
     var nyquist_features: [mel_bins_count]f32 = undefined;
     calculateMelFrame(&nyquist_features, 1, 0, &nyquist_power, &filters, &coefficients);
+
     try std.testing.expectEqual(@as(f32, 1.0e-20), nyquist_features[mel_bins_count - 1]);
 }

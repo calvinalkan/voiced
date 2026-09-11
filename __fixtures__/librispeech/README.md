@@ -35,25 +35,25 @@ in `manifest.tsv`; migrating checksum algorithms does not resample the corpus.
 Run every audio fixture with the default `whisper.base.en` model from the repository root:
 
 ```bash
-zig test src/root_test.zig -OReleaseFast --test-filter inference.root_test
+zig build test -Doptimize=ReleaseFast -Doptimize-inference-runtime=ReleaseFast -- inference.root_test
 ```
 
 Select `whisper.small.en` with:
 
 ```bash
 VOICED_RUNTIME_MODEL=whisper.small.en \
-  zig test src/root_test.zig -OReleaseFast --test-filter inference.root_test
+  zig build test -Doptimize=ReleaseFast -Doptimize-inference-runtime=ReleaseFast -- inference.root_test
 ```
 
-`VOICED_RUNTIME_MODEL` accepts `whisper.base.en`, `whisper.small.en`, and
-`whisper.medium.en`. Select the per-transcription encoder tail with
+`VOICED_RUNTIME_MODEL` accepts `whisper.base.en`, `whisper.small.en`,
+`whisper.medium.en`, or `whisper.tiny.en`. Select the per-transcription encoder tail with
 `VOICED_RUNTIME_TRAILING_PADDING_SECONDS`; accepted values are `5`, `10`, and
 the default `30`:
 
 ```bash
 VOICED_RUNTIME_MODEL=whisper.small.en \
 VOICED_RUNTIME_TRAILING_PADDING_SECONDS=10 \
-  zig test src/root_test.zig -OReleaseFast --test-filter inference.root_test
+  zig build test -Doptimize=ReleaseFast -Doptimize-inference-runtime=ReleaseFast -- inference.root_test
 ```
 
 The runtime sizes its workspace once from `Runtime.Config.audio_samples_count_max`, `encoder_padding_max`, and the bound pool capacity. Shorter per-transcription padding changes only the logical feature and encoder lengths; it does not resize or allocate memory.
@@ -62,14 +62,14 @@ Select Debug inference with Zig's optimization flag:
 
 ```bash
 VOICED_RUNTIME_AUDIO_FIXTURE=librispeech-test-clean-6829-68769-0026 \
-  zig test src/root_test.zig -ODebug --test-filter inference.root_test
+  zig build test -Doptimize-inference-runtime=Debug -- inference.root_test
 ```
 
 Select one fixture during development:
 
 ```bash
 VOICED_RUNTIME_AUDIO_FIXTURE=librispeech-test-clean-6829-68769-0026 \
-  zig test src/root_test.zig -OReleaseFast --test-filter inference.root_test
+  zig build test -Doptimize=ReleaseFast -Doptimize-inference-runtime=ReleaseFast -- inference.root_test
 ```
 
 An external directory can supply additional fixtures through `VOICED_RUNTIME_AUDIO_FIXTURES_DIRECTORY`. It must follow the same adjacent `.wav` and `.transcript` convention.

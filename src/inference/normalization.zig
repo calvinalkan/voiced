@@ -22,12 +22,14 @@ pub fn forwardRows(input: []const f32, gamma: []const f32, beta: []const f32, ro
     assert(width % (4 * simd_lanes_count) == 0);
 
     const rows_range = lane.range(rows_count);
+
     for (rows_range.start_index..rows_range.end_index) |row_index| {
         const input_row = input[row_index * width ..][0..width];
         const output_row = output[row_index * width ..][0..width];
         const statistics = calculateRowStatistics(input_row);
 
         var column: usize = 0;
+
         while (column < width) : (column += simd_lanes_count) {
             output_row[column..][0..simd_lanes_count].* = normalizedVector(input_row, gamma, beta, statistics, column);
         }
@@ -53,6 +55,7 @@ pub inline fn calculateRowStatistics(input: []const f32) RowStatistics {
         const values_1: F32x8 = input[column + 1 * simd_lanes_count ..][0..simd_lanes_count].*;
         const values_2: F32x8 = input[column + 2 * simd_lanes_count ..][0..simd_lanes_count].*;
         const values_3: F32x8 = input[column + 3 * simd_lanes_count ..][0..simd_lanes_count].*;
+
         sums_0 += values_0;
         sums_1 += values_1;
         sums_2 += values_2;
@@ -83,6 +86,7 @@ pub inline fn normalizedVector(input: []const f32, gamma: []const f32, beta: []c
 
 inline fn reduceAddAvx2(values: F32x8) f32 {
     var reduced = values;
+
     var shuffled: F32x8 = undefined;
     asm volatile (
         \\ vperm2f128 $0x1, %[reduced], %[reduced], %[shuffled]
@@ -94,5 +98,6 @@ inline fn reduceAddAvx2(values: F32x8) f32 {
         : [reduced] "+x" (reduced),
           [shuffled] "=&x" (shuffled),
     );
+
     return reduced[0];
 }

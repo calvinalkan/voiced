@@ -72,25 +72,32 @@ pub const Decoder = struct {
         assert(positions_count > 0);
         assert(positions_count <= dimensions.encoder_positions_count_max);
         assert(layer_index < dimensions.decoder_layers_count);
+
         const width = dimensions.decoder_width;
         const layer_values_capacity = crossLayerValuesCapacity(positions_count, width);
+
         assert(encoded_audio.len == positions_count * width);
+
         const layer_weights = weights.decoder_layers[layer_index];
         const key_values = decoder.memory.cross_key_values[layer_index * layer_values_capacity ..][0..layer_values_capacity];
+
         linear.forwardDecoderCrossKeyValues(encoded_audio, positions_count, layer_weights.cross_attention_key_value_weight, layer_weights.cross_attention_key_value_bias, positions_count, key_values, laneQuantizedRow(decoder, lane), lane);
     }
 
     pub fn decodeToken(decoder: *Decoder, dimensions: ModelDimensions, weights: *const InferenceWeights, encoder_positions_count: usize, token: Token, decoder_position: usize, lane: Lane) void {
         const width = dimensions.decoder_width;
+
         assert(encoder_positions_count > 0);
         assert(encoder_positions_count <= dimensions.encoder_positions_count_max);
         assert(token < dimensions.vocabulary_tokens_count);
         assert(decoder_position < decoder.self_positions_capacity);
 
         const input_range = lane.range(width);
+
         for (input_range.start_index..input_range.end_index) |column| {
             decoder.memory.input[column] = embeddingValue(weights.decoder_embeddings_weight, token, column) + weights.decoder_position_encodings[decoder_position * width + column];
         }
+
         lane.sync();
 
         for (weights.decoder_layers[0..dimensions.decoder_layers_count], 0..) |layer_weights, layer_index| {
@@ -151,6 +158,7 @@ fn storeSelfKeyValues(decoder: *Decoder, dimensions: ModelDimensions, layer_inde
         const head_depth = column % attention_head_width;
         const packed_key_offset = packed_key_layer_offset + head_index * packed_positions_capacity * attention_head_width + head_depth * packed_positions_capacity + decoder_position;
         const value_offset = value_layer_offset + head_index * positions_capacity * attention_head_width + decoder_position * attention_head_width + head_depth;
+
         decoder.memory.self_keys[packed_key_offset] = @floatCast(decoder.memory.query_key_value[width + column]);
         decoder.memory.self_values[value_offset] = @floatCast(decoder.memory.query_key_value[2 * width + column]);
     }
@@ -163,6 +171,7 @@ fn selfAttention(decoder: *Decoder, dimensions: ModelDimensions, layer_index: us
     const value_layer_values_capacity = positions_capacity * width;
     const packed_keys = decoder.memory.self_keys[layer_index * packed_key_layer_values_capacity ..][0..packed_key_layer_values_capacity];
     const values = decoder.memory.self_values[layer_index * value_layer_values_capacity ..][0..value_layer_values_capacity];
+
     attention.forwardDecoder(decoder.memory.query_key_value[0..width], packed_keys, values, decoder_position + 1, positions_capacity, width, dimensions.decoder_attention_heads_count, decoder.memory.attention_output, decoder.memory.lane_attention_scores, lane);
 }
 
@@ -190,9 +199,11 @@ fn forwardNormalizedProjection(decoder: *Decoder, input: []const f32, gamma: []c
 
     // All lanes consume the leader's quantized row and scale after publication.
     const quantized_input = decoder.memory.lane_quantized_rows[0..input.len];
+
     if (lane.isLeader()) {
         decoder.normalized_input_scale = linear.quantizeNormalized(input, gamma, beta, quantized_input);
     }
+
     lane.sync();
 
     linear.forwardQuantizedOneParallel(quantized_input, decoder.normalized_input_scale, weight, bias, activation, output, lane);
@@ -210,5 +221,6 @@ fn embeddingValue(weight: QuantizedWeight, token: Token, column: usize) f32 {
 
 fn laneQuantizedRow(decoder: *Decoder, lane: Lane) []u8 {
     const values_count = decoder.memory.lane_quantized_rows.len / lane.count;
+
     return decoder.memory.lane_quantized_rows[lane.index * values_count ..][0..values_count];
 }

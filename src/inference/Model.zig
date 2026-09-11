@@ -30,6 +30,7 @@ pub fn deinit(model: *Model) void {
         .mapped => |mapping| std.posix.munmap(mapping),
         .allocated => |allocation| allocation.allocator.free(allocation.bytes),
     }
+
     model.* = undefined;
 }
 
@@ -39,12 +40,14 @@ pub const Kind = enum(u16) {
     whisper_base_en = 1,
     whisper_small_en = 2,
     whisper_medium_en = 3,
+    whisper_tiny_en = 4,
 
     pub fn name(kind: Kind) []const u8 {
         return switch (kind) {
             .whisper_base_en => "whisper.base.en",
             .whisper_small_en => "whisper.small.en",
             .whisper_medium_en => "whisper.medium.en",
+            .whisper_tiny_en => "whisper.tiny.en",
         };
     }
 };
@@ -178,6 +181,20 @@ pub fn dimensions(kind: Kind) Dimensions {
             .decoder_attention_heads_count = 16,
             .decoder_layers_count = 24,
             .decoder_ffn_width = 4096,
+            .vocabulary_tokens_count = 51_864,
+        },
+        .whisper_tiny_en => .{
+            .mel_bins_count = 80,
+            .encoder_positions_count_max = 1500,
+            .encoder_width = 384,
+            .encoder_attention_heads_count = 6,
+            .encoder_layers_count = 4,
+            .encoder_ffn_width = 1536,
+            .decoder_positions_count_max = 448,
+            .decoder_width = 384,
+            .decoder_attention_heads_count = 6,
+            .decoder_layers_count = 4,
+            .decoder_ffn_width = 1536,
             .vocabulary_tokens_count = 51_864,
         },
     };

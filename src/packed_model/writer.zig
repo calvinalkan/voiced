@@ -50,6 +50,7 @@ pub fn writeFromCTranslate2(
     var reader: WeightsReader = .{ .remaining = weights_bytes };
 
     const binary_version = try reader.readInt(u32);
+
     if (binary_version != binary_version_supported) {
         return error.InvalidCTranslate2Weights;
     }
@@ -97,6 +98,7 @@ pub fn writeFromCTranslate2(
 
     for (0..dimensions.decoder_layers_count) |layer_ordinal| {
         const layer_index = sourceLayerIndexFromOrdinal(layer_ordinal, dimensions.decoder_layers_count);
+
         for (decoder_layer_tensors) |plan| {
             try convertLayerTensor(&reader, &output, dimensions, "decoder", layer_index, plan);
         }
@@ -216,18 +218,21 @@ fn prepareVocabulary(
 
         const line_end = std.mem.indexOfScalarPos(u8, vocabulary_text, line_start, '\n') orelse vocabulary_text.len;
         const token_text = vocabulary_text[line_start..line_end];
+
         const token_view = std.unicode.Utf8View.init(token_text) catch {
             // Every vocabulary token must be valid UTF-8 before GPT-2 decoding.
             return error.InvalidCTranslate2Vocabulary;
         };
 
         var codepoints = token_view.iterator();
+
         while (codepoints.nextCodepoint()) |codepoint| {
             const byte = gpt2ByteFromCodepoint(codepoint) orelse {
                 // GPT-2's alphabet contains only the 256 codepoints documented
                 // above; any other codepoint cannot represent a source byte.
                 return error.InvalidCTranslate2Vocabulary;
             };
+
             if (byte_offset == token_bytes.len) {
                 // Decoding may not exceed the packed format's fixed byte payload.
                 return error.InvalidCTranslate2Vocabulary;
@@ -245,12 +250,14 @@ fn prepareVocabulary(
         // The source ended before supplying every model vocabulary token.
         return error.InvalidCTranslate2Vocabulary;
     }
+
     if (byte_offset != token_bytes.len) {
         // The decoded tokens must exactly fill the format's vocabulary payload.
         return error.InvalidCTranslate2Vocabulary;
     }
 
     offsets[token_count] = @intCast(byte_offset);
+
     return .{ .offsets = offsets, .bytes = token_bytes };
 }
 
@@ -268,18 +275,22 @@ const gpt2_byte_by_codepoint: [gpt2_codepoints_count]?u8 = mapping: {
 
     for (0..gpt2_bytes_count) |byte_value| {
         const byte: u8 = @intCast(byte_value);
+
         const codepoint = if (gpt2ByteIsDirect(byte)) direct: {
             break :direct byte_value;
         } else remapped: {
             defer next_remapped_codepoint += 1;
+
             break :remapped next_remapped_codepoint;
         };
 
         assert(byte_by_codepoint[codepoint] == null);
+
         byte_by_codepoint[codepoint] = byte;
     }
 
     assert(next_remapped_codepoint == gpt2_codepoints_count);
+
     break :mapping byte_by_codepoint;
 };
 
@@ -341,7 +352,12 @@ const Output = struct {
         // each payload in that order and publish its location through the fixed
         // kind/layer directory rather than rearranging the source stream.
         const section = TensorSection.calculate(output.kind, section_kind, layer_index, output.next_payload_offset);
-        const layer_slot_index: usize = if (layer_index) |index| @intCast(index) else 0;
+
+        const layer_slot_index: usize = if (layer_index) |index|
+            @intCast(index)
+        else
+            0;
+
         const directory_entry_offset = TensorSection.directoryEntryOffset(output.kind, section_kind, layer_slot_index);
         const directory_entry = output.bytes[directory_entry_offset..][0..@sizeOf(u64)];
 
@@ -365,6 +381,7 @@ const Output = struct {
         // ── Verify Complete Tensor Conversion ──
 
         const dimensions = inference.Model.dimensions(output.kind);
+
         assert(output.sections_written_count == TensorSection.count(output.kind));
         assert(output.next_payload_offset == output.file_layout.tensor_payloads_end_offset);
         assert(vocabulary.offsets.len == dimensions.vocabulary_tokens_count + 1);
@@ -375,6 +392,7 @@ const Output = struct {
         for (vocabulary.offsets, 0..) |offset, index| {
             writeInt(u32, output.bytes, output.file_layout.vocabulary_index_offset + index * @sizeOf(u32), offset);
         }
+
         @memcpy(output.bytes[output.file_layout.vocabulary_bytes_start_offset..output.file_layout.vocabulary_bytes_end_offset], vocabulary.bytes);
 
         // ── Publish The Header ──
@@ -393,6 +411,7 @@ const Output = struct {
         // output matches the reader's rule of substituting zeros for that field.
 
         var hash = Blake3.init(.{});
+
         hash.update(output.bytes);
         hash.final(output.bytes[layout.header_file_blake3_offset..layout.header_reserved_offset]);
 
@@ -401,6 +420,7 @@ const Output = struct {
 
     fn deinit(output: *Output) void {
         output.allocator.free(output.bytes);
+
         output.* = undefined;
     }
 };
@@ -451,8 +471,10 @@ const WeightsReader = struct {
 
         var dimensions: [Tensor.dimensions_count_max]usize = @splat(0);
         var elements_count: usize = 1;
+
         for (0..dimensions_count) |dimension_index| {
             const dimension: usize = @intCast(try reader.readInt(u32));
+
             dimensions[dimension_index] = dimension;
 
             elements_count = std.math.mul(usize, elements_count, dimension) catch {
@@ -466,18 +488,22 @@ const WeightsReader = struct {
             // Unassigned tags have no defined CTranslate2 element width.
             return error.InvalidCTranslate2Weights;
         };
+
         const data_size: usize = @intCast(try reader.readInt(u32));
+
         const expected_data_size = std.math.mul(usize, elements_count, data_type.elementSize()) catch {
             // The declared shape and element type cannot fit an addressable
             // payload size.
             return error.InvalidCTranslate2Weights;
         };
+
         if (data_size != expected_data_size) {
             // The payload must contain exactly one encoded value per element.
             return error.InvalidCTranslate2Weights;
         }
 
         const data = try reader.readBytes(data_size);
+
         return .{
             .name = name,
             .dimensions = dimensions,
@@ -522,7 +548,9 @@ const WeightsReader = struct {
         }
 
         const bytes = reader.remaining[0..size];
+
         reader.remaining = reader.remaining[size..];
+
         return bytes;
     }
 };
@@ -550,14 +578,17 @@ const Tensor = struct {
             i16 => .int16,
             else => @compileError("unsupported CTranslate2 scalar type"),
         };
+
         if (tensor.dimensions_count != 0) {
             return false;
         }
+
         if (tensor.data_type != expected_data_type) {
             return false;
         }
 
         const actual_value = std.mem.readInt(Int, tensor.data[0..@sizeOf(Int)], .little);
+
         return actual_value == expected_value;
     }
 };
@@ -637,10 +668,10 @@ fn sourceLayerIndexFromOrdinal(layer_ordinal: usize, layers_count: usize) u16 {
     assert(layer_ordinal < layers_count);
 
     // CTranslate2 serializes tensor names lexicographically rather than by
-    // numeric layer index. Single-digit Base.en indexes already have numeric
-    // order; Small.en and Medium.en need explicit source-order mappings.
+    // numeric layer index. Tiny.en and Base.en have only single-digit indexes,
+    // while Small.en and Medium.en need explicit source-order mappings.
     return switch (layers_count) {
-        6 => @intCast(layer_ordinal),
+        4, 6 => @intCast(layer_ordinal),
         12 => ([_]u16{ 0, 1, 10, 11, 2, 3, 4, 5, 6, 7, 8, 9 })[layer_ordinal],
         24 => ([_]u16{ 0, 1, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 2, 20, 21, 22, 23, 3, 4, 5, 6, 7, 8, 9 })[layer_ordinal],
         else => unreachable,
@@ -729,7 +760,9 @@ fn convertLayerTensor(
     assert(plan.name.len > 0);
 
     var tensor_name_buffer: [tensor_name_size_max]u8 = undefined;
-    const tensor_name = std.fmt.bufPrint(&tensor_name_buffer, "{s}/layer_{d}/{s}", .{ scope, layer_index, plan.name }) catch unreachable;
+    const tensor_name = std.fmt.bufPrint(&tensor_name_buffer, "{s}/layer_{d}/{s}", .{ scope, layer_index, plan.name }) catch {
+        unreachable;
+    };
 
     try convertTensor(reader, output, dimensions, layer_index, tensor_name, plan.handling);
 }
@@ -757,12 +790,14 @@ fn convertTensor(
                 return error.InvalidCTranslate2Weights;
             }
         },
+
         .scalar_i16 => |expected_value| {
             if (!tensor.hasScalarValue(i16, expected_value)) {
                 // This source configuration does not match Voiced's fixed model.
                 return error.InvalidCTranslate2Weights;
             }
         },
+
         .encoder_attention_heads_count => {
             const expected_value: i16 = @intCast(dimensions.encoder_attention_heads_count);
             if (!tensor.hasScalarValue(i16, expected_value)) {
@@ -770,6 +805,7 @@ fn convertTensor(
                 return error.InvalidCTranslate2Weights;
             }
         },
+
         .decoder_attention_heads_count => {
             const expected_value: i16 = @intCast(dimensions.decoder_attention_heads_count);
             if (!tensor.hasScalarValue(i16, expected_value)) {
@@ -777,12 +813,15 @@ fn convertTensor(
                 return error.InvalidCTranslate2Weights;
             }
         },
+
         .packed_section => |section_kind| {
             const section = output.claimSection(section_kind, layer_index);
+
             if (tensor.data_type != .float16) {
                 // The pinned source models store every retained tensor as Float16.
                 return error.InvalidCTranslate2Weights;
             }
+
             if (!tensor.hasDimensions(section.dimensions.slice())) {
                 // Runtime section dimensions are authoritative for the model kind.
                 return error.InvalidCTranslate2Weights;
@@ -812,9 +851,11 @@ fn convertFloat16TensorToFloat32(source: []const u8, destination: []u8) ConvertE
     assert(destination.len == source.len / @sizeOf(f16) * @sizeOf(f32));
 
     const values_count = source.len / @sizeOf(f16);
+
     for (0..values_count) |value_index| {
         const source_offset = value_index * @sizeOf(f16);
         const value: f32 = @floatCast(readFloat(f16, source, source_offset));
+
         if (!std.math.isFinite(value)) {
             // Runtime tensors admit only finite numeric values.
             return error.InvalidCTranslate2Weights;
@@ -826,6 +867,7 @@ fn convertFloat16TensorToFloat32(source: []const u8, destination: []u8) ConvertE
 
 fn quantizeVnniWeight(source: []const u8, dimensions: TensorDimensions, destination: []u8) ConvertError!void {
     const vnni_layout = TensorSection.VnniPayload.calculate(dimensions);
+
     assert(dimensions.rank == 2 or dimensions.rank == 3);
     assert(source.len == vnni_layout.weights_size * @sizeOf(f16));
     assert(destination.len == vnni_layout.size);
@@ -864,6 +906,7 @@ fn calculateVnniWeightScales(source: []const u8, vnni_layout: VnniPayload, desti
 
             const half_values: F16Values = @bitCast(half_bits);
             const values: F32Values = @floatCast(half_values);
+
             absolute_maximums = @max(absolute_maximums, @abs(values));
         }
 
@@ -871,7 +914,12 @@ fn calculateVnniWeightScales(source: []const u8, vnni_layout: VnniPayload, desti
         // 127. An all-zero row uses scale one to avoid division by zero while
         // still quantizing every value to zero.
         const absolute_maximum = @reduce(.Max, absolute_maximums);
-        const scale: f32 = if (absolute_maximum == 0) 1 else quantized_weight_magnitude_max / absolute_maximum;
+
+        const scale: f32 = if (absolute_maximum == 0)
+            1
+        else
+            quantized_weight_magnitude_max / absolute_maximum;
+
         assert(std.math.isFinite(scale));
         assert(scale > 0);
         writeFloat(f32, destination, vnni_layout.scales_offset + output_row_index * @sizeOf(f32), scale);
@@ -898,9 +946,9 @@ fn quantizeAndPackVnniWeight(source: []const u8, vnni_layout: VnniPayload, desti
         // Scales live in the final payload. Load one output-row block before
         // traversing its K dimension so every group uses the same row scale.
         var output_scales: F32OutputBlock = undefined;
-
         inline for (0..inference.VnniWeight.output_rows_per_block) |block_row_index| {
             const scale_offset = vnni_layout.scales_offset + (output_row_start_index + block_row_index) * @sizeOf(f32);
+
             output_scales[block_row_index] = readFloat(f32, destination, scale_offset);
         }
 
@@ -909,7 +957,6 @@ fn quantizeAndPackVnniWeight(source: []const u8, vnni_layout: VnniPayload, desti
 
         while (input_value_start_index < vnni_layout.weight_layout.input_values_count) : (input_value_start_index += inference.VnniWeight.input_values_per_group) {
             var quantized_group_sums: I32OutputBlock = undefined;
-
             inline for (0..inference.VnniWeight.output_rows_per_block) |block_row_index| {
                 const output_row_index = output_row_start_index + block_row_index;
                 const source_value_index = output_row_index * vnni_layout.weight_layout.input_values_count + input_value_start_index;
@@ -925,6 +972,7 @@ fn quantizeAndPackVnniWeight(source: []const u8, vnni_layout: VnniPayload, desti
                 const quantized_bytes: [inference.VnniWeight.input_values_per_group]u8 = @bitCast(quantized_values);
 
                 const packed_output_offset = vnni_layout.weight_layout.valueOffset(output_row_index, input_value_start_index);
+
                 destination[packed_output_offset..][0..inference.VnniWeight.input_values_per_group].* = quantized_bytes;
                 quantized_group_sums[block_row_index] = @reduce(.Add, quantized_integers);
             }
@@ -939,6 +987,7 @@ fn quantizeAndPackVnniWeight(source: []const u8, vnni_layout: VnniPayload, desti
 
         inline for (0..inference.VnniWeight.output_rows_per_block) |block_row_index| {
             const compensation_offset = vnni_layout.compensation_offset + (output_row_start_index + block_row_index) * @sizeOf(i32);
+
             writeInt(i32, destination, compensation_offset, quantized_values_sums[block_row_index]);
         }
     }
@@ -950,6 +999,7 @@ fn readFloat(comptime Float: type, source: []const u8, byte_offset: usize) Float
         f32 => u32,
         else => @compileError("unsupported packed float type"),
     };
+
     assert(byte_offset <= source.len);
     assert(@sizeOf(Bits) <= source.len - byte_offset);
 

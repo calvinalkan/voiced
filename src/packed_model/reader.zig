@@ -61,9 +61,7 @@ fn loadInto(io: std.Io, directory: std.Io.Dir, file_name: []const u8, expected_k
     errdefer std.posix.munmap(mapping);
 
     const bytes: []align(layout.alignment) const u8 = @alignCast(mapping);
-
     // ── Validate The Header ──
-
     if (!std.mem.eql(u8, bytes[0..layout.header_format_version_offset], layout.header_magic)) {
         // Without the magic, these bytes are not a Voiced packed model.
         return error.InvalidPackedModel;
@@ -121,6 +119,7 @@ fn loadInto(io: std.Io, directory: std.Io.Dir, file_name: []const u8, expected_k
     // byte without depending on itself.
 
     var hash = Blake3.init(.{});
+
     hash.update(bytes[0..layout.header_file_blake3_offset]);
     hash.update(&([_]u8{0} ** Blake3.digest_length));
     hash.update(bytes[layout.header_file_blake3_offset + Blake3.digest_length ..]);
@@ -153,10 +152,12 @@ fn loadInto(io: std.Io, directory: std.Io.Dir, file_name: []const u8, expected_k
         .offsets = vocabulary_offsets_pointer[0 .. dimensions.vocabulary_tokens_count + 1],
         .bytes = bytes[expected.vocabulary_bytes_start_offset..expected.vocabulary_bytes_end_offset],
     };
+
     if (vocabulary.offsets[0] != 0) {
         // Token zero must begin at the first vocabulary payload byte.
         return error.InvalidPackedModel;
     }
+
     if (vocabulary.offsets[vocabulary.offsets.len - 1] != layout.whisper_vocabulary_bytes_size) {
         // The terminal offset must cover the complete vocabulary payload.
         return error.InvalidPackedModel;
@@ -221,6 +222,7 @@ fn validateTensorDirectory(
             const entry_is_required = layer_slot_index < required_entries_count;
 
             const unused_entry_is_nonzero = !entry_is_required and stored_payload_offset != 0;
+
             if (unused_entry_is_nonzero) {
                 // A nonzero unused slot would assign a second meaning to bytes
                 // outside this model kind's tensor set.
@@ -232,7 +234,10 @@ fn validateTensorDirectory(
                 continue;
             }
 
-            const layer_index: ?u16 = if (layers_count != null) @intCast(layer_slot_index) else null;
+            const layer_index: ?u16 = if (layers_count != null)
+                @intCast(layer_slot_index)
+            else
+                null;
 
             const payload_offset = std.math.cast(usize, stored_payload_offset) orelse {
                 // The file offset cannot be represented by this runtime target.
@@ -243,10 +248,12 @@ fn validateTensorDirectory(
                 // Tensor views require the packed format's 64-byte alignment.
                 return error.InvalidPackedModel;
             }
+
             if (payload_offset < file_layout.tensor_payloads_start_offset) {
                 // A tensor may not point backward into the header or directory.
                 return error.InvalidPackedModel;
             }
+
             if (payload_offset > file_layout.tensor_payloads_end_offset) {
                 // A tensor may not start beyond the tensor payload region.
                 return error.InvalidPackedModel;
@@ -255,6 +262,7 @@ fn validateTensorDirectory(
             const section = layout.TensorSection.calculate(kind, section_kind, layer_index, payload_offset);
 
             const padded_payload_size = std.mem.alignForward(usize, section.payload_size, layout.alignment);
+
             if (padded_payload_size > file_layout.tensor_payloads_end_offset - payload_offset) {
                 // The complete payload and its canonical padding must fit before
                 // the vocabulary index begins.
@@ -301,7 +309,6 @@ fn modelWeights(
     // undefined tail.
 
     var encoder_layers: [inference.Model.layers_count_max]inference.Model.Weights.EncoderLayer = undefined;
-
     for (encoder_layers[0..dimensions.encoder_layers_count], 0..) |*layer, layer_index| {
         layer.* = .{
             .self_attention_layer_norm_beta = floatValues(bytes, kind, .encoder_layer_self_attention_layer_norm_beta, @intCast(layer_index)),
@@ -322,7 +329,6 @@ fn modelWeights(
     // ── Construct Decoder Layer Views ──
 
     var decoder_layers: [inference.Model.layers_count_max]inference.Model.Weights.DecoderLayer = undefined;
-
     for (decoder_layers[0..dimensions.decoder_layers_count], 0..) |*layer, layer_index| {
         layer.* = .{
             .self_attention_layer_norm_beta = floatValues(bytes, kind, .decoder_layer_self_attention_layer_norm_beta, @intCast(layer_index)),
@@ -413,7 +419,11 @@ fn tensorSection(
     section_kind: layout.TensorSection.Kind,
     layer_index: ?u16,
 ) layout.TensorSection {
-    const layer_slot_index: usize = if (layer_index) |index| @intCast(index) else 0;
+    const layer_slot_index: usize = if (layer_index) |index|
+        @intCast(index)
+    else
+        0;
+
     const directory_entry_offset = layout.TensorSection.directoryEntryOffset(kind, section_kind, layer_slot_index);
 
     // Directory validation already proved that every required `u64` offset fits

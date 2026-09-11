@@ -59,6 +59,20 @@ pub const ModelSource = struct {
                     .expected_blake3 = "5ba2618f5d7940b9cebc94299dcc42f056848f660e602ace121ac29af488cb15",
                 },
             },
+            .whisper_tiny_en => .{
+                .weights = .{
+                    .url = "https://huggingface.co/Systran/faster-whisper-tiny.en/resolve/0d3d19a32d3338f10357c0889762bd8d64bbdeba/model.bin",
+                    .file_name = "model.bin",
+                    .expected_size = 75_537_502,
+                    .expected_blake3 = "9f7968391f52fd9843b982d2c6a054e0bfb15c2bf3938d66f678dfe9f2b6c1f0",
+                },
+                .vocabulary = .{
+                    .url = "https://huggingface.co/Systran/faster-whisper-tiny.en/resolve/0d3d19a32d3338f10357c0889762bd8d64bbdeba/vocabulary.txt",
+                    .file_name = "vocabulary.txt",
+                    .expected_size = 422_309,
+                    .expected_blake3 = "5ba2618f5d7940b9cebc94299dcc42f056848f660e602ace121ac29af488cb15",
+                },
+            },
         };
     }
 };
@@ -78,7 +92,9 @@ pub fn run(init: std.process.Init, options: Options) !void {
     // ── Determine The Output Directory ──
 
     const xdg_data_home_path = env.get("XDG_DATA_HOME");
-    const data_home_path = xdg_data_home_path orelse env.get("HOME") orelse {
+
+    const data_home_path = xdg_data_home_path orelse
+        env.get("HOME") orelse {
         return error.HomeNotSet;
     };
 
@@ -95,6 +111,7 @@ pub fn run(init: std.process.Init, options: Options) !void {
     defer init.gpa.free(output_dir_path);
 
     const cwd = Io.Dir.cwd();
+
     try cwd.createDirPath(init.io, output_dir_path);
 
     var output_dir_handle = try cwd.openDir(init.io, output_dir_path, .{ .iterate = true });
@@ -128,6 +145,7 @@ fn setupModel(
     if (packed_model.load(io, installed_directory, output_file_name, kind)) |loaded_model| {
         var model = loaded_model;
         defer model.deinit();
+
         std.debug.print("{s} already installed in {s}\n", .{ kind.name(), install_path });
 
         return;
@@ -150,6 +168,7 @@ fn setupModel(
     const cwd = Io.Dir.cwd();
 
     try cwd.deleteTree(io, staging_path);
+
     try cwd.createDirPath(io, staging_path);
     errdefer cwd.deleteTree(io, staging_path) catch |err| {
         std.debug.print("Could not cleanup the staging directory: {any}\n", .{err});
@@ -197,6 +216,7 @@ fn setupModel(
     try output_file_atomic_writer.replace(io);
 
     const directory_handle: Io.File = .{ .handle = installed_directory.handle, .flags = .{ .nonblocking = false } };
+
     try directory_handle.sync(io);
 
     // Reopen the published file through the production reader before deleting
@@ -258,10 +278,11 @@ fn cachedArtifactMatches(
         io,
         artifact.file_name,
         .{ .mode = .read_only, .allow_directory = false },
-    ) catch |err| switch (err) {
-        error.FileNotFound => return false,
-        else => return err,
-    };
+    ) catch |err|
+        switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
     defer file.close(io);
 
     const stat = try file.stat(io);
@@ -275,8 +296,8 @@ fn cachedArtifactMatches(
 
     var hash = Blake3.init(.{});
     var file_reader = file.reader(io, &.{});
-    var buffer: [64 * 1024]u8 = undefined;
 
+    var buffer: [64 * 1024]u8 = undefined;
     while (true) {
         const size = try file_reader.interface.readSliceShort(&buffer);
         if (size == 0) {
@@ -303,16 +324,19 @@ fn downloadArtifact(io: Io, client: *std.http.Client, directory: Io.Dir, artifac
 
                 return error.UnexpectedHttpStatus;
             },
+
             .size_exceeded => |actual_size| {
                 std.debug.print("error: artifact size mismatch\n  output: {s}\n  expected: {d} bytes\n  actual: at least {d} bytes\n", .{ artifact.file_name, artifact.expected_size, actual_size });
 
                 return error.DownloadSizeMismatch;
             },
+
             .size_incomplete => |actual_size| {
                 std.debug.print("error: artifact size mismatch\n  output: {s}\n  expected: {d} bytes\n  actual: {d} bytes\n", .{ artifact.file_name, artifact.expected_size, actual_size });
 
                 return error.DownloadSizeMismatch;
             },
+
             .blake3_mismatch => |actual_digest_bytes| {
                 const actual_digest = std.fmt.bytesToHex(actual_digest_bytes, .lower);
 

@@ -31,6 +31,7 @@ pub const Runtime = opaque {
     pub fn requiredMemory(model: *const Model, pool: *const WorkerPool, config: Config) InitError!usize {
         var size: usize = undefined;
         try checkInit(abi.voiced_inference_runtime_memory(model, pool.scheduler, &config, &size));
+
         return size;
     }
 
@@ -40,6 +41,7 @@ pub const Runtime = opaque {
     /// On error no resources remain owned; do not call deinit for a failed init.
     pub fn init(memory: []align(memory_alignment) u8, model: *const Model, pool: *WorkerPool, config: Config) InitError!*Runtime {
         try checkInit(abi.voiced_inference_runtime_init(model, memory.ptr, memory.len, pool.scheduler, &config));
+
         return @ptrCast(memory.ptr);
     }
 
@@ -89,8 +91,10 @@ pub const Runtime = opaque {
             .decoder_workers_count_max = options.decoder_workers_count_max,
             .cancellation = options.cancellation,
         };
+
         var result: TranscriptionResult = undefined;
         abi.voiced_inference_runtime_transcribe(runtime, &request, &result);
+
         return result;
     }
 };

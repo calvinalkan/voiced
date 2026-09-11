@@ -38,6 +38,12 @@ pub const Environment = struct {
     xauthority: ?[]const u8,
     home: ?[]const u8,
 };
+pub const DiagnosticSnapshot = struct {
+    mode: ?Mode = null,
+    transfers_completed_count: u64 = 0,
+    transfers_expired_count: u64 = 0,
+    transfers_rejected_count: u64 = 0,
+};
 
 pub fn Result(comptime T: type) type {
     return union(enum) { ok: T, err: Error };
@@ -59,10 +65,6 @@ backend: Backend = .none,
 auto_fallback: ?AutoFallback = null,
 epoll_fd: i32 = -1,
 tag: u64 = 0,
-mode: Mode = .core,
-transfers_completed: u64 = 0,
-transfers_expired: u64 = 0,
-transfers_rejected: u64 = 0,
 
 /// Initializes fresh or deinitialized storage. `auto` tries Wayland ext/wlr
 /// data control, X11, then core Wayland when both displays exist. Explicit
@@ -73,12 +75,10 @@ pub fn init(self: *Clipboard, epoll_fd: i32, tag: u64, environment: Environment,
     self.auto_fallback = null;
     self.epoll_fd = epoll_fd;
     self.tag = tag;
-    self.mode = .core;
-    self.transfers_completed = 0;
-    self.transfers_expired = 0;
-    self.transfers_rejected = 0;
 
-    const wayland_display = environment.wayland_display orelse defaultWaylandDisplay(environment);
+    const wayland_display = environment.wayland_display orelse
+        defaultWaylandDisplay(environment);
+
     return switch (selection) {
         .wayland => if (wayland_display) |display|
             self.startWayland(environment, display, .best, now_ns)
@@ -96,11 +96,17 @@ pub fn init(self: *Clipboard, epoll_fd: i32, tag: u64, environment: Environment,
                     // advance(), allowing the supervisor to log each fallback
                     // decision before the next candidate can also fail.
                     _ = self.startWayland(environment, display, .data_control_only, now_ns);
+
                     return .{ .ok = {} };
                 }
+
                 return self.startWayland(environment, display, .best, now_ns);
             }
-            if (environment.display != null) return self.startX11(environment, now_ns);
+
+            if (environment.display != null) {
+                return self.startX11(environment, now_ns);
+            }
+
             return .{ .err = .unavailable };
         },
     };
@@ -108,6 +114,7 @@ pub fn init(self: *Clipboard, epoll_fd: i32, tag: u64, environment: Environment,
 
 pub fn deinit(self: *Clipboard) void {
     self.closeBackend();
+
     self.auto_fallback = null;
 }
 
@@ -123,7 +130,7 @@ pub fn publish(self: *Clipboard, publication: PublicationId, text: []const u8, n
             .err => |err| .{ .err = mapX11Error(err) },
         },
     };
-    self.syncMetrics();
+
     return result;
 }
 
@@ -139,34 +146,43 @@ pub fn advance(self: *Clipboard, now_ns: u64) Result(Event) {
             .err => |err| .{ .err = mapX11Error(err) },
         },
     };
+
     switch (result) {
         .ok => |event| {
-            if (event == .ready) self.auto_fallback = null;
-            self.syncMetrics();
+            if (event == .ready) {
+                self.auto_fallback = null;
+            }
+
             return .{ .ok = event };
         },
+
         .err => |err| {
             const fallback = self.auto_fallback orelse {
-                self.syncMetrics();
                 return .{ .err = err };
             };
+
             const next = fallback.next orelse {
                 self.auto_fallback = null;
-                self.syncMetrics();
+
                 return .{ .err = err };
             };
+
             const notice: CandidateNotice = if (fallback.candidate == .wayland_data_control and dataControlUnavailable(err))
                 .{ .skipped = .{ .candidate = fallback.candidate, .fallback = next } }
             else
                 .{ .failed = .{ .candidate = fallback.candidate, .fallback = next, .error_detail = err } };
+
             self.closeBackend();
+
             self.auto_fallback.?.candidate = next;
             self.auto_fallback.?.next = if (next == .x11) .wayland_core else null;
+
             switch (next) {
                 .x11 => _ = self.startX11(fallback.environment, now_ns),
                 .wayland_core => _ = self.startWayland(fallback.environment, fallback.wayland_display, .core_only, now_ns),
                 .wayland_data_control => unreachable,
             }
+
             return .{ .ok = .{ .candidate_notice = notice } };
         },
     }
@@ -204,6 +220,35 @@ pub fn backendName(self: *const Clipboard) []const u8 {
     };
 }
 
+/// Captures one coherent diagnostic view from the active backend. The facade
+/// does not mirror counters or protocol mode, so backend progress has one owner.
+pub fn diagnosticSnapshot(self: *const Clipboard) DiagnosticSnapshot {
+    return switch (self.backend) {
+        .none => .{},
+        .wayland => |*client| .{
+            // Core is the Wayland client's construction default, not an
+            // established protocol choice, until setup reaches ready.
+            .mode = if (client.phase == .ready)
+                switch (client.mode) {
+                    .core => .core,
+                    .wlr => .wlr,
+                    .ext => .ext,
+                }
+            else
+                null,
+            .transfers_completed_count = client.transfers_completed,
+            .transfers_expired_count = client.transfers_expired,
+            .transfers_rejected_count = client.transfers_rejected,
+        },
+        .x11 => |*client| .{
+            .mode = if (client.ready()) .x11 else null,
+            .transfers_completed_count = client.transfers_completed,
+            .transfers_expired_count = client.transfers_expired,
+            .transfers_rejected_count = client.transfers_rejected,
+        },
+    };
+}
+
 pub fn deadline(self: *const Clipboard) u64 {
     return switch (self.backend) {
         .none => std.math.maxInt(u64),
@@ -214,11 +259,12 @@ pub fn deadline(self: *const Clipboard) u64 {
 
 fn startWayland(self: *Clipboard, environment: Environment, display: []const u8, policy: WaylandClipboard.ProtocolPolicy, now_ns: u64) Result(void) {
     self.backend = .{ .wayland = undefined };
+
     const result = self.backend.wayland.init(self.epoll_fd, self.tag, .{
         .runtime_directory = environment.runtime_directory,
         .display = display,
     }, policy, now_ns);
-    self.syncMetrics();
+
     return switch (result) {
         .ok => .{ .ok = {} },
         .err => |err| .{ .err = mapWaylandError(err) },
@@ -227,12 +273,13 @@ fn startWayland(self: *Clipboard, environment: Environment, display: []const u8,
 
 fn startX11(self: *Clipboard, environment: Environment, now_ns: u64) Result(void) {
     self.backend = .{ .x11 = undefined };
+
     const result = self.backend.x11.init(self.epoll_fd, self.tag, .{
         .display = environment.display,
         .authority = environment.xauthority,
         .home = environment.home,
     }, now_ns);
-    self.syncMetrics();
+
     return switch (result) {
         .ok => .{ .ok = {} },
         .err => |err| .{ .err = mapX11Error(err) },
@@ -245,6 +292,7 @@ fn closeBackend(self: *Clipboard) void {
         .wayland => |*client| client.deinit(),
         .x11 => |*client| client.deinit(),
     }
+
     self.backend = .none;
 }
 
@@ -258,38 +306,29 @@ fn dataControlUnavailable(err: Error) bool {
     };
 }
 
-fn syncMetrics(self: *Clipboard) void {
-    switch (self.backend) {
-        .none => {},
-        .wayland => |*client| {
-            self.mode = switch (client.mode) {
-                .core => .core,
-                .wlr => .wlr,
-                .ext => .ext,
-            };
-            self.transfers_completed = client.transfers_completed;
-            self.transfers_expired = client.transfers_expired;
-            self.transfers_rejected = client.transfers_rejected;
-        },
-        .x11 => |*client| {
-            self.mode = .x11;
-            self.transfers_completed = client.transfers_completed;
-            self.transfers_expired = client.transfers_expired;
-            self.transfers_rejected = client.transfers_rejected;
-        },
-    }
-}
-
 // Probe instead of assuming `wayland-0`: a missing socket must leave X11
 // available to automatic selection rather than producing a Wayland failure.
 fn defaultWaylandDisplay(environment: Environment) ?[]const u8 {
-    const runtime_directory = environment.runtime_directory orelse return null;
+    const runtime_directory = environment.runtime_directory orelse {
+        return null;
+    };
+
     var path: [108]u8 = undefined;
-    const socket = std.fmt.bufPrint(path[0 .. path.len - 1], "{s}/wayland-0", .{runtime_directory}) catch return null;
+    const socket = std.fmt.bufPrint(path[0 .. path.len - 1], "{s}/wayland-0", .{runtime_directory}) catch {
+        return null;
+    };
+
     path[socket.len] = 0;
+
     var stat: linux.Statx = undefined;
-    if (linux.errno(linux.statx(linux.AT.FDCWD, @ptrCast(&path), 0, .BASIC_STATS, &stat)) != .SUCCESS) return null;
-    if (!stat.mask.TYPE or stat.mode & linux.S.IFMT != linux.S.IFSOCK) return null;
+    if (linux.errno(linux.statx(linux.AT.FDCWD, @ptrCast(&path), 0, .BASIC_STATS, &stat)) != .SUCCESS) {
+        return null;
+    }
+
+    if (!stat.mask.TYPE or stat.mode & linux.S.IFMT != linux.S.IFSOCK) {
+        return null;
+    }
+
     return "wayland-0";
 }
 

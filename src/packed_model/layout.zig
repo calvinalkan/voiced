@@ -176,13 +176,14 @@ pub fn calculate(model_kind: ModelKind) FileLayout {
 }
 
 /// Kind values 1 and 2 retain the twelve-slot directory defined by packed
-/// format version 1, including Base.en's unused slots. Medium.en is a new kind,
-/// so the same format can assign its required twenty-four-slot directory
-/// without changing the interpretation of an existing packed file.
+/// format version 1, including Base.en's unused slots. New kinds can use their
+/// exact layer count without changing the interpretation of an existing packed
+/// file.
 pub fn tensorDirectoryLayerSlotsCount(model_kind: ModelKind) usize {
     return switch (model_kind) {
         .whisper_base_en, .whisper_small_en => 12,
         .whisper_medium_en => 24,
+        .whisper_tiny_en => 4,
     };
 }
 
@@ -377,7 +378,9 @@ pub const TensorSection = struct {
             for (dimensions.slice()) |dimension| {
                 assert(dimension > 0);
 
-                elements_count = std.math.mul(usize, elements_count, dimension) catch unreachable;
+                elements_count = std.math.mul(usize, elements_count, dimension) catch {
+                    unreachable;
+                };
             }
 
             return elements_count;
@@ -411,11 +414,24 @@ pub const TensorSection = struct {
             const weight_layout = inference.VnniWeight.Layout.init(output_rows_count, input_values_count);
             const weights_size = weight_layout.valuesCount();
             const scales_offset = std.mem.alignForward(usize, weights_size, alignment);
-            const scales_size = std.math.mul(usize, output_rows_count, @sizeOf(f32)) catch unreachable;
-            const scales_end = std.math.add(usize, scales_offset, scales_size) catch unreachable;
+
+            const scales_size = std.math.mul(usize, output_rows_count, @sizeOf(f32)) catch {
+                unreachable;
+            };
+
+            const scales_end = std.math.add(usize, scales_offset, scales_size) catch {
+                unreachable;
+            };
+
             const compensation_offset = std.mem.alignForward(usize, scales_end, alignment);
-            const compensation_size = std.math.mul(usize, output_rows_count, @sizeOf(i32)) catch unreachable;
-            const size = std.math.add(usize, compensation_offset, compensation_size) catch unreachable;
+
+            const compensation_size = std.math.mul(usize, output_rows_count, @sizeOf(i32)) catch {
+                unreachable;
+            };
+
+            const size = std.math.add(usize, compensation_offset, compensation_size) catch {
+                unreachable;
+            };
 
             return .{
                 .weight_layout = weight_layout,
@@ -430,6 +446,7 @@ pub const TensorSection = struct {
 
     pub fn layerCount(model_kind: ModelKind, section_kind: Kind) ?usize {
         const model_dimensions = inference.Model.dimensions(model_kind);
+
         return switch (definition(section_kind, model_dimensions).scope) {
             .model => null,
             .encoder_layer => model_dimensions.encoder_layers_count,
@@ -451,6 +468,7 @@ pub const TensorSection = struct {
     pub fn calculate(model_kind: ModelKind, section_kind: Kind, layer_index: ?u16, payload_offset: usize) TensorSection {
         const model_dimensions = inference.Model.dimensions(model_kind);
         const section_definition = definition(section_kind, model_dimensions);
+
         section_definition.assertValidLayerIndex(model_dimensions, layer_index);
 
         return .{
@@ -467,6 +485,7 @@ pub const TensorSection = struct {
 
         const section_kind_index: usize = @intFromEnum(section_kind);
         const directory_index = section_kind_index * layer_slots_count + layer_slot;
+
         return tensor_directory_offset + directory_index * @sizeOf(u64);
     }
 
@@ -477,8 +496,14 @@ pub const TensorSection = struct {
         for (std.enums.values(Kind)) |section_kind| {
             const section_definition = definition(section_kind, model_dimensions);
             const section_size = std.mem.alignForward(usize, section_definition.payloadSize(), alignment);
-            const instances_size = std.math.mul(usize, section_size, section_definition.instancesCount(model_dimensions)) catch unreachable;
-            payloads_size = std.math.add(usize, payloads_size, instances_size) catch unreachable;
+
+            const instances_size = std.math.mul(usize, section_size, section_definition.instancesCount(model_dimensions)) catch {
+                unreachable;
+            };
+
+            payloads_size = std.math.add(usize, payloads_size, instances_size) catch {
+                unreachable;
+            };
         }
 
         return payloads_size;
@@ -522,7 +547,9 @@ pub const TensorSection = struct {
 
         fn payloadSize(section: Definition) usize {
             return switch (section.encoding) {
-                .float32 => std.math.mul(usize, section.dimensions.countElements(), @sizeOf(f32)) catch unreachable,
+                .float32 => std.math.mul(usize, section.dimensions.countElements(), @sizeOf(f32)) catch {
+                    unreachable;
+                },
                 .vnni_o8_k4 => VnniPayload.calculate(section.dimensions).size,
             };
         }

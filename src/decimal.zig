@@ -6,7 +6,11 @@ const std = @import("std");
 /// uses its `(float)` fallback. Writer errors still propagate.
 pub fn fmt(value: anytype, precision: ?usize) Format {
     const T = @TypeOf(value);
-    if (T != f32 and T != f64) @compileError("decimal.fmt accepts f32 or f64");
+
+    if (T != f32 and T != f64) {
+        @compileError("decimal.fmt accepts f32 or f64");
+    }
+
     return .{
         // Preserve the original type's bits: widening f32 here would change
         // its shortest decimal representation before precision rounding.

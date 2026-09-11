@@ -1,47 +1,124 @@
 # voiced
 
-Voiced is a native Zig dictation daemon for Linux Wayland and X11 desktops. The current usage and
-implementation documentation is in `README.md` and `docs/inference.md`.
-The Python application and its supporting scripts have been removed.
+Voiced is a native Zig dictation daemon for Linux Wayland and X11. It captures
+through PipeWire, transcribes locally with a custom high-performance Whisper
+runtime, publishes through a native clipboard client, and pastes through uinput.
 
-## Ownership
+```text
+CLI/control socket -> supervisor -> capture/transcription -> clipboard/paste
+```
 
-- `src/service/supervisor.zig` owns lifecycle transitions, public commands, worker
-  deadlines, and desktop delivery through one event loop.
-- The persistent capture thread owns its PipeWire connection per capture.
-  It validates borrowed graph buffers and resamples directly into unpublished
-  shared Float32 slots, with no allocation, blocking I/O, model work, or logging
-  in the capture callback.
-- The supervisor owns one native Wayland or X11 clipboard client. Published text
-  stays immutable until ownership and all outstanding transfers release its buffer.
-- The persistent transcription thread borrows sealed audio and returns bounded
-  typed results. Reuse storage only after the previous owners acknowledge completion.
-  Cancellation is cooperative; an overdue stop exits the whole daemon for restart.
-- The runtime and its arena remain at stable addresses until workers are joined.
-- Configuration and environment-derived paths are resolved at initialization.
-- Operational diagnostics use `src/logging.zig`. CLI output retains its
-  stdout/stderr contract. Keep transcript contents out of operational logs.
+## Code map
+
+- `build.zig`: build profiles, release, setup, tests, and developer tools.
+- `src/main.zig`: executable root and binary-size configuration.
+- `src/service/supervisor.zig`: lifecycle state machine and coordination.
+- `src/capture/`: PipeWire capture, realtime processing, and resampling.
+- `src/inference/`: Whisper runtime and separately compiled LLVM object.
+- `src/clipboard/`: Wayland/X11 ownership and transfers.
+- `src/root_test.zig`: test aggregator, including repository lint.
+- `tools/zig_lint/`: self-contained ZigLint package, CLI, rules, and tests.
+
+Use `README.md` for operation and configuration, `docs/inference.md` for
+inference design, and `__fixtures__/librispeech/README.md` for corpus controls.
+
+## Build
+
+Discover the authoritative steps and options with:
+
+```bash
+zig build --help
+```
+
+Common commands:
+
+```bash
+zig build                         # Debug app/stdlib, ReleaseSafe LLVM inference
+zig build release                 # fixed stripped compact release
+zig build setup                   # install the default model
+zig build setup -- --model all    # install every supported model
+```
+
+`release` rejects profile `-D` options and arguments after `--`. Normal builds
+retain configurable diagnostics and optimization options; `-Dllvm` overrides
+Zig's application-backend selection without affecting LLVM inference.
 
 ## Checks
 
-Run checks through `agent-run`; read the saved log when a command fails.
-From the repository root:
+Run checks through `agent-run`; read its failure log before continuing.
 
 ```bash
 agent-run 'zig build -Doptimize=ReleaseSafe install'
-agent-run 'zig fmt --check src tools build.zig build.zig.zon'
+agent-run 'zig build release'
+agent-run 'zig build test'
 ```
 
-Runtime corpus commands are documented in `__fixtures__/librispeech/README.md`.
-The process-level harness was removed; its scenarios can be ported from Git
-history when requested.
+When changing ZigLint itself, also run its internal package tests:
 
-## Test isolation
+```bash
+agent-run 'cd tools/zig_lint && zig build test'
+```
 
-Use private runtime/state paths, PipeWire graphs, and desktop fixtures for
-service tests. Never exercise the user's live
-clipboard, keyboard, microphone, or running service as an automated check.
-Test lifecycle behavior through process-level scenarios and observable output.
-Do not add new test files unless the user requests them. Do not restore
-production test-scenario switches or rewrite the service around the old Python
-tests.
+`zig build test` is the complete repository check. It runs Debug application
+tests with Zig's selected backend, ReleaseSafe inference tests against the
+production LLVM object and exported ABI, repository ZigLint, and canonical
+formatting. Tests never rewrite source files. Pass a case-sensitive test-name
+substring after `--` for a focused run:
+
+```bash
+zig build test -- inference.root_test
+zig build test -- "repository source passes lint"
+zig build test -Ddeveloper=false -- "object boundary"
+```
+
+## Lint and fixes
+
+```bash
+zig build zig-lint
+./zig-out/bin/zig-lint src
+./zig-out/bin/zig-lint --fix src
+```
+
+`--fix` atomically writes compatible rule fixes and canonical formatting, then
+reports remaining diagnostics. Re-run the repository lint test afterward.
+ZigLint documentation lives under `tools/zig_lint/`.
+
+## Debugging
+
+Discover runtime commands and inspect the daemon before reading implementation:
+
+```bash
+./zig-out/bin/voiced --help
+./zig-out/bin/voiced help serve
+./zig-out/bin/voiced status
+systemctl --user status voiced.service
+```
+
+Follow or filter native journal records:
+
+```bash
+journalctl --user -u voiced -f -o short-precise
+journalctl --user -u voiced -p warning
+journalctl --user -u voiced VOICED_COMPONENT=capture
+journalctl --user -u voiced VOICED_RECORDING_ID=21
+```
+
+For foreground debugging, use
+`voiced serve --log-target stderr --log-level debug`. To send foreground logs to
+the journal instead, select `--log-target journal` and follow them with
+`journalctl --user -t voiced -f`.
+
+## Core design constraints
+
+- Keep the deployment artifact a single zero-dependency, fully static executable
+  with no runtime shared-library dependencies.
+- Integrate through native PipeWire, Wayland, X11, D-Bus, control-socket, and
+  uinput protocols; do not shell out to desktop CLIs or helper processes.
+- Treat binary size as a design constraint and keep the implementation light.
+  `zig build release` enforces its limit, while
+  `zig build test:executable-size` checks a selected non-Debug profile. Use
+  `bloaty zig-out/bin/voiced` to investigate growth and `bloaty --help` to
+  discover analysis options.
+- The PipeWire process callback runs on its real-time audio thread. Keep it
+  allocation-free, lock-free, and free of blocking I/O, logging, and model work
+  so capture remains responsive under CPU load.

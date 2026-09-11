@@ -6,6 +6,13 @@ const Paste = @This();
 const std = @import("std");
 const logging = @import("logging.zig");
 const log = logging.scoped(.paste);
+const CleanupFields = logging.FieldSet(.{
+    .system_error,
+    .syscall_result,
+    .write_size,
+});
+const PasteCleanupWriteFailed = log.Event(.paste_cleanup_write_failed, CleanupFields);
+const PasteCleanupDestroyFailed = log.Event(.paste_cleanup_destroy_failed, CleanupFields);
 const linux = std.os.linux;
 
 pub const Error = union(enum) {
@@ -53,11 +60,17 @@ pending: ?struct {
 
 pub fn open(now_ns: u64) Result(Paste) {
     const result = linux.open("/dev/uinput", .{ .ACCMODE = .WRONLY, .NONBLOCK = true, .CLOEXEC = true }, 0);
-    if (linux.errno(result) != .SUCCESS) return .{ .err = .{ .open = linux.errno(result) } };
+    if (linux.errno(result) != .SUCCESS) {
+        return .{ .err = .{ .open = linux.errno(result) } };
+    }
+
     const fd: linux.fd_t = @intCast(result);
+
     var initialized = false;
     defer {
-        if (!initialized) _ = linux.close(fd);
+        if (!initialized) {
+            _ = linux.close(fd);
+        }
     }
 
     if (configure(fd, linux.IOCTL.IOW('U', 100, c_int), 1)) |err| return .{ .err = err }; // UI_SET_EVBIT(EV_KEY)
@@ -65,25 +78,36 @@ pub fn open(now_ns: u64) Result(Paste) {
     for (1..32) |key| {
         // udev recognizes keyboards by capability bits 1..31. Only advertising
         // our chord keys can leave this device unclassified and ignored.
-        if (configure(fd, linux.IOCTL.IOW('U', 101, c_int), key)) |err| return .{ .err = err };
+        if (configure(fd, linux.IOCTL.IOW('U', 101, c_int), key)) |err| {
+            return .{ .err = err };
+        }
     }
 
     for ([_]u16{ key_ctrl, key_shift, key_v, key_insert }) |key| {
-        if (configure(fd, linux.IOCTL.IOW('U', 101, c_int), key)) |err| return .{ .err = err };
+        if (configure(fd, linux.IOCTL.IOW('U', 101, c_int), key)) |err| {
+            return .{ .err = err };
+        }
     }
 
     var setup = std.mem.zeroes(UinputSetup);
+
     setup.id.bustype = 0x06; // BUS_VIRTUAL
     setup.id.version = 1;
+
     const name = "Voiced paste keyboard";
+
     @memcpy(setup.name[0..name.len], name);
 
-    if (configure(fd, linux.IOCTL.IOW('U', 3, UinputSetup), @intFromPtr(&setup))) |err| return .{ .err = err };
+    if (configure(fd, linux.IOCTL.IOW('U', 3, UinputSetup), @intFromPtr(&setup))) |err| {
+        return .{ .err = err };
+    }
+
     if (configure(fd, linux.IOCTL.IO('U', 1), 0)) |err| return .{ .err = err }; // UI_DEV_CREATE
 
     // Enumeration is asynchronous. The kernel example's one-second
     // allowance is not proof of readiness at the destination application.
     initialized = true;
+
     return .{ .ok = .{ .fd = fd, .usable_after_ns = now_ns + std.time.ns_per_s } };
 }
 
@@ -92,6 +116,7 @@ pub fn beginPaste(self: *Paste, chord: Chord, key_gap_ms: u16, now_ns: u64) void
     std.debug.assert(now_ns >= self.usable_after_ns);
 
     const key_gap_ns = @as(u64, key_gap_ms) * std.time.ns_per_ms;
+
     // Four frames require three intentional gaps. Keep those waits outside
     // the 200 ms allowance for scheduling delays and nonblocking writes.
     self.pending = .{
@@ -108,10 +133,13 @@ pub fn advance(self: *Paste, now_ns: u64) Result(bool) {
     const pending = if (self.pending) |*value| value else {
         return .{ .ok = false };
     };
+
     const progress: Progress = .{ .chord = pending.chord, .frame = pending.stage, .frame_bytes_sent = pending.sent };
+
     if (now_ns >= pending.expires_ns) {
         return .{ .err = .{ .timed_out = .{ .progress = progress, .deadline_ns = pending.expires_ns, .observed_ns = now_ns } } };
     }
+
     if (now_ns < pending.next_ns) {
         return .{ .ok = false };
     }
@@ -143,10 +171,13 @@ pub fn advance(self: *Paste, now_ns: u64) Result(bool) {
     const bytes = std.mem.sliceAsBytes(frame[0 .. count + 1]);
 
     const written = linux.write(self.fd, bytes[pending.sent..].ptr, bytes.len - pending.sent);
+
     switch (linux.errno(written)) {
         .SUCCESS => {},
+
         .AGAIN, .INTR => {
             pending.next_ns = now_ns + 2 * std.time.ns_per_ms;
+
             return .{ .ok = false };
         },
         else => |errno| return .{ .err = .{ .write = .{ .progress = progress, .errno = errno } } },
@@ -157,6 +188,7 @@ pub fn advance(self: *Paste, now_ns: u64) Result(bool) {
         // or ambiguous frame could insert the transcript twice.
         return .{ .err = .{ .ambiguous_write = .{ .progress = progress, .bytes_written = written } } };
     }
+
     pending.sent += written;
 
     if (pending.sent != bytes.len) {
@@ -179,7 +211,10 @@ pub fn advance(self: *Paste, now_ns: u64) Result(bool) {
 }
 
 pub fn deadlineMonotonicNs(self: *const Paste) ?u64 {
-    const pending = self.pending orelse return null;
+    const pending = self.pending orelse {
+        return null;
+    };
+
     return @min(pending.next_ns, pending.expires_ns);
 }
 
@@ -188,7 +223,6 @@ pub fn deinit(self: *Paste) void {
         const keys = pending.chord.keys();
 
         var frame: [4]InputEvent = undefined;
-
         for (0..keys.len) |index| {
             frame[index] = keyEvent(keys[keys.len - index - 1], 0);
         }
@@ -198,18 +232,21 @@ pub fn deinit(self: *Paste) void {
         const bytes = std.mem.sliceAsBytes(frame[0 .. keys.len + 1]);
 
         const written = linux.write(self.fd, bytes.ptr, bytes.len);
+
         if (linux.errno(written) != .SUCCESS or written != bytes.len)
-            log.event(.err, .{}, "paste_cleanup_write_failed", &.{
-                .{ "system_error", .{ .errno = linux.errno(written) } },
-                .{ "syscall_result", .{ .u = written } },
-                .{ "write_size", .{ .u = bytes.len } },
+            PasteCleanupWriteFailed.emit(.err, .{}, .{
+                .system_error = linux.errno(written),
+                .syscall_result = written,
+                .write_size = bytes.len,
             });
     }
 
     const destroy_errno = linux.errno(linux.ioctl(self.fd, linux.IOCTL.IO('U', 2), 0)); // UI_DEV_DESTROY
-    if (destroy_errno != .SUCCESS) log.event(.err, .{}, "paste_cleanup_destroy_failed", &.{
-        .{ "system_error", .{ .errno = destroy_errno } },
+
+    if (destroy_errno != .SUCCESS) PasteCleanupDestroyFailed.emit(.err, .{}, .{
+        .system_error = destroy_errno,
     });
+
     _ = linux.close(self.fd);
 
     self.* = undefined;
@@ -228,6 +265,7 @@ const UinputSetup = extern struct {
 
 fn keyEvent(code: u16, value: i32) InputEvent {
     var event = std.mem.zeroes(InputEvent);
+
     event.type = 1; // EV_KEY
     event.code = code;
     event.value = value;
@@ -237,6 +275,13 @@ fn keyEvent(code: u16, value: i32) InputEvent {
 
 fn configure(fd: linux.fd_t, request: u32, argument: usize) ?Error {
     const errno = linux.errno(linux.ioctl(fd, request, argument));
+
     // Snapshot the setup value rather than retaining its stack address.
-    return if (errno == .SUCCESS) null else .{ .configure = .{ .request = request, .argument = if (request == linux.IOCTL.IOW('U', 3, UinputSetup)) .{ .setup = @as(*const UinputSetup, @ptrFromInt(argument)).* } else .{ .value = argument }, .errno = errno } };
+    return if (errno == .SUCCESS)
+        null
+    else
+        .{ .configure = .{ .request = request, .argument = if (request == linux.IOCTL.IOW('U', 3, UinputSetup))
+            .{ .setup = @as(*const UinputSetup, @ptrFromInt(argument)).* }
+        else
+            .{ .value = argument }, .errno = errno } };
 }

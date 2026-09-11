@@ -223,16 +223,19 @@ pub fn run(launch: Launch) Result {
         .node_name => |value| .{ .node_name = value },
         .device_serial => |value| .{ .device_serial = value },
     } };
+
     // Establish a closed, empty connection before cleanup or any fallible work;
     // otherwise an early error could close an uninitialized descriptor.
     client.connection.initEmpty();
     defer client.deinit();
+
     var report: Report = undefined;
     // Keep the large Report out of the error union: constant error returns must
     // not materialize zero-filled report payloads.
     const capture_result = runCapture(launch, &client, &report) catch |err| {
         var detail: SetupFailure = undefined;
         detail.message = @splat(0);
+
         detail.pipewire_version = @splat(0);
         detail.stage = if (client.source != .default and (err == error.SourceNotFound or err == error.SourceAmbiguous)) .source_resolution else .stream_connect;
         detail.cause = switch (err) {
@@ -242,10 +245,16 @@ pub fn run(launch: Launch) Result {
             else => .{ .zig = err },
         };
         detail.pipewire_version_size = @intCast(@min(client.server_version.size, detail.pipewire_version.len));
+
         @memcpy(detail.pipewire_version[0..detail.pipewire_version_size], client.server_version.get()[0..detail.pipewire_version_size]);
+
         detail.client_node_version_advertised = client.client_node_version;
-        detail.client_node_version_selected = if (client.stream_created) @min(client.client_node_version, 5) else 0;
+        detail.client_node_version_selected = if (client.stream_created)
+            @min(client.client_node_version, 5)
+        else
+            0;
         detail.message_size = describeError(&client, err, &detail.message);
+
         return .{ .err = if (err == error.SourceNotFound)
             .{ .source_not_found = detail }
         else if (err == error.SourceAmbiguous)
@@ -253,6 +262,7 @@ pub fn run(launch: Launch) Result {
         else
             .{ .setup = detail } };
     };
+
     return switch (capture_result) {
         .ok => |end| .{ .ok = .{ .end = end, .report = report } },
         .err => |failure| .{ .err = switch (failure.kind) {
@@ -274,143 +284,219 @@ const CaptureResult = union(enum) { ok: End, err: CaptureFailure };
 
 fn runCapture(launch: Launch, client: *PipeWireClient, report: *Report) !CaptureResult {
     assert(launch.recording_samples_target > 0);
+
     const limits = try std.posix.getrlimit(.MEMLOCK);
     const bytes = std.mem.asBytes(launch.exchange);
+
     const lock_errno = linux.errno(linux.mlock(bytes.ptr, bytes.len));
     defer if (lock_errno == .SUCCESS) {
         _ = linux.munlock(bytes.ptr, bytes.len);
     };
+
     var socket_buffer: [108]u8 = undefined;
-    const socket_path = if (std.fs.path.isAbsolute(launch.environment.remote)) launch.environment.remote else try std.fmt.bufPrint(&socket_buffer, "{s}/{s}", .{ launch.environment.runtime_directory orelse return error.PipeWireRuntimeDirectoryMissing, launch.environment.remote });
+    const socket_path = if (std.fs.path.isAbsolute(launch.environment.remote))
+        launch.environment.remote
+    else
+        try std.fmt.bufPrint(&socket_buffer, "{s}/{s}", .{ launch.environment.runtime_directory orelse {
+            return error.PipeWireRuntimeDirectoryMissing;
+        }, launch.environment.remote });
+
     realtime_scheduling.acquire(launch.recording_id, launch.environment.system_bus_address, launch.control_event_fd);
     try client.init(socket_path);
+
     var capture: RealtimeCapture = .{
         .exchange = launch.exchange,
         .publication_event_fd = launch.publication_event_fd,
         .recording_samples_target = launch.recording_samples_target,
         .activity_detector = audio_activity.Detector.init(AudioExchange.sample_rate_hz),
     };
-    if (!beginNextAvailableSlot(&capture)) return error.AudioExchangeFull;
+
+    if (!beginNextAvailableSlot(&capture)) {
+        return error.AudioExchangeFull;
+    }
     defer abandonUnpublishedActiveSlot(&capture);
+
     var resampler: audio_resampler.Resampler = .{};
     var negotiated: ?NegotiatedFormat = null;
     var outcome: TerminalOutcome = .none;
     var capture_error: ?anyerror = null;
     var polling_errno: linux.E = .SUCCESS;
+
     while (outcome == .none) {
         client.connection.flush() catch |err| {
             capture_error = err;
+
             break;
         };
+
         var fds = [_]linux.pollfd{
             .{ .fd = launch.control_event_fd, .events = linux.POLL.IN, .revents = 0 },
-            .{ .fd = client.connection.fd, .events = linux.POLL.IN | (if (client.connection.output_size > 0) @as(i16, linux.POLL.OUT) else 0), .revents = 0 },
+            .{ .fd = client.connection.fd, .events = linux.POLL.IN | (if (client.connection.output_size > 0)
+                @as(i16, linux.POLL.OUT)
+            else
+                0), .revents = 0 },
             .{ .fd = client.wake_fd, .events = linux.POLL.IN, .revents = 0 },
         };
-        const result = linux.poll(&fds, fds.len, if (launch.control.load(.acquire) == .none) -1 else 0);
+
+        const result = linux.poll(&fds, fds.len, if (launch.control.load(.acquire) == .none)
+            -1
+        else
+            0);
+
         polling_errno = linux.errno(result);
-        if (polling_errno == .INTR) continue;
+
+        if (polling_errno == .INTR) {
+            continue;
+        }
+
         if (polling_errno != .SUCCESS) {
             capture_error = error.CapturePollFailed;
+
             break;
         }
+
         // A stop applies at the last completed graph cycle. Its borrowed
         // buffers have been returned before re-entering this poll loop.
         if (fds[0].revents != 0) {
             worker.drain(launch.control_event_fd);
         }
+
         // The wake may have been drained while taking the job. The atomic
         // command is authoritative, so check it independently of poll readiness.
         switch (launch.control.load(.acquire)) {
             .none => {},
+
             .stop => {
                 outcome = .stopped;
+
                 break;
             },
+
             .cancel => {
                 outcome = .cancelled;
+
                 break;
             },
         }
+
         // Process at most one control message before returning to the poller.
         // New mappings and identity changes cannot race a graph buffer read.
         if (fds[1].revents & (linux.POLL.IN | linux.POLL.HUP | linux.POLL.ERR) != 0) {
             _ = client.dispatch() catch |err| {
                 capture_error = err;
+
                 break;
             };
         }
+
         if (fds[2].revents & (linux.POLL.HUP | linux.POLL.ERR) != 0) {
             capture_error = error.WakeFailed;
+
             break;
         }
-        if (fds[2].revents & linux.POLL.IN == 0) continue;
+
+        if (fds[2].revents & linux.POLL.IN == 0) {
+            continue;
+        }
+
         {
             const start = monotonicNanoseconds();
+
             const block = client.process() catch |err| {
                 capture_error = captureErrorAfterPendingEvents(client, err);
+
                 break;
             } orelse {
                 if (capture.callback_state == .observed) {
                     observeCallback(&capture, start);
+
                     capture.callback_state.observed.missing_buffers_count += 1;
                 }
+
                 continue;
             };
             defer client.finishCycle();
+
             observeCallback(&capture, start);
-            if (block.header_present) capture.callback_state.observed.header_metadata_buffers_count += 1;
+
+            if (block.header_present) {
+                capture.callback_state.observed.header_metadata_buffers_count += 1;
+            }
 
             resampler.configure(block.rate) catch |err| {
                 capture_error = err;
+
                 break;
             };
+
             const count = resampler.outputCount(block.samples_count);
             if (count > AudioExchange.callback_samples_count_max) {
                 capture_error = error.OutputFull;
+
                 break;
             }
+
             if (count > AudioExchange.slot_samples_capacity - capture.active_slot.?.samples_count) {
                 publishActiveSlotIfNonEmpty(&capture);
+
                 if (!beginNextAvailableSlot(&capture)) {
                     outcome = .pipeline_full;
+
                     break;
                 }
             }
+
             const active = capture.active_slot.?;
             const destination = active.writer.slot.samples[active.samples_count..][0..count];
+
             const samples = resampler.process(&block, destination) catch |err| {
                 capture_error = err;
+
                 break;
             };
+
             if (samples.len > 0) {
                 outcome = publishCompleteBlock(&capture, samples);
+
                 if (block.silence and block.header_present and outcome != .pipeline_full) {
                     capture.callback_state.observed.header_gap_buffers_count += 1;
                     capture.callback_state.observed.header_gap_samples_count += @intCast(samples.len);
                 }
             }
+
             capture.callback_state.observed.duration_ns_max = @max(capture.callback_state.observed.duration_ns_max, monotonicNanoseconds() -| start);
         }
+
         if (negotiated == null or negotiated.?.sample_rate_hz != resampler.input_rate) {
             client.publishFormat(resampler.input_rate) catch |err| {
                 capture_error = err;
+
                 break;
             };
+
             negotiated = .{ .sample_rate_hz = resampler.input_rate, .channels_count = @intCast(client.ports_count) };
         }
     }
+
     if (capture_error) |err| {
         // Before the first retained callback, discovery/format errors remain
         // setup errors and shared liveness must remain unpublished.
-        if (capture.callback_state == .unobserved) return err;
+        if (capture.callback_state == .unobserved) {
+            return err;
+        }
+
         outcome = classifyError(err);
     }
-    if (outcome != .cancelled) publishActiveSlotIfNonEmpty(&capture);
+
+    if (outcome != .cancelled) {
+        publishActiveSlotIfNonEmpty(&capture);
+    }
+
     report.* = undefined;
     report.source_identity = null;
     report.callback = null;
     report.pipewire_server_version = @splat(0);
+
     const result: CaptureResult = switch (outcome) {
         .completed => .{ .ok = .completed },
         .stopped => .{ .ok = .stopped },
@@ -418,6 +504,7 @@ fn runCapture(launch: Launch, client: *PipeWireClient, report: *Report) !Capture
         else => failed: {
             var failure: RuntimeFailure = undefined;
             failure.message = @splat(0);
+
             failure.stage = switch (outcome) {
                 .pipeline_full => .exchange_publication,
                 .source_changed, .source_disconnected => .source_identity,
@@ -434,10 +521,12 @@ fn runCapture(launch: Launch, client: *PipeWireClient, report: *Report) !Capture
             else
                 unreachable;
             failure.message_size = describeError(client, capture_error orelse error.AudioExchangeFull, &failure.message);
+
             if ((capture_error orelse error.NoCaptureError) == error.CapturePollFailed) {
                 failure.stage = .main_loop;
                 failure.cause = .{ .linux = polling_errno };
             }
+
             break :failed .{ .err = .{
                 .kind = switch (outcome) {
                     .pipeline_full => .pipeline_full,
@@ -455,12 +544,20 @@ fn runCapture(launch: Launch, client: *PipeWireClient, report: *Report) !Capture
             } };
         },
     };
+
     report.pipewire_server_version_size = @intCast(@min(client.server_version.size, report.pipewire_server_version.len));
+
     @memcpy(report.pipewire_server_version[0..report.pipewire_server_version_size], client.server_version.get()[0..report.pipewire_server_version_size]);
+
     report.client_node_version_advertised = client.client_node_version;
-    report.client_node_version_selected = if (client.stream_created) @min(client.client_node_version, 5) else 0;
+    report.client_node_version_selected = if (client.stream_created)
+        @min(client.client_node_version, 5)
+    else
+        0;
+
     if (client.selected) |identity| {
         var source: SourceIdentity = std.mem.zeroes(SourceIdentity);
+
         source.node_id = identity.node.id;
         source.node_object_serial = identity.node.serial;
         source.device_id = std.math.maxInt(u32);
@@ -468,6 +565,7 @@ fn runCapture(launch: Launch, client: *PipeWireClient, report: *Report) !Capture
         source.node_name_size = identity.node.name.size;
         source.node_description = identity.node.description.bytes;
         source.node_description_size = identity.node.description.size;
+
         if (identity.device) |device| {
             source.device_id = device.id;
             source.device_object_serial = device.serial;
@@ -476,16 +574,23 @@ fn runCapture(launch: Launch, client: *PipeWireClient, report: *Report) !Capture
             source.device_description = device.description.bytes;
             source.device_description_size = device.description.size;
         }
+
         report.source_identity = source;
     }
+
     report.negotiated_format = negotiated;
     report.samples_count = capture.samples_count;
     report.published_samples_count = capture.published_samples_count;
     report.slot_publications_count = capture.publications_count;
-    report.memory_lock = if (lock_errno == .SUCCESS) .{ .locked = limits.cur } else .{ .unavailable = .{ .errno = lock_errno, .limit_bytes = limits.cur } };
+    report.memory_lock = if (lock_errno == .SUCCESS)
+        .{ .locked = limits.cur }
+    else
+        .{ .unavailable = .{ .errno = lock_errno, .limit_bytes = limits.cur } };
     report.main_loop_thread_id = linux.gettid();
+
     if (capture.callback_state == .observed) {
         const metrics = capture.callback_state.observed;
+
         report.callback = .{
             .thread_id = metrics.thread_id,
             .scheduler_policy = metrics.scheduler_policy,
@@ -502,6 +607,7 @@ fn runCapture(launch: Launch, client: *PipeWireClient, report: *Report) !Capture
             .activity = capture.activity_detector.report(),
         };
     }
+
     return result;
 }
 
@@ -512,45 +618,68 @@ fn captureErrorAfterPendingEvents(client: *PipeWireClient, cycle_error: anyerror
     // instead of only its buffer/timeline symptom. Never wait for future events.
     const cycle_errno = client.connection.errno;
     defer client.connection.errno = cycle_errno;
+
     for (0..256) |_| {
         const dispatched = client.dispatch() catch |err| {
             if (err == error.SourceDisconnected or err == error.SourceChanged) {
                 if (client.error_message_size == 0) {
-                    const message = std.fmt.bufPrint(&client.error_message, "audio_cycle_error={s}", .{@errorName(cycle_error)}) catch unreachable;
+                    const message = std.fmt.bufPrint(&client.error_message, "audio_cycle_error={s}", .{@errorName(cycle_error)}) catch {
+                        unreachable;
+                    };
+
                     client.error_message_size = message.len;
                 }
+
                 return err;
             }
+
             return cycle_error;
         };
+
         if (dispatched) continue;
+
         // receive() can consume just the header and still have the body
         // waiting in the socket. Readiness distinguishes that from waiting.
         var fd = [_]linux.pollfd{.{ .fd = client.connection.fd, .events = linux.POLL.IN, .revents = 0 }};
         const result = linux.poll(&fd, 1, 0);
-        if (linux.errno(result) != .SUCCESS or fd[0].revents & linux.POLL.IN == 0) break;
+
+        if (linux.errno(result) != .SUCCESS or fd[0].revents & linux.POLL.IN == 0) {
+            break;
+        }
     }
+
     return cycle_error;
 }
 
 fn observeCallback(capture: *RealtimeCapture, start: u64) void {
     if (capture.callback_state == .unobserved) {
         var metrics: CallbackMetrics = std.mem.zeroes(CallbackMetrics);
+
         metrics.thread_id = linux.gettid();
         metrics.started_ns_previous = start;
+
         const result = linux.sched_getscheduler(0);
+
         if (linux.errno(result) == .SUCCESS) {
             const scheduler: linux.SCHED = @bitCast(@as(i32, @intCast(result)));
+
             metrics.scheduler_policy = @intFromEnum(scheduler.mode);
         }
+
         var params: linux.sched_param = undefined;
-        if (linux.errno(linux.sched_getparam(0, &params)) == .SUCCESS) metrics.scheduler_priority = params.priority;
+        if (linux.errno(linux.sched_getparam(0, &params)) == .SUCCESS) {
+            metrics.scheduler_priority = params.priority;
+        }
+
         capture.callback_state = .{ .observed = metrics };
     }
+
     const callback = &capture.callback_state.observed;
+
     callback.gap_ns_max = @max(callback.gap_ns_max, start -| callback.started_ns_previous);
     callback.started_ns_previous = start;
     callback.callbacks_count += 1;
+
     AudioExchange.publishAudioCallbacksCount(capture.exchange, callback.callbacks_count);
 }
 
@@ -569,42 +698,63 @@ fn classifyError(err: anyerror) TerminalOutcome {
 
 fn describeError(client: *const PipeWireClient, err: anyerror, buffer: []u8) u16 {
     var writer = std.Io.Writer.fixed(buffer);
+
     writeErrorDescription(client, err, &writer) catch {
         const marker = " [truncated]";
         const end = @min(writer.end, buffer.len - marker.len);
+
         @memcpy(buffer[end..][0..marker.len], marker);
+
         writer.end = end + marker.len;
     };
+
     return @intCast(writer.end);
 }
 
 fn writeErrorDescription(client: *const PipeWireClient, err: anyerror, writer: *std.Io.Writer) error{WriteFailed}!void {
     try writer.print("{s}: errno={f}, server_error_code={d}, object_id={d}, sequence={d}, detail=\"{f}\"", .{ @errorName(err), logging.fmtErrno(client.connection.errno), client.error_code, client.error_object, client.error_sequence, std.zig.fmtString(client.error_message[0..client.error_message_size]) });
+
     switch (err) {
         error.UnsupportedDefaultSourceMetadata => try writer.writeAll("; PipeWire default.audio.source must use {\"name\":\"NODE\"} without JSON escapes; configure microphone_node or microphone_serial explicitly"),
         error.DefaultSourceNameInvalidUtf8 => try writer.writeAll("; PipeWire default.audio.source name is not valid UTF-8; configure microphone_node or microphone_serial explicitly"),
         error.DefaultSourceNameTooLong => try writer.writeAll("; PipeWire default.audio.source name exceeds 256 bytes; configure microphone_node or microphone_serial explicitly"),
         else => {},
     }
+
     if (client.diagnostic.wake_count > 0) {
         const d = client.diagnostic;
+
         try writer.print("; graph_rate={d}/{d}, graph_position={d}, graph_duration={d}, wake_count={d}, channel={d}, buffer_id={d}, chunk_offset={d}, chunk_size={d}, chunk_stride={d}, chunk_flags={d}, header_flags={d}, header_sequence={d}, header_pts_ns={d}", .{ d.graph_rate_num, d.graph_rate_hz, d.graph_position, d.graph_duration, d.wake_count, d.channel, d.buffer_id, d.chunk_offset, d.chunk_size, d.chunk_stride, d.chunk_flags, d.header_flags, d.header_sequence, d.header_pts_ns });
     }
-    if (client.previous) |previous| try writer.print("; previous_position={d}, previous_duration={d}, previous_rate_hz={d}", .{ previous.position, previous.duration, previous.rate });
-    if (client.diagnostic.invalid_sample_index) |index| try writer.print("; invalid_sample_index={d}", .{index});
+
+    if (client.previous) |previous| {
+        try writer.print("; previous_position={d}, previous_duration={d}, previous_rate_hz={d}", .{ previous.position, previous.duration, previous.rate });
+    }
+
+    if (client.diagnostic.invalid_sample_index) |index| {
+        try writer.print("; invalid_sample_index={d}", .{index});
+    }
+
     if (err == error.SourceNotFound or err == error.SourceAmbiguous) {
         try writer.print("; available sources:", .{});
+
         for (client.catalog) |entry| if (entry) |stored| {
-            if (stored.data != .node or !stored.data.node.is_source) continue;
+            if (stored.data != .node or !stored.data.node.is_source) {
+                continue;
+            }
+
             const object = stored.expand(&client.text);
             var serial: PipeWireClient.Text = .{};
+
             for (client.catalog) |candidate| if (candidate) |stored_device| {
                 if (stored_device.data == .device and stored_device.id == object.parent) {
                     // Own the expanded text until the diagnostic is formatted.
                     serial = stored_device.expand(&client.text).device_serial;
+
                     break;
                 }
             };
+
             try writer.print(" [name=\"{f}\", description=\"{f}\", serial=\"{f}\"]", .{ std.zig.fmtString(object.name.get()), std.zig.fmtString(object.description.get()), std.zig.fmtString(serial.get()) });
         };
     }
@@ -687,11 +837,14 @@ fn publishCompleteBlock(
 ) TerminalOutcome {
     const block_samples_count: u32 = @intCast(destination_samples.len);
     assert(block_samples_count > 0);
+
     assert(block_samples_count <= AudioExchange.callback_samples_count_max);
     assert(block_samples_count <= AudioExchange.slot_samples_capacity);
+
     if (realtime.active_slot) |active_slot| {
         assert(active_slot.samples_count <= AudioExchange.slot_samples_capacity);
     }
+
     assert(realtime.samples_count <
         realtime.recording_samples_target + AudioExchange.callback_samples_count_max);
 
@@ -699,8 +852,12 @@ fn publishCompleteBlock(
     // Conversion wrote only into this unpublished suffix. Normalize in place;
     // a rejected suffix never advances the publication count.
     var clipped: u32 = 0;
+
     for (destination_samples) |*sample| {
-        if (!std.math.isFinite(sample.*)) return .invalid_buffer;
+        if (!std.math.isFinite(sample.*)) {
+            return .invalid_buffer;
+        }
+
         if (sample.* > 1) {
             sample.* = 1;
             clipped += 1;
@@ -709,17 +866,26 @@ fn publishCompleteBlock(
             clipped += 1;
         }
     }
+
     realtime.callback_state.observed.clipped_samples_count += clipped;
 
     const activity = realtime.activity_detector.observe(destination_samples);
 
     active_slot.samples_count += block_samples_count;
-    if (activity.activity == .active) active_slot.contains_activity = true;
+
+    if (activity.activity == .active) {
+        active_slot.contains_activity = true;
+    }
+
     realtime.samples_count += block_samples_count;
+
     assert(active_slot.samples_count <= AudioExchange.slot_samples_capacity);
+
     assert(realtime.samples_count <=
         realtime.recording_samples_target + AudioExchange.callback_samples_count_max);
+
     const callback = &realtime.callback_state.observed;
+
     if (callback.samples_range) |*range| {
         range.minimum = @min(range.minimum, block_samples_count);
         range.maximum = @max(range.maximum, block_samples_count);
@@ -748,6 +914,7 @@ fn publishCompleteBlock(
             audio_policy.natural_boundary_quiet_samples_count)
     {
         publishActiveSlotIfNonEmpty(realtime);
+
         if (!beginNextAvailableSlot(realtime)) {
             return .pipeline_full;
         }
@@ -765,21 +932,32 @@ fn beginNextAvailableSlot(realtime: *RealtimeCapture) bool {
     const slot_index = AudioExchange.SlotIndex.fromPublicationOrdinal(
         realtime.publications_count,
     );
+
     const writer = AudioExchange.tryAcquireWriter(
         &realtime.exchange.slots[slot_index.arrayIndex()],
-    ) orelse return false;
+    ) orelse {
+        return false;
+    };
+
     realtime.active_slot = .{
         .writer = writer,
         .samples_count = 0,
         .contains_activity = false,
     };
+
     return true;
 }
 
 fn publishActiveSlotIfNonEmpty(realtime: *RealtimeCapture) void {
-    const active_slot = realtime.active_slot orelse return;
+    const active_slot = realtime.active_slot orelse {
+        return;
+    };
+
     assert(active_slot.samples_count <= AudioExchange.slot_samples_capacity);
-    if (active_slot.samples_count == 0) return;
+
+    if (active_slot.samples_count == 0) {
+        return;
+    }
 
     AudioExchange.publishWrittenSlot(active_slot.writer, .{
         .samples_count = active_slot.samples_count,
@@ -800,12 +978,16 @@ fn publishActiveSlotIfNonEmpty(realtime: *RealtimeCapture) void {
 }
 
 fn abandonUnpublishedActiveSlot(realtime: *RealtimeCapture) void {
-    const active_slot = realtime.active_slot orelse return;
+    const active_slot = realtime.active_slot orelse {
+        return;
+    };
+
     assert(active_slot.samples_count <= AudioExchange.slot_samples_capacity);
 
     // Samples may have been copied into this slot and counted as callback
     // progress, but its writer never release-published a positive count.
     AudioExchange.abandonEmptyWrite(active_slot.writer);
+
     realtime.active_slot = null;
 
     assert(realtime.published_samples_count <= realtime.samples_count);
@@ -815,15 +997,18 @@ fn writeEventCounter(event_fd: std.posix.fd_t) void {
     assert(event_fd >= 0);
 
     const increment: u64 = 1;
+
     while (true) {
         const write_result = linux.write(
             event_fd,
             std.mem.asBytes(&increment).ptr,
             @sizeOf(u64),
         );
+
         switch (linux.errno(write_result)) {
             .SUCCESS => {
                 assert(write_result == @sizeOf(u64));
+
                 return;
             },
             // The syscall has not changed the counter when a signal interrupts
@@ -844,6 +1029,7 @@ fn writeEventCounter(event_fd: std.posix.fd_t) void {
 fn monotonicNanoseconds() u64 {
     var timestamp: linux.timespec = undefined;
     const result = linux.clock_gettime(.MONOTONIC, &timestamp);
+
     assert(linux.errno(result) == .SUCCESS);
     assert(timestamp.sec >= 0);
     assert(timestamp.nsec >= 0);
@@ -858,7 +1044,9 @@ pub fn schedulerPolicyName(policy: i32) []const u8 {
         @intFromEnum(linux.SCHED.Mode.NORMAL) => "normal",
         else => "other",
     };
+
     assert(name.len > 0);
+
     return name;
 }
 

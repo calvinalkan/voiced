@@ -21,8 +21,15 @@ pub const InitError = error{ InvalidConfig, MemorySizeOverflow, MemoryTooSmall, 
 pub fn requiredMemory(config: Config) InitError!usize {
     var scheduler_size: usize = undefined;
     try checkInit(abi.voiced_inference_scheduler_memory(config.workers_count, &scheduler_size));
-    const workers_size = std.math.mul(usize, config.workers_count, @sizeOf(std.Thread)) catch return error.MemorySizeOverflow;
-    const workers_offset = std.math.add(usize, schedulerOffset(), scheduler_size) catch return error.MemorySizeOverflow;
+
+    const workers_size = std.math.mul(usize, config.workers_count, @sizeOf(std.Thread)) catch {
+        return error.MemorySizeOverflow;
+    };
+
+    const workers_offset = std.math.add(usize, schedulerOffset(), scheduler_size) catch {
+        return error.MemorySizeOverflow;
+    };
+
     return std.math.add(usize, workers_offset, workers_size) catch error.MemorySizeOverflow;
 }
 
@@ -31,24 +38,37 @@ pub fn requiredMemory(config: Config) InitError!usize {
 /// stacks here, before any transcription. The pool borrows no model or runtime.
 pub fn init(memory: []align(memory_alignment) u8, config: Config) InitError!*WorkerPool {
     const size = try requiredMemory(config);
-    if (memory.len < size) return error.MemoryTooSmall;
+    if (memory.len < size) {
+        return error.MemoryTooSmall;
+    }
+
     const pool: *WorkerPool = @ptrCast(memory.ptr);
     const workers_offset = size - config.workers_count * @sizeOf(std.Thread);
     const workers: [*]std.Thread = @ptrCast(@alignCast(memory.ptr + workers_offset));
+
     pool.* = .{ .scheduler = @ptrCast(memory.ptr + schedulerOffset()), .workers = workers[0..config.workers_count] };
+
     try checkInit(abi.voiced_inference_scheduler_init(pool.scheduler, workers_offset - schedulerOffset(), config.workers_count));
+
     var started: usize = 0;
     errdefer {
         abi.voiced_inference_scheduler_stop(pool.scheduler);
-        for (pool.workers[0..started]) |thread| thread.join();
+
+        for (pool.workers[0..started]) |thread| {
+            thread.join();
+        }
     }
+
     // Keep spawn/join on the application side of the object boundary. Zig's
     // executable startup initializes the stdlib TLS layout used by spawn;
     // an independently compiled object's private copy is uninitialized.
     // Moving spawn into that object produced an invalid optimized init body.
     while (started < pool.workers.len) : (started += 1) {
-        pool.workers[started] = std.Thread.spawn(.{}, workerMain, .{ pool.scheduler, started }) catch return error.ThreadSpawnFailed;
+        pool.workers[started] = std.Thread.spawn(.{}, workerMain, .{ pool.scheduler, started }) catch {
+            return error.ThreadSpawnFailed;
+        };
     }
+
     return pool;
 }
 
@@ -56,7 +76,11 @@ pub fn init(memory: []align(memory_alignment) u8, config: Config) InitError!*Wor
 /// this block only after deinit returns; it does not free the block itself.
 pub fn deinit(pool: *WorkerPool) void {
     abi.voiced_inference_scheduler_stop(pool.scheduler);
-    for (pool.workers) |thread| thread.join();
+
+    for (pool.workers) |thread| {
+        thread.join();
+    }
+
     pool.* = undefined;
 }
 

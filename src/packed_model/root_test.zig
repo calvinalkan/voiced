@@ -38,6 +38,11 @@ const golden_models = [_]struct {
         .packed_file_name = "whisper.medium.en.voiced",
         .expected_file_blake3_hex = "c2343a47b30eec063cf13463d09ca5796c655543b626c99754118be46a04ed9d",
     },
+    .{
+        .kind = .whisper_tiny_en,
+        .packed_file_name = "whisper.tiny.en.voiced",
+        .expected_file_blake3_hex = "2fe13e291b2d70f6a89c4509c0a9ef7be70e4e3a5bbf2c395aa927fff87a9c11",
+    },
 };
 comptime {
     const supported_model_kinds = std.enums.values(inference.Model.Kind);
@@ -87,8 +92,8 @@ test "supported model conversions match the inference-blessed packed files" {
 
             var file_hash = Blake3.init(.{});
             var packed_file_reader = packed_file.reader(io, &.{});
-            var hash_buffer: [64 * 1024]u8 = undefined;
 
+            var hash_buffer: [64 * 1024]u8 = undefined;
             while (true) {
                 const bytes_read_count = try packed_file_reader.interface.readSliceShort(&hash_buffer);
                 if (bytes_read_count == 0) {
@@ -130,6 +135,7 @@ fn generatePackedModel(
     defer allocator.free(source_directory_path);
 
     const cwd = std.Io.Dir.cwd();
+
     try cwd.createDirPath(io, source_directory_path);
 
     var source_directory = try cwd.openDir(io, source_directory_path, .{});
@@ -201,6 +207,7 @@ test "reader rejects representative packed-file corruption" {
     const io = std.testing.io;
 
     const base_model = golden_models[0];
+
     assert(base_model.kind == .whisper_base_en);
 
     var http_client: std.http.Client = .{ .allocator = allocator, .io = io };
@@ -271,6 +278,7 @@ test "reader rejects representative packed-file corruption" {
     // Replace a required entry with the directory's zero sentinel. The reader
     // rejects it because required tensors must begin inside the payload region.
     std.mem.writeInt(u64, &tensor_offset_bytes, 0, .little);
+
     try expectMutationRejected(.{
         .io = io,
         .packed_file = packed_file,
@@ -284,6 +292,7 @@ test "reader rejects representative packed-file corruption" {
     // Point an unused layer slot at the first tensor payload. The reader rejects
     // every nonzero unused entry so one payload cannot acquire another meaning.
     std.mem.writeInt(u64, &tensor_offset_bytes, first_tensor_payload_offset, .little);
+
     try expectMutationRejected(.{
         .io = io,
         .packed_file = packed_file,
@@ -309,6 +318,7 @@ test "reader rejects representative packed-file corruption" {
     // Move the first tensor one byte forward. The reader rejects the resulting
     // payload address because every tensor requires 64-byte alignment.
     std.mem.writeInt(u64, &tensor_offset_bytes, first_tensor_payload_offset + 1, .little);
+
     try expectMutationRejected(.{
         .io = io,
         .packed_file = packed_file,
@@ -322,6 +332,7 @@ test "reader rejects representative packed-file corruption" {
     // Move the first tensor beyond the tensor region and into vocabulary space.
     // The reader rejects the payload before constructing a tensor view.
     std.mem.writeInt(u64, &tensor_offset_bytes, vocabulary_index_offset + 64, .little);
+
     try expectMutationRejected(.{
         .io = io,
         .packed_file = packed_file,
@@ -341,10 +352,10 @@ test "reader rejects representative packed-file corruption" {
     assert(second_vocabulary_offset > 0);
 
     var vocabulary_offset_bytes: [@sizeOf(u32)]u8 = undefined;
-
     // Move the first token start to byte one. The reader rejects a vocabulary
     // whose index does not begin at the first payload byte.
     std.mem.writeInt(u32, &vocabulary_offset_bytes, 1, .little);
+
     try expectMutationRejected(.{
         .io = io,
         .packed_file = packed_file,
@@ -358,6 +369,7 @@ test "reader rejects representative packed-file corruption" {
     // Move the third token start below the second token start. The reader
     // rejects the resulting reversed token byte range.
     std.mem.writeInt(u32, &vocabulary_offset_bytes, second_vocabulary_offset - 1, .little);
+
     try expectMutationRejected(.{
         .io = io,
         .packed_file = packed_file,
@@ -371,6 +383,7 @@ test "reader rejects representative packed-file corruption" {
     // Move the second token end beyond the complete vocabulary payload. The
     // reader rejects the range before exposing the token bytes.
     std.mem.writeInt(u32, &vocabulary_offset_bytes, std.math.maxInt(u32), .little);
+
     try expectMutationRejected(.{
         .io = io,
         .packed_file = packed_file,
@@ -387,6 +400,7 @@ test "reader rejects representative packed-file corruption" {
     const vocabulary_terminal_offset = vocabulary_index_offset + vocabulary_tokens_count * @sizeOf(u32);
 
     std.mem.writeInt(u32, &vocabulary_offset_bytes, 0, .little);
+
     try expectMutationRejected(.{
         .io = io,
         .packed_file = packed_file,
@@ -403,6 +417,7 @@ test "reader rejects representative packed-file corruption" {
     // checksum validation and mapping must not begin.
 
     const packed_file_size = (try packed_file.stat(io)).size;
+
     {
         try packed_file.setLength(io, packed_file_size + 1);
         defer packed_file.setLength(io, packed_file_size) catch {
@@ -440,17 +455,18 @@ fn expectMutationRejected(options: struct {
     const original = original_bytes[0..replacement_bytes.len];
 
     const read_size = try packed_file.readPositionalAll(io, original, byte_offset);
+
     try std.testing.expectEqual(original.len, read_size);
 
     var original_digest: [Blake3.digest_length]u8 = undefined;
     const digest_bytes_read = try packed_file.readPositionalAll(io, &original_digest, 48);
 
     try std.testing.expectEqual(original_digest.len, digest_bytes_read);
-
     defer {
         packed_file.writePositionalAll(io, original, byte_offset) catch {
             @panic("could not restore a structurally corrupted packed model");
         };
+
         packed_file.writePositionalAll(io, &original_digest, 48) catch {
             @panic("could not restore a structurally corrupted packed model checksum");
         };
@@ -470,12 +486,13 @@ fn resealPackedFile(io: std.Io, packed_file: std.Io.File) !void {
     // The packed checksum hashes its own field as zero. Write that canonical
     // value before streaming the complete mutated file.
     const zero_digest: [Blake3.digest_length]u8 = @splat(0);
+
     try packed_file.writePositionalAll(io, &zero_digest, 48);
 
     var hash = Blake3.init(.{});
     var packed_file_reader = packed_file.reader(io, &.{});
-    var buffer: [64 * 1024]u8 = undefined;
 
+    var buffer: [64 * 1024]u8 = undefined;
     while (true) {
         const read_size = try packed_file_reader.interface.readSliceShort(&buffer);
         if (read_size == 0) {

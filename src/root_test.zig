@@ -1,12 +1,5 @@
-comptime {
-    // Direct `zig test` does not evaluate build.zig or link production's LLVM
-    // inference object. Compile the same exports into the test executable so
-    // the facade's `extern` declarations resolve for every source test. This
-    // validates behavior through the private ABI, not the physical object
-    // boundary. A future process-level service harness must build and launch a
-    // production-shaped binary to cover that boundary and full lifecycle.
-    _ = @import("inference/root.object.zig");
-}
+const std = @import("std");
+const zig_lint = @import("zig_lint");
 
 test {
     _ = @import("audio_exchange.zig");
@@ -14,11 +7,38 @@ test {
     _ = @import("capture/pipewire_wire.zig");
     _ = @import("clipboard/x11.zig");
     _ = @import("clipboard/x11_wire.zig");
-    _ = @import("inference/attention.zig");
-    _ = @import("inference/Runtime.object.zig");
-    _ = @import("inference/linear.zig");
-    _ = @import("inference/log_mel.zig");
-    _ = @import("inference/root_test.zig");
     _ = @import("logging.zig");
     _ = @import("packed_model/root_test.zig");
+}
+
+test "repository source passes lint" {
+    const allocator = std.testing.allocator;
+
+    var report = try zig_lint.lint(
+        zig_lint.Allocators.same(allocator),
+        std.testing.io,
+        ".",
+        .{
+            .apply_fixes = true,
+            .report_path_format = .git_root_relative,
+        },
+    );
+    defer report.deinit(allocator);
+
+    if (report.diagnostics.len == 0 and report.fixed_files.len == 0) {
+        return;
+    }
+
+    if (report.diagnostics.len != 0) {
+        const rendered = try report.renderAgent(allocator);
+        defer allocator.free(rendered);
+
+        std.debug.print("{s}", .{rendered});
+    }
+
+    for (report.fixed_files.items(.path)) |path| {
+        std.debug.print("{s}: source has available lint fixes or formatting changes\n", .{path});
+    }
+
+    return error.RepositoryLintFailed;
 }

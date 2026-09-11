@@ -21,27 +21,49 @@ pub const Result = union(enum) { ok: void, err: Error };
 /// path. std.Io errors retain the library's exact error set, not invented errno.
 pub fn save(io: std.Io, directory_path: []const u8, text: []const u8) Result {
     std.debug.assert(text.len > 0);
+
     const directory = std.Io.Dir.cwd().createDirPathOpen(io, directory_path, .{
         .permissions = .fromMode(0o700),
         .open_options = .{ .iterate = true, .follow_symlinks = false },
-    }) catch |err| return .{ .err = .{ .open_directory = err } };
+    }) catch |err| {
+        return .{ .err = .{ .open_directory = err } };
+    };
     defer directory.close(io);
+
     const linux = std.os.linux;
+
     var stat: linux.Statx = undefined;
     const errno = linux.errno(linux.statx(directory.handle, "", linux.AT.EMPTY_PATH, .BASIC_STATS, &stat));
-    if (errno != .SUCCESS) return .{ .err = .{ .stat_directory = errno } };
-    if (!stat.mask.UID or !stat.mask.MODE or stat.uid != linux.geteuid())
-        return .{ .err = .{ .unsafe_directory = .{ .uid = stat.uid, .expected_uid = linux.geteuid(), .mode = stat.mode, .uid_available = stat.mask.UID, .mode_available = stat.mask.MODE } } };
-    if (stat.mode & 0o777 != 0o700) directory.setPermissions(io, .fromMode(0o700)) catch |err| return .{ .err = .{ .permissions = err } };
 
-    var output = directory.createFileAtomic(io, "transcript.txt", .{ .replace = true, .permissions = .fromMode(0o600) }) catch |err| return .{ .err = .{ .create_temporary = err } };
-    defer output.deinit(io);
-    var written: usize = 0;
-    while (written < text.len) {
-        written += output.file.writeStreaming(io, &.{}, &.{text[written..]}, 1) catch |err|
-            return .{ .err = .{ .write = .{ .cause = err, .bytes_written = written, .bytes_total = text.len, .cleanup = discardTemporary(io, &output) } } };
+    if (errno != .SUCCESS) {
+        return .{ .err = .{ .stat_directory = errno } };
     }
-    output.replace(io) catch |err| return .{ .err = .{ .replace = .{ .cause = err, .cleanup = discardTemporary(io, &output) } } };
+
+    if (!stat.mask.UID or !stat.mask.MODE or stat.uid != linux.geteuid()) {
+        return .{ .err = .{ .unsafe_directory = .{ .uid = stat.uid, .expected_uid = linux.geteuid(), .mode = stat.mode, .uid_available = stat.mask.UID, .mode_available = stat.mask.MODE } } };
+    }
+
+    if (stat.mode & 0o777 != 0o700) directory.setPermissions(io, .fromMode(0o700)) catch |err| {
+        return .{ .err = .{ .permissions = err } };
+    };
+
+    var output = directory.createFileAtomic(io, "transcript.txt", .{ .replace = true, .permissions = .fromMode(0o600) }) catch |err| {
+        return .{ .err = .{ .create_temporary = err } };
+    };
+    defer output.deinit(io);
+
+    var written: usize = 0;
+
+    while (written < text.len) {
+        written += output.file.writeStreaming(io, &.{}, &.{text[written..]}, 1) catch |err| {
+            return .{ .err = .{ .write = .{ .cause = err, .bytes_written = written, .bytes_total = text.len, .cleanup = discardTemporary(io, &output) } } };
+        };
+    }
+
+    output.replace(io) catch |err| {
+        return .{ .err = .{ .replace = .{ .cause = err, .cleanup = discardTemporary(io, &output) } } };
+    };
+
     return .{ .ok = {} };
 }
 
@@ -49,10 +71,18 @@ pub fn save(io: std.Io, directory_path: []const u8, text: []const u8) Result {
 // cleanup result before deinit closes handles; never overwrite the write/rename
 // error, and keep the temporary basename when removal failed.
 fn discardTemporary(io: std.Io, output: *std.Io.File.Atomic) ?CleanupError {
-    if (!output.file_exists) return null;
+    if (!output.file_exists) {
+        return null;
+    }
+
     const name = std.fmt.hex(output.file_basename_hex);
+
     output.file_exists = false;
-    output.dir.deleteFile(io, &name) catch |err| return .{ .cause = err, .temporary_name = name };
+
+    output.dir.deleteFile(io, &name) catch |err| {
+        return .{ .cause = err, .temporary_name = name };
+    };
+
     return null;
 }
 
@@ -63,7 +93,17 @@ pub fn allocDirectoryPath(
     home: ?[]const u8,
 ) ![]u8 {
     const use_state_home = state_home != null and std.fs.path.isAbsolute(state_home.?);
-    const root = if (use_state_home) state_home.? else home orelse return error.HomeNotSet;
-    if (!std.fs.path.isAbsolute(root)) return error.StateHomeNotAbsolute;
+
+    const root = if (use_state_home)
+        state_home.?
+    else
+        home orelse {
+            return error.HomeNotSet;
+        };
+
+    if (!std.fs.path.isAbsolute(root)) {
+        return error.StateHomeNotAbsolute;
+    }
+
     return std.fs.path.join(allocator, &.{ root, if (use_state_home) "" else ".local/state", "voiced" });
 }

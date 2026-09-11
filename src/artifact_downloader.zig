@@ -60,6 +60,7 @@ pub fn downloadAndVerify(
 
     var redirect_buffer: [8 * 1024]u8 = undefined;
     var response = try request.receiveHead(&redirect_buffer);
+
     if (response.head.status != .ok) {
         return .{ .err = .{ .http_status = @intFromEnum(response.head.status) } };
     }
@@ -85,6 +86,7 @@ pub fn downloadAndVerify(
         const read_size = response_body.readSliceShort(&download_buffer) catch {
             return response.bodyErr().?;
         };
+
         if (read_size == 0) {
             break;
         }
@@ -94,6 +96,7 @@ pub fn downloadAndVerify(
         }
 
         try blake3_writer.writer.writeAll(download_buffer[0..read_size]);
+
         downloaded_size += read_size;
     }
 

@@ -106,11 +106,14 @@ pub const Detector = struct {
         if (detector.unknown_samples_count < calibration_samples_count_target) {
             const calibration_samples_count_remaining =
                 calibration_samples_count_target - detector.unknown_samples_count;
+
             const calibration_samples_count = @min(
                 samples.len,
                 calibration_samples_count_remaining,
             );
+
             const calibration_rms = calculateRms(samples[0..calibration_samples_count]);
+
             const unknown_samples_count_after =
                 detector.unknown_samples_count + calibration_samples_count;
 
@@ -129,6 +132,7 @@ pub const Detector = struct {
                 assert(detector.activity == .unknown);
                 assert(detector.quiet_samples_count == 0);
                 assert(detector.active_samples_count == 0);
+
                 return .{
                     .activity = .unknown,
                     .activity_samples_count = detector.activity_samples_count,
@@ -146,10 +150,12 @@ pub const Detector = struct {
         const classified_samples = samples[samples_offset..];
         const block_rms = calculateRms(classified_samples);
         const thresholds = calculateThresholds(detector.noise_floor_rms);
+
         const threshold_rms = if (detector.activity == .active)
             thresholds.quiet_rms
         else
             thresholds.active_rms;
+
         const activity: Activity = if (block_rms > threshold_rms) .active else .quiet;
         const classified_samples_count: u32 = @intCast(classified_samples.len);
 
@@ -159,6 +165,7 @@ pub const Detector = struct {
             if (detector.activity != .unknown) {
                 detector.activity_changes_count += 1;
             }
+
             detector.activity = activity;
             detector.activity_samples_count = classified_samples_count;
         }
@@ -179,14 +186,17 @@ pub const Detector = struct {
                     detector.sample_rate_hz / 5
                 else
                     detector.sample_rate_hz * 4;
+
                 const adaptation_fraction = @min(
                     1.0,
                     @as(f32, @floatFromInt(classified_samples_count)) /
                         @as(f32, @floatFromInt(adaptation_samples_count)),
                 );
+
                 detector.noise_floor_rms +=
                     adaptation_fraction * (block_rms - detector.noise_floor_rms);
             },
+
             .active => {
                 detector.active_samples_count += classified_samples_count;
                 detector.active_run_samples_count_max = @max(
@@ -198,10 +208,12 @@ pub const Detector = struct {
 
         const observed_samples_count_after = detector.unknown_samples_count +
             detector.quiet_samples_count + detector.active_samples_count;
+
         assert(observed_samples_count_after == observed_samples_count + samples.len);
         assert(detector.activity != .unknown);
         assert(detector.activity_samples_count > 0);
         assert(detector.noise_floor_rms >= 0);
+
         return .{
             .activity = detector.activity,
             .activity_samples_count = detector.activity_samples_count,
@@ -217,9 +229,11 @@ pub const Detector = struct {
     pub fn report(detector: *const Detector) Report {
         const observed_samples_count = detector.unknown_samples_count +
             detector.quiet_samples_count + detector.active_samples_count;
+
         assert(detector.noise_floor_rms >= 0);
 
         const thresholds = calculateThresholds(detector.noise_floor_rms);
+
         const report_value: Report = .{
             .activity = detector.activity,
             .activity_samples_count = detector.activity_samples_count,
@@ -239,6 +253,7 @@ pub const Detector = struct {
         assert(report_value.active_samples_count <= report_value.observed_samples_count);
         assert(report_value.quiet_samples_count <= report_value.observed_samples_count);
         assert(report_value.quiet_threshold_rms <= report_value.active_threshold_rms);
+
         return report_value;
     }
 };
@@ -268,14 +283,17 @@ fn calculateRms(samples: []const f32) f32 {
     assert(samples.len > 0);
 
     var squares_sum: f64 = 0;
+
     for (samples) |sample| {
         const normalized: f64 = sample;
+
         squares_sum += normalized * normalized;
     }
 
     const rms: f32 = @floatCast(@sqrt(
         squares_sum / @as(f64, @floatFromInt(samples.len)),
     ));
+
     assert(std.math.isFinite(rms));
     assert(rms >= 0);
     assert(rms <= 1.0);

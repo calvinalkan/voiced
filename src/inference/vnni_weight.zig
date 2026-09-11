@@ -28,6 +28,7 @@ pub const QuantizedWeight = struct {
     pub fn layout(weight: QuantizedWeight) Layout {
         const weight_layout = Layout.init(weight.scales.len, weight.input_values_count);
         assert(weight.values.len == weight_layout.valuesCount());
+
         assert(weight.compensation.len == weight.scales.len);
 
         return weight_layout;
@@ -53,7 +54,9 @@ pub const Layout = struct {
     }
 
     pub fn valuesCount(layout: Layout) usize {
-        return std.math.mul(usize, layout.output_rows_count, layout.input_values_count) catch unreachable;
+        return std.math.mul(usize, layout.output_rows_count, layout.input_values_count) catch {
+            unreachable;
+        };
     }
 
     pub fn outputBlockSize(layout: Layout) usize {
@@ -78,6 +81,7 @@ pub const Layout = struct {
 
 pub inline fn roundFloat32VectorToNearestEven(values: anytype) @TypeOf(values) {
     const Float32Vector = @TypeOf(values);
+
     comptime {
         if (Float32Vector != @Vector(4, f32) and Float32Vector != @Vector(8, f32)) {
             @compileError("expected a four- or eight-lane Float32 vector");
@@ -92,5 +96,6 @@ pub inline fn roundFloat32VectorToNearestEven(values: anytype) @TypeOf(values) {
         : [rounded] "=x" (rounded),
         : [values] "x" (values),
     );
+
     return rounded;
 }
