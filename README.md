@@ -51,16 +51,28 @@ zig build
 ./zig-out/bin/voiced setup
 ```
 
-Setup downloads the pinned Systran weights and vocabularies from Hugging Face,
-verifies their sizes and BLAKE3-256 pins, and converts them into the native files
-`whisper.base.en.voiced`, `whisper.small.en.voiced`, and
-`whisper.medium.en.voiced`. An existing file is reused only when it loads as the
-requested model under the runtime's current packed format; otherwise setup
-atomically replaces it. Source downloads are temporary. The complete installed
-files use about 1.1 GiB under
+Setup installs Small.en by default. Repeat `--model` to select one or more models,
+or use `--model all` by itself:
+
+```bash
+./zig-out/bin/voiced setup --model whisper.medium.en
+./zig-out/bin/voiced setup \
+  --model whisper.small.en \
+  --model whisper.medium.en
+./zig-out/bin/voiced setup --model all
+```
+
+Setup downloads the selected pinned Systran weights and vocabularies from Hugging
+Face, verifies their sizes and BLAKE3-256 pins, and converts them into native
+`.voiced` files. An existing file is reused only when it loads as the requested
+model under the runtime's current packed format; otherwise setup atomically
+replaces it. Unselected installed models remain untouched, and source downloads
+are temporary. Small.en downloads about 461 MiB and installs about 238 MiB; all
+current models download about 2.1 GiB and install about 1.1 GiB under
 `$XDG_DATA_HOME/voiced/models`, or `~/.local/share/voiced/models` when the XDG
-path is unset. `zig build setup` builds Voiced and invokes the same command;
-ordinary builds neither download models nor run inference.
+path is unset. `zig build setup` builds Voiced and installs Small.en; pass setup
+arguments after `--`, for example `zig build setup -- --model all`. Ordinary
+builds neither download models nor run inference.
 
 Plain `zig build` creates a developer build and defaults to ReleaseSafe for the
 application, inference runtime, and stdlib. It retains symbols, in-process panic

@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const inference = @import("inference/root.zig");
 const setup = @import("setup.zig");
 const voiced = @import("voiced.zig");
 const logging = voiced.logging;
@@ -155,6 +156,7 @@ fn runCommandLine(init: std.process.Init) u8 {
             error.MissingValue => stderr("voiced: option '{s}' requires a value.\n", .{diagnostic.argument}),
             error.DuplicateOption => stderr("voiced: option '{s}' was supplied more than once; specify it only once.\n", .{diagnostic.argument}),
             error.ConflictingOptions => stderr("voiced: options '{s}' and '{s}' cannot be used together; choose one source.\n", .{ diagnostic.other_option, diagnostic.argument }),
+            error.ConflictingModelSelection => stderr("voiced: '--model all' cannot be combined with another model.\n", .{}),
             error.InvalidValue => stderr("voiced: invalid value '{s}' for '{s}'; expected {s}.\n", .{ diagnostic.value, diagnostic.argument, diagnostic.expected }),
             error.OptionTakesNoValue => stderr("voiced: option '{s}' does not take a value; use 'voiced record --toggle'.\n", .{diagnostic.argument}),
             error.InvalidConfigLine => stderr("voiced: expected key=value.\n", .{}),
@@ -259,7 +261,7 @@ fn runCommandLine(init: std.process.Init) u8 {
     defer logging.deinit();
 
     const execution = switch (invocation) {
-        .setup => setup.run(init),
+        .setup => |options| setup.run(init, options),
         .serve => |options| service.run(init, options),
         .client => |request| service.send(init, request),
         .usage, .help => unreachable,
@@ -303,7 +305,7 @@ fn runCommandLine(init: std.process.Init) u8 {
 const Invocation = union(enum) {
     usage,
     help: []const u8,
-    setup,
+    setup: setup.Options,
     serve: service.Options,
     client: service.Request,
 };
@@ -364,17 +366,7 @@ fn parseCommand(init: std.process.Init, arguments: []const [:0]const u8, diagnos
 
     if (std.mem.eql(u8, command, "setup")) {
         diagnostic.command = command;
-        if (arguments.len > 1) {
-            diagnostic.argument = arguments[1];
-            if (std.mem.eql(u8, diagnostic.argument, "--")) {
-                if (arguments.len == 2) return .setup;
-                diagnostic.argument = arguments[2];
-                return error.UnexpectedArgument;
-            }
-            if (std.mem.startsWith(u8, diagnostic.argument, "-")) return error.UnknownOption;
-            return error.UnexpectedArgument;
-        }
-        return .setup;
+        return .{ .setup = try parseSetupArguments(arguments[1..], diagnostic) };
     }
 
     diagnostic.argument = command;
@@ -428,13 +420,88 @@ fn parseCommand(init: std.process.Init, arguments: []const [:0]const u8, diagnos
     return .{ .client = request };
 }
 
+fn parseSetupArguments(arguments: []const [:0]const u8, diagnostic: *ArgumentDiagnostic) !setup.Options {
+    var options: setup.Options = .{};
+    var saw_specific_model = false;
+    var saw_all = false;
+    var index: usize = 0;
+
+    while (index < arguments.len) : (index += 1) {
+        const argument = arguments[index];
+
+        diagnostic.argument = argument;
+
+        if (std.mem.eql(u8, argument, "--")) {
+            if (index + 1 < arguments.len) {
+                diagnostic.argument = arguments[index + 1];
+
+                return error.UnexpectedArgument;
+            }
+
+            break;
+        }
+
+        const model_prefix = "--model=";
+
+        const value = if (std.mem.eql(u8, argument, "--model")) value: {
+            if (index + 1 == arguments.len or std.mem.startsWith(u8, arguments[index + 1], "--")) {
+                return error.MissingValue;
+            }
+
+            index += 1;
+
+            break :value arguments[index];
+        } else if (std.mem.startsWith(u8, argument, model_prefix))
+            argument[model_prefix.len..]
+        else {
+            if (std.mem.startsWith(u8, argument, "-")) {
+                return error.UnknownOption;
+            }
+
+            return error.UnexpectedArgument;
+        };
+
+        diagnostic.argument = "--model";
+        diagnostic.value = value;
+        diagnostic.expected = "'all', 'whisper.base.en', 'whisper.small.en', or 'whisper.medium.en'";
+
+        if (std.mem.eql(u8, value, "all")) {
+            if (saw_specific_model) {
+                return error.ConflictingModelSelection;
+            }
+
+            saw_all = true;
+            options.model_kinds = .full;
+
+            continue;
+        }
+
+        if (saw_all) {
+            return error.ConflictingModelSelection;
+        }
+
+        const kind = inference.Model.parseKind(value) orelse {
+            return error.InvalidValue;
+        };
+
+        if (!saw_specific_model) {
+            options.model_kinds = .empty;
+            saw_specific_model = true;
+        }
+
+        options.model_kinds.insert(kind);
+    }
+
+    return options;
+}
+
 const main_help =
     \\voiced - voice dictation daemon
     \\
     \\Usage: voiced <command> [options]
     \\
     \\Commands:
-    \\  setup    Install and verify the supported models.
+    \\  setup    Install and verify selected models.
     \\  serve    Run the daemon in the foreground.
     \\  record   Record manually; -t or --toggle toggles recording.
     \\  stop     Stop recording and finish transcription.
@@ -467,18 +534,33 @@ const main_help =
 ;
 
 const setup_help =
-    \\Install every Whisper speech-recognition model supported by this build.
+    \\Install and verify selected Whisper speech-recognition models.
     \\
-    \\Installed models:
+    \\Usage:
+    \\  voiced setup [--model <model>]...
+    \\
+    \\Options:
+    \\  --model <model>
+    \\      Install one model. Repeat this option to install multiple models.
+    \\      Use 'all' by itself to install every supported model.
+    \\      Default: whisper.small.en.
+    \\
+    \\Available models:
     \\  whisper.base.en
     \\  whisper.small.en
     \\  whisper.medium.en
     \\
-    \\Each model is built from weights and a vocabulary downloaded from a pinned
-    \\Hugging Face revision. Existing models are reused when their packed contents
-    \\and source digests remain valid.
+    \\Examples:
+    \\  voiced setup
+    \\  voiced setup --model whisper.medium.en
+    \\  voiced setup --model whisper.base.en --model whisper.medium.en
+    \\  voiced setup --model all
     \\
-    \\Setup downloads about 2.1 GiB. The completed installation uses about 1.1 GiB.
+    \\Each selected model is built from weights and a vocabulary downloaded from a
+    \\pinned Hugging Face revision. Existing valid packed models are reused.
+    \\
+    \\The default Small.en download is about 461 MiB and installs about 238 MiB.
+    \\All current models download about 2.1 GiB and install about 1.1 GiB.
     \\
     \\Storage:
     \\  $XDG_DATA_HOME/voiced/models/whisper.base.en.voiced

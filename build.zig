@@ -202,9 +202,13 @@ pub fn build(b: *std.Build) void {
 
     const run_setup = b.addRunArtifact(voiced);
     run_setup.addArg("setup");
+
+    run_setup.addArgs(b.args orelse
+        &.{});
+
     run_setup.setCwd(b.path(""));
 
-    b.step("setup", "Download and verify the supported Whisper checkpoints").dependOn(&run_setup.step);
+    b.step("setup", "Download and verify selected Whisper checkpoints").dependOn(&run_setup.step);
 
     // ── Linter ──
 

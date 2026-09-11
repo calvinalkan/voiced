@@ -1,6 +1,6 @@
-//! Installs every supported Whisper model as one self-contained packed model.
-//! Upstream selection, XDG paths, staging, downloads, and publication belong to
-//! this command; source files are removed after conversion.
+//! Installs selected Whisper models as self-contained packed models. Upstream
+//! selection, XDG paths, staging, downloads, and publication belong to this
+//! command; source files are removed after conversion.
 
 const std = @import("std");
 const artifact_downloader = @import("artifact_downloader.zig");
@@ -63,7 +63,13 @@ pub const ModelSource = struct {
     }
 };
 
-pub fn run(init: std.process.Init) !void {
+pub const ModelSet = std.enums.EnumSet(inference.Model.Kind);
+
+pub const Options = struct {
+    model_kinds: ModelSet = ModelSet.initOne(.whisper_small_en),
+};
+
+pub fn run(init: std.process.Init, options: Options) !void {
     var http_client: std.http.Client = .{ .allocator = init.gpa, .io = init.io };
     defer http_client.deinit();
 
@@ -95,7 +101,9 @@ pub fn run(init: std.process.Init) !void {
     defer output_dir_handle.close(init.io);
 
     inline for (comptime std.meta.tags(inference.Model.Kind)) |kind| {
-        try setupModel(init, output_dir_path, output_dir_handle, &http_client, kind);
+        if (options.model_kinds.contains(kind)) {
+            try setupModel(init, output_dir_path, output_dir_handle, &http_client, kind);
+        }
     }
 }
 
