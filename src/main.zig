@@ -677,6 +677,7 @@ const status_help =
     \\Examples:
     \\  voiced status
     \\  voiced status | grep '^phase='
+    \\  voiced status | grep '^model='
     \\  voiced status | grep '^model_state='
     \\
     \\Output:
@@ -701,6 +702,9 @@ const status_help =
     \\  recording_elapsed_seconds=<integer|unavailable>
     \\      Whole seconds since the current recording was requested. Available only
     \\      while phase=capturing.
+    \\
+    \\  model=<whisper.base.en|whisper.small.en|whisper.medium.en>
+    \\      Whisper model this daemon loads. Independent of model_state.
     \\
     \\  model_state=<unloaded|loading|loaded|unloading>
     \\      Current model lifecycle:

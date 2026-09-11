@@ -714,6 +714,11 @@ noinline fn dispatchControl(supervisor: *Supervisor, client_index: usize, reques
         .idle, .busy => .loaded,
         .stopping => .unloading,
     };
+    const model_kind: control_socket.ModelKind = switch (supervisor.options.capture.transcription.model) {
+        .whisper_base_en => .whisper_base_en,
+        .whisper_small_en => .whisper_small_en,
+        .whisper_medium_en => .whisper_medium_en,
+    };
     const recording_started_ns = if (phase == .capturing)
         service.pending_recording orelse supervisor.recording_requested_monotonic_ns
     else
@@ -726,6 +731,7 @@ noinline fn dispatchControl(supervisor: *Supervisor, client_index: usize, reques
         .ignored = ignored,
         .phase = phase,
         .model = model_state,
+        .model_kind = model_kind,
         .recording_id = supervisor.recording_ordinal,
         .model_idle_seconds_max = supervisor.options.model_keep_warm_seconds,
         .daemon_uptime_seconds = (request_received_monotonic_ns -| supervisor.started_monotonic_ns) / std.time.ns_per_s,

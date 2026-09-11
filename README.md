@@ -371,6 +371,7 @@ per line to stdout and no acknowledgement, for example:
 phase=idle
 recording_id=127
 recording_elapsed_seconds=unavailable
+model=whisper.small.en
 model_state=loaded
 model_idle_seconds_remaining=241
 model_idle_seconds_max=300
@@ -378,8 +379,9 @@ daemon_uptime_seconds=15237
 ```
 
 `phase` is the recording workflow: `idle`, `capturing`, `stopping`,
-`transcribing`, or `delivering`. `model_state` is independently `unloaded`,
-`loading`, `loaded`, or `unloading`.
+`transcribing`, or `delivering`. `model` is the configured Whisper model this
+daemon loads. `model_state` is independently `unloaded`, `loading`, `loaded`, or
+`unloading`.
 `recording_id` identifies the current recording, or the latest recording while
 idle, and matches `VOICED_RECORDING_ID` in journal records. It resets to zero
 when the daemon starts. Elapsed recording time is available only during capture;
@@ -421,8 +423,9 @@ before dispatch or display. Each send is one complete record. Receivers use
 | 32 | 8 | Recording elapsed seconds, or `2^64-1` when unavailable |
 | 40 | 8 | Model idle seconds remaining, or `2^64-1` when unavailable |
 | 48 | 1 | Phase: idle=1, capturing=2, stopping=3, transcribing=4, delivering=5 |
-| 49 | 1 | Model: unloaded=1, loading=2, loaded=3, unloading=4 |
-| 50 | 14 | Reserved: zero |
+| 49 | 1 | Model state: unloaded=1, loading=2, loaded=3, unloading=4 |
+| 50 | 1 | Model kind: whisper.base.en=1, whisper.small.en=2, whisper.medium.en=3 |
+| 51 | 13 | Reserved: zero |
 
 Requests are exactly 8 bytes and replies are exactly 64 bytes. No other record
 sizes or layouts are accepted. Accepted and ignored replies carry a status

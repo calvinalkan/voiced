@@ -22,6 +22,7 @@ pub const Status = struct {
     ignored: bool,
     phase: Phase,
     model: ModelState,
+    model_kind: ModelKind,
     recording_id: u64,
     model_idle_seconds_max: u64,
     daemon_uptime_seconds: u64,
@@ -31,6 +32,22 @@ pub const Status = struct {
 
 pub const Phase = enum(u8) { unavailable = 0, idle = 1, capturing = 2, stopping = 3, transcribing = 4, delivering = 5, _ };
 pub const ModelState = enum(u8) { unavailable = 0, unloaded = 1, loading = 2, loaded = 3, unloading = 4, _ };
+pub const ModelKind = enum(u8) {
+    unavailable = 0,
+    whisper_base_en = 1,
+    whisper_small_en = 2,
+    whisper_medium_en = 3,
+    _,
+
+    pub fn name(kind: ModelKind) []const u8 {
+        return switch (kind) {
+            .whisper_base_en => "whisper.base.en",
+            .whisper_small_en => "whisper.small.en",
+            .whisper_medium_en => "whisper.medium.en",
+            else => unreachable,
+        };
+    }
+};
 
 // Non-exhaustive wire enums represent every incoming byte. Validate them before
 // dispatch or @tagName; unknown values must not become invalid Zig enums.
@@ -58,7 +75,8 @@ const WireReply = extern struct {
     model_idle_seconds_remaining: u64 = seconds_unavailable,
     phase: Phase = .unavailable,
     model: ModelState = .unavailable,
-    reserved: [14]u8 = @splat(0),
+    model_kind: ModelKind = .unavailable,
+    reserved: [13]u8 = @splat(0),
 };
 
 comptime {
@@ -66,7 +84,7 @@ comptime {
     assert(@sizeOf(WireRequest) == 8);
     for (std.meta.fields(WireRequest), [_]usize{ 0, 4, 6, 7 }) |field, offset| assert(@offsetOf(WireRequest, field.name) == offset);
     assert(@sizeOf(WireReply) == 64);
-    for (std.meta.fields(WireReply), [_]usize{ 0, 4, 6, 7, 8, 16, 24, 32, 40, 48, 49, 50 }) |field, offset| assert(@offsetOf(WireReply, field.name) == offset);
+    for (std.meta.fields(WireReply), [_]usize{ 0, 4, 6, 7, 8, 16, 24, 32, 40, 48, 49, 50, 51 }) |field, offset| assert(@offsetOf(WireReply, field.name) == offset);
     for (std.meta.fields(@FieldType(Request, "cmd"))) |field| assert(field.value == @intFromEnum(@field(WireRequest.Command, field.name)));
 }
 
@@ -315,6 +333,7 @@ pub const Server = struct {
             .model_idle_seconds_remaining = status.model_idle_seconds_remaining orelse seconds_unavailable,
             .phase = status.phase,
             .model = status.model,
+            .model_kind = status.model_kind,
         };
         server.flush(index);
     }
@@ -426,6 +445,10 @@ pub fn sendRequest(init: std.process.Init, request: Request) !void {
                 .unloaded, .loading, .loaded, .unloading => {},
                 else => return error.InvalidControlReply,
             }
+            switch (wire_reply.model_kind) {
+                .whisper_base_en, .whisper_small_en, .whisper_medium_en => {},
+                else => return error.InvalidControlReply,
+            }
             if (wire_reply.model_idle_seconds_max > std.math.maxInt(u32)) return error.InvalidControlReply;
             if (recording_elapsed_seconds != null and wire_reply.phase != .capturing) return error.InvalidControlReply;
             if (model_idle_seconds_remaining) |remaining| {
@@ -439,7 +462,8 @@ pub fn sendRequest(init: std.process.Init, request: Request) !void {
         .invalid_request, .unsupported_version => {
             if (wire_reply.recording_id != 0 or wire_reply.model_idle_seconds_max != 0 or wire_reply.daemon_uptime_seconds != 0 or
                 recording_elapsed_seconds != null or model_idle_seconds_remaining != null or
-                wire_reply.phase != .unavailable or wire_reply.model != .unavailable)
+                wire_reply.phase != .unavailable or wire_reply.model != .unavailable or
+                wire_reply.model_kind != .unavailable)
                 return error.InvalidControlReply;
             return if (wire_reply.result == .unsupported_version) error.IncompatibleControlProtocol else error.CommandRejected;
         },
@@ -450,6 +474,7 @@ pub fn sendRequest(init: std.process.Init, request: Request) !void {
         .ignored = wire_reply.result == .ignored,
         .phase = wire_reply.phase,
         .model = wire_reply.model,
+        .model_kind = wire_reply.model_kind,
         .recording_id = wire_reply.recording_id,
         .model_idle_seconds_max = wire_reply.model_idle_seconds_max,
         .daemon_uptime_seconds = wire_reply.daemon_uptime_seconds,
@@ -471,7 +496,7 @@ fn writeStatus(io: std.Io, status: Status) !void {
     var writer = std.Io.Writer.fixed(&buffer);
     try writer.print("phase={s}\nrecording_id={d}\n", .{ @tagName(status.phase), status.recording_id });
     try writeOptionalSeconds(&writer, "recording_elapsed_seconds", status.recording_elapsed_seconds);
-    try writer.print("model_state={s}\n", .{@tagName(status.model)});
+    try writer.print("model={s}\nmodel_state={s}\n", .{ status.model_kind.name(), @tagName(status.model) });
     try writeOptionalSeconds(&writer, "model_idle_seconds_remaining", status.model_idle_seconds_remaining);
     try writer.print("model_idle_seconds_max={d}\ndaemon_uptime_seconds={d}\n", .{ status.model_idle_seconds_max, status.daemon_uptime_seconds });
     try std.Io.File.stdout().writeStreamingAll(io, writer.buffered());
