@@ -19,9 +19,15 @@ const TestModel = struct {
 };
 
 fn loadTestModel(allocator: std.mem.Allocator, test_model: TestModel) !inference.Model {
-    const path = try modelPath(allocator, test_model.kind);
-    defer allocator.free(path);
-    return packed_model.load(std.testing.io, path, test_model.kind);
+    const io = std.testing.io;
+    const directory_path = try modelDirectoryPath(allocator);
+    defer allocator.free(directory_path);
+    var directory = try std.Io.Dir.cwd().openDir(io, directory_path, .{});
+    defer directory.close(io);
+    var file_name_buffer: [32]u8 = undefined;
+    const file_name = try std.fmt.bufPrint(&file_name_buffer, "{s}.voiced", .{test_model.name});
+
+    return packed_model.load(io, directory, file_name, test_model.kind);
 }
 
 // ─── Fixture Transcription ─────────────────────────────────────────────────
@@ -786,7 +792,7 @@ fn selectedTestModel() !TestModel {
 
 // ─── Installed Model Location ──────────────────────────────────────────────
 
-fn modelPath(allocator: std.mem.Allocator, kind: inference.Model.Kind) ![]u8 {
+fn modelDirectoryPath(allocator: std.mem.Allocator) ![]u8 {
     const env = std.testing.environ;
     const data_home = if (env.getPosix("XDG_DATA_HOME")) |path|
         path
@@ -796,9 +802,8 @@ fn modelPath(allocator: std.mem.Allocator, kind: inference.Model.Kind) ![]u8 {
         "voiced/models"
     else
         ".local/share/voiced/models";
-    const file_name = try std.fmt.allocPrint(allocator, "{s}.voiced", .{kind.name()});
-    defer allocator.free(file_name);
-    return std.fs.path.join(allocator, &.{ data_home, relative_directory, file_name });
+
+    return std.fs.path.join(allocator, &.{ data_home, relative_directory });
 }
 
 fn parsePcmWav(wav_bytes: []const u8) ![]const u8 {

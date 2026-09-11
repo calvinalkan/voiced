@@ -44,12 +44,12 @@ pub const Result = union(enum) {
 // Retain the actual loader, allocation, and initialization errors. No formatted
 // diagnostic buffer or second transcription error taxonomy crosses the mailbox.
 pub const ModelLoadError = @typeInfo(@typeInfo(@TypeOf(packed_model.load)).@"fn".return_type.?).error_union.error_set ||
-    std.mem.Allocator.Error || inference.WorkerPool.InitError || inference.Runtime.InitError;
+    std.Io.Dir.OpenError || std.mem.Allocator.Error || inference.WorkerPool.InitError || inference.Runtime.InitError;
 
 pub const Context = struct {
     io: std.Io,
     allocator: std.mem.Allocator,
-    model_path: []const u8,
+    models_directory_path: []const u8,
 };
 
 mailbox: worker.Mailbox(Job, Result),
@@ -91,7 +91,12 @@ fn resident(self: *Transcription, prepare: @FieldType(Job, "prepare")) ModelLoad
     const launch = prepare.model;
     if (self.cancel.load(.acquire)) return;
     const model_load_started_ns = monotonicNanoseconds();
-    var model = try packed_model.load(context.io, context.model_path, launch.model);
+    var model = load: {
+        var directory = try std.Io.Dir.cwd().openDir(context.io, context.models_directory_path, .{});
+        defer directory.close(context.io);
+
+        break :load try packed_model.load(context.io, directory, modelFileName(launch.model), launch.model);
+    };
     defer model.deinit();
     if (self.cancel.load(.acquire)) return;
     log.event(.debug, .{ .recording_id = prepare.recording_ordinal }, "model_loaded", &.{
@@ -145,6 +150,14 @@ fn resident(self: *Transcription, prepare: @FieldType(Job, "prepare")) ModelLoad
         }
     }
     unreachable; // Shutdown is submitted only after unload completes.
+}
+
+fn modelFileName(kind: inference.Model.Kind) []const u8 {
+    return switch (kind) {
+        .whisper_base_en => "whisper.base.en.voiced",
+        .whisper_small_en => "whisper.small.en.voiced",
+        .whisper_medium_en => "whisper.medium.en.voiced",
+    };
 }
 
 fn monotonicNanoseconds() u64 {

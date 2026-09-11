@@ -11,11 +11,12 @@ const layout = @import("layout.zig");
 const assert = std.debug.assert;
 const Blake3 = std.crypto.hash.Blake3;
 
-/// `load` maps and validates one packed file for `expected_kind`. The returned
-/// model owns the mapping; the caller releases it with `inference.Model.deinit`.
-pub fn load(io: std.Io, path: []const u8, expected_kind: inference.Model.Kind) !inference.Model {
+/// `load` maps and validates `file_name` from `directory` for `expected_kind`.
+/// The returned model owns the mapping; the caller releases it with
+/// `inference.Model.deinit`.
+pub fn load(io: std.Io, directory: std.Io.Dir, file_name: []const u8, expected_kind: inference.Model.Kind) !inference.Model {
     var model: inference.Model = undefined;
-    try loadInto(io, path, expected_kind, &model);
+    try loadInto(io, directory, file_name, expected_kind, &model);
 
     return model;
 }
@@ -26,7 +27,7 @@ pub fn load(io: std.Io, path: []const u8, expected_kind: inference.Model.Kind) !
 // (application/stdlib ReleaseSmall, packed-model code ReleaseFast). Preserve this
 // boundary when changing validation. The complete model is assigned only after
 // every check succeeds; on error, load returns without reading its local model.
-fn loadInto(io: std.Io, path: []const u8, expected_kind: inference.Model.Kind, model: *inference.Model) !void {
+fn loadInto(io: std.Io, directory: std.Io.Dir, file_name: []const u8, expected_kind: inference.Model.Kind, model: *inference.Model) !void {
     // ── Map The Exact Expected File ──
     //
     // The model kind determines the complete file size. Rejecting every other
@@ -35,7 +36,7 @@ fn loadInto(io: std.Io, path: []const u8, expected_kind: inference.Model.Kind, m
 
     const expected = layout.calculate(expected_kind);
 
-    const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only, .allow_directory = false });
+    const file = try directory.openFile(io, file_name, .{ .mode = .read_only, .allow_directory = false });
     defer file.close(io);
 
     const stat = try file.stat(io);

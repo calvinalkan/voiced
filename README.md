@@ -971,7 +971,7 @@ The caller keeps the model, runtime, and tensor arena alive at stable addresses
 until the workers join:
 
 ```zig
-var model = try packed_model.load(io, model_path, expected_kind);
+var model = try packed_model.load(io, models_directory, model_file_name, expected_kind);
 defer model.deinit();
 
 var runtime: inference.Runtime = undefined;

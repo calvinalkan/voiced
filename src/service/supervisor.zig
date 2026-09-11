@@ -404,16 +404,11 @@ pub fn runService(init: std.process.Init, options: ServiceOptions) !void {
     const xdg_data_home = init.environ_map.get("XDG_DATA_HOME");
     const data_home = xdg_data_home orelse init.environ_map.get("HOME") orelse return error.HomeNotSet;
     if (!std.fs.path.isAbsolute(data_home)) return error.DataHomeNotAbsolute;
-    const model_path = try std.fmt.allocPrint(
-        init.gpa,
-        "{s}/{s}{s}.voiced",
-        .{
-            data_home,
-            if (xdg_data_home != null) "voiced/models/" else ".local/share/voiced/models/",
-            options.capture.transcription.model.name(),
-        },
-    );
-    defer init.gpa.free(model_path);
+    const models_directory_path = try std.fs.path.join(init.gpa, &.{
+        data_home,
+        if (xdg_data_home != null) "voiced/models" else ".local/share/voiced/models",
+    });
+    defer init.gpa.free(models_directory_path);
 
     var capture_worker: Capture = .{
         .mailbox = undefined,
@@ -431,7 +426,7 @@ pub fn runService(init: std.process.Init, options: ServiceOptions) !void {
         .context = .{
             .io = init.io,
             .allocator = init.gpa,
-            .model_path = model_path,
+            .models_directory_path = models_directory_path,
         },
         .audio = audio_storage,
     };

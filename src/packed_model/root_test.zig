@@ -108,10 +108,7 @@ test "supported model conversions match the inference-blessed packed files" {
         // The golden digest proves byte identity. Loading separately exercises
         // the production format validation and model-view construction.
 
-        const packed_file_path = try tmp_dir.dir.realPathFileAlloc(io, golden_model.packed_file_name, allocator);
-        defer allocator.free(packed_file_path);
-
-        var loaded_model = try packed_model.load(io, packed_file_path, golden_model.kind);
+        var loaded_model = try packed_model.load(io, tmp_dir.dir, golden_model.packed_file_name, golden_model.kind);
         defer loaded_model.deinit();
     }
 }
@@ -220,10 +217,8 @@ test "reader rejects representative packed-file corruption" {
     );
     defer tmp_dir.cleanup();
 
-    const packed_file_path = try tmp_dir.dir.realPathFileAlloc(io, base_model.packed_file_name, allocator);
-    defer allocator.free(packed_file_path);
     {
-        var loaded_model = try packed_model.load(io, packed_file_path, base_model.kind);
+        var loaded_model = try packed_model.load(io, tmp_dir.dir, base_model.packed_file_name, base_model.kind);
         defer loaded_model.deinit();
     }
 
@@ -255,7 +250,7 @@ test "reader rejects representative packed-file corruption" {
 
         try std.testing.expectError(
             corruption.expected_error,
-            packed_model.load(io, packed_file_path, base_model.kind),
+            packed_model.load(io, tmp_dir.dir, base_model.packed_file_name, base_model.kind),
         );
     }
 
@@ -279,7 +274,8 @@ test "reader rejects representative packed-file corruption" {
     try expectMutationRejected(.{
         .io = io,
         .packed_file = packed_file,
-        .packed_file_path = packed_file_path,
+        .packed_directory = tmp_dir.dir,
+        .packed_file_name = base_model.packed_file_name,
         .model_kind = base_model.kind,
         .byte_offset = first_tensor_entry_offset,
         .replacement_bytes = &tensor_offset_bytes,
@@ -291,7 +287,8 @@ test "reader rejects representative packed-file corruption" {
     try expectMutationRejected(.{
         .io = io,
         .packed_file = packed_file,
-        .packed_file_path = packed_file_path,
+        .packed_directory = tmp_dir.dir,
+        .packed_file_name = base_model.packed_file_name,
         .model_kind = base_model.kind,
         .byte_offset = first_unused_tensor_entry_offset,
         .replacement_bytes = &tensor_offset_bytes,
@@ -302,7 +299,8 @@ test "reader rejects representative packed-file corruption" {
     try expectMutationRejected(.{
         .io = io,
         .packed_file = packed_file,
-        .packed_file_path = packed_file_path,
+        .packed_directory = tmp_dir.dir,
+        .packed_file_name = base_model.packed_file_name,
         .model_kind = base_model.kind,
         .byte_offset = second_tensor_entry_offset,
         .replacement_bytes = &tensor_offset_bytes,
@@ -314,7 +312,8 @@ test "reader rejects representative packed-file corruption" {
     try expectMutationRejected(.{
         .io = io,
         .packed_file = packed_file,
-        .packed_file_path = packed_file_path,
+        .packed_directory = tmp_dir.dir,
+        .packed_file_name = base_model.packed_file_name,
         .model_kind = base_model.kind,
         .byte_offset = first_tensor_entry_offset,
         .replacement_bytes = &tensor_offset_bytes,
@@ -326,7 +325,8 @@ test "reader rejects representative packed-file corruption" {
     try expectMutationRejected(.{
         .io = io,
         .packed_file = packed_file,
-        .packed_file_path = packed_file_path,
+        .packed_directory = tmp_dir.dir,
+        .packed_file_name = base_model.packed_file_name,
         .model_kind = base_model.kind,
         .byte_offset = first_tensor_entry_offset,
         .replacement_bytes = &tensor_offset_bytes,
@@ -348,7 +348,8 @@ test "reader rejects representative packed-file corruption" {
     try expectMutationRejected(.{
         .io = io,
         .packed_file = packed_file,
-        .packed_file_path = packed_file_path,
+        .packed_directory = tmp_dir.dir,
+        .packed_file_name = base_model.packed_file_name,
         .model_kind = base_model.kind,
         .byte_offset = vocabulary_index_offset,
         .replacement_bytes = &vocabulary_offset_bytes,
@@ -360,7 +361,8 @@ test "reader rejects representative packed-file corruption" {
     try expectMutationRejected(.{
         .io = io,
         .packed_file = packed_file,
-        .packed_file_path = packed_file_path,
+        .packed_directory = tmp_dir.dir,
+        .packed_file_name = base_model.packed_file_name,
         .model_kind = base_model.kind,
         .byte_offset = vocabulary_index_offset + 2 * @sizeOf(u32),
         .replacement_bytes = &vocabulary_offset_bytes,
@@ -372,7 +374,8 @@ test "reader rejects representative packed-file corruption" {
     try expectMutationRejected(.{
         .io = io,
         .packed_file = packed_file,
-        .packed_file_path = packed_file_path,
+        .packed_directory = tmp_dir.dir,
+        .packed_file_name = base_model.packed_file_name,
         .model_kind = base_model.kind,
         .byte_offset = vocabulary_index_offset + @sizeOf(u32),
         .replacement_bytes = &vocabulary_offset_bytes,
@@ -387,7 +390,8 @@ test "reader rejects representative packed-file corruption" {
     try expectMutationRejected(.{
         .io = io,
         .packed_file = packed_file,
-        .packed_file_path = packed_file_path,
+        .packed_directory = tmp_dir.dir,
+        .packed_file_name = base_model.packed_file_name,
         .model_kind = base_model.kind,
         .byte_offset = vocabulary_terminal_offset,
         .replacement_bytes = &vocabulary_offset_bytes,
@@ -407,7 +411,7 @@ test "reader rejects representative packed-file corruption" {
 
         try std.testing.expectError(
             error.InvalidPackedModel,
-            packed_model.load(io, packed_file_path, base_model.kind),
+            packed_model.load(io, tmp_dir.dir, base_model.packed_file_name, base_model.kind),
         );
     }
 }
@@ -415,14 +419,14 @@ test "reader rejects representative packed-file corruption" {
 fn expectMutationRejected(options: struct {
     io: std.Io,
     packed_file: std.Io.File,
-    packed_file_path: []const u8,
+    packed_directory: std.Io.Dir,
+    packed_file_name: []const u8,
     model_kind: inference.Model.Kind,
     byte_offset: u64,
     replacement_bytes: []const u8,
 }) !void {
     const io = options.io;
     const packed_file = options.packed_file;
-    const packed_file_path = options.packed_file_path;
     const byte_offset = options.byte_offset;
     const replacement_bytes = options.replacement_bytes;
 
@@ -458,7 +462,7 @@ fn expectMutationRejected(options: struct {
 
     try std.testing.expectError(
         error.InvalidPackedModel,
-        packed_model.load(io, packed_file_path, options.model_kind),
+        packed_model.load(io, options.packed_directory, options.packed_file_name, options.model_kind),
     );
 }
 

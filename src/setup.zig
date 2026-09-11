@@ -117,7 +117,7 @@ fn setupModel(
 
     // ── Reuse A Valid Installed Model ──
 
-    if (packed_model.load(io, install_path, kind)) |loaded_model| {
+    if (packed_model.load(io, installed_directory, output_file_name, kind)) |loaded_model| {
         var model = loaded_model;
         defer model.deinit();
         std.debug.print("{s} already installed in {s}\n", .{ kind.name(), install_path });
@@ -194,7 +194,7 @@ fn setupModel(
     // Reopen the published file through the production reader before deleting
     // its sources. A successful load verifies the writer-reader round trip and
     // the final on-disk bytes.
-    var installed_model = try packed_model.load(io, install_path, kind);
+    var installed_model = try packed_model.load(io, installed_directory, output_file_name, kind);
     defer installed_model.deinit();
 
     try cwd.deleteTree(io, staging_path);
